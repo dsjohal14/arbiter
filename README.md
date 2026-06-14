@@ -1,17 +1,17 @@
 # Arbiter
 
-> Multiple AI agents debate. The best answer wins.
+> Multiple AI agents debate. An Opus 4.8 arbiter picks the best answer — then keeps refining it with you.
 
-Arbiter is a developer CLI tool that routes your question through Claude, Codex, and Gemini in structured debate rounds. Models refine each other's answers, then a judge picks the winner based on reasoning quality — not a popularity vote.
+Arbiter is a developer CLI tool that routes your question through **Claude Sonnet**, **Codex**, and **Gemini Pro** in structured debate rounds. Models refine each other's answers, then **Opus 4.8** arbitrates — picking the winner on reasoning quality, not a popularity vote. Output streams live, sessions persist, and after the verdict you can keep talking to the arbiter.
 
 ```
 ╔══════════════════════════════════════════╗
 ║       🤖  LLM DEBATE ARENA  🤖           ║
 ╚══════════════════════════════════════════╝
 
-  Debaters:  Claude  vs  Codex  vs  Gemini
-  Judge:     Claude
-  Rounds:    2
+  Debaters:  Claude Sonnet  vs  Codex  vs  Gemini Pro
+  Arbiter:   Opus 4.8
+  Rounds:    1
 
   Your prompt: ▌
 ```
@@ -20,11 +20,12 @@ Arbiter is a developer CLI tool that routes your question through Claude, Codex,
 
 ## How It Works
 
-1. **Round 1** — all models answer your prompt in parallel
-2. **Round 2..N** — each model sees the others' answers and refines its position (can push back, incorporate good points, or stand firm)
-3. **Judgment** — the judge model reads all final-round answers and picks the best, with a written reason
+1. **Round 1** — all debaters answer your prompt in parallel, streamed live into their own blocks
+2. **Round 2..N** *(optional)* — each model sees the others' answers and refines its position (push back, incorporate good points, or stand firm)
+3. **Judgment** — the **Opus 4.8** arbiter reads the final answers and picks the best, with a written reason and an improved best answer
+4. **Follow-up** — the arbiter keeps its session; reply with anything and it refines its answer. If your follow-up needs fresh debate, it re-polls the debaters and re-judges.
 
-No API keys needed. Arbiter shells out to the CLI tools you already have installed.
+Each model runs as **one persistent CLI session** for the whole run, so context carries across rounds and follow-ups. No API keys needed — Arbiter shells out to the CLI tools you already have installed.
 
 ---
 
@@ -32,12 +33,12 @@ No API keys needed. Arbiter shells out to the CLI tools you already have install
 
 | Tool | Install | Used for |
 |------|---------|----------|
-| Claude Code | [code.claude.com](https://code.claude.com) | `claude` model |
-| Codex CLI | `npm install -g @openai/codex` | `codex` model |
-| Gemini CLI | [developers.google.com/gemini-cli](https://developers.google.com/gemini-cli) | `gemini` model |
+| Claude Code | [code.claude.com](https://code.claude.com) | Sonnet debater + Opus 4.8 arbiter |
+| Codex CLI | `npm install -g @openai/codex` | Codex debater |
+| Gemini CLI | [developers.google.com/gemini-cli](https://developers.google.com/gemini-cli) | Gemini Pro debater |
 | Python 3.12+ | [python.org](https://python.org) | Runtime |
 
-Make sure you're authenticated in each CLI tool before running Arbiter.
+Make sure you're authenticated in each CLI tool before running Arbiter. Run Arbiter from a directory the Gemini CLI trusts (or set `GEMINI_CLI_TRUST_WORKSPACE=true`).
 
 ---
 
@@ -55,39 +56,28 @@ No pip install needed. Arbiter has no external Python dependencies.
 ## Usage
 
 ```bash
-# Default: 2 rounds, all 3 models, Claude judges
+# Default: 1 round, all 3 debaters, Opus 4.8 arbitrates
 python main.py
 
-# 3 rounds, Gemini as judge
-python main.py --rounds 3 --judge gemini
+# 2 rounds of refinement
+python main.py --rounds 2
 
-# Only Claude and Gemini, 1 round
-python main.py --rounds 1 --models claude,gemini
+# Only Claude and Gemini, save the transcript, show raw CLI calls + timing
+python main.py --models claude,gemini --save debate.md --verbose
 
-# Only Claude and Codex
-python main.py --models claude,codex
+# Use Gemini as the arbiter instead of Opus
+python main.py --judge gemini
 ```
 
 ### Flags
 
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
-| `--rounds` | `-r` | `2` | Number of debate rounds |
-| `--judge` | `-j` | `claude` | Which model judges: `claude`, `codex`, `gemini` |
-| `--models` | `-m` | `claude,codex,gemini` | Comma-separated list of debaters |
-
----
-
-## Good Prompts to Try
-
-Arbiter shines on questions with real tradeoffs:
-
-- `Should startups build on microservices or a monolith first?`
-- `What is the best way to handle errors in async Python code?`
-- `Should I use REST or GraphQL for a new API?`
-- `What makes a good code review?`
-- `What's the most underrated concept in software engineering?`
-- `How should a junior engineer spend their first 90 days at a new job?`
+| `--rounds` | `-r` | `1` | Number of debate rounds |
+| `--judge` | `-j` | `claude` | Arbiter model: `claude` (→ Opus 4.8), `codex`, `gemini` |
+| `--models` | `-m` | `claude,codex,gemini` | Comma-separated debaters |
+| `--save` | | _(off)_ | Write the full transcript (markdown) to a file |
+| `--verbose` | `-v` | _(off)_ | Show raw CLI commands and per-call timing |
 
 ---
 
@@ -95,10 +85,10 @@ Arbiter shines on questions with real tradeoffs:
 
 ```
 arbiter/
-├── main.py       # CLI entry point, arg parsing, prompt input
-├── debate.py     # Orchestration: rounds, concurrency, judge call
-├── models.py     # CLI callers (claude, codex, gemini) + message builders
-├── display.py    # All terminal output and ANSI colors — zero logic
+├── main.py       # CLI entry point, arg parsing, prompt input, follow-up loop wiring
+├── debate.py     # Orchestration: rounds, streaming coordinator, judge, follow-up loop
+├── models.py     # CLI adapters (model config, persistent sessions, streaming) + prompt builders
+├── display.py    # All terminal output, ANSI colors, live streaming blocks — zero logic
 └── README.md
 ```
 
@@ -114,32 +104,29 @@ User Prompt
     ▼
 Debate Orchestrator (debate.py)
     │
-    ├── Round 1: asyncio.gather → [claude, codex, gemini] in parallel
+    ├── Round 1: asyncio.gather → [Sonnet, Codex, Gemini Pro] stream live in parallel
     │
-    ├── Round 2..N: each model sees all prior answers, refines
+    ├── Round 2..N: each model resumes its session, sees prior answers, refines
     │
-    └── Judge call → parse WINNER / REASON / BEST ANSWER
+    ├── Arbiter (Opus 4.8) → parse WINNER / REASON / BEST ANSWER
+    │
+    └── Follow-up loop: arbiter refines, or re-polls the debaters and re-judges
             │
             ▼
        Terminal Output (display.py)
 ```
 
-Each model adapter in `models.py` exposes one interface:
+Each model is described by a single config entry in `models.py` and driven through one interface:
 
 ```python
-async def call_model(model: str, messages: list[dict]) -> ModelResponse
+async def call_session(session: Session, prompt: str, on_delta=..., on_cmd=...) -> ModelResponse
 ```
 
-Adding a new model (Ollama, local LLM, etc.) requires only a new function in `models.py` — no orchestration changes.
+The adapter knows how to build that model's first/resume command and parse its streaming events. Adding a new model (Ollama, local LLM, etc.) is a new config entry plus a parse branch — no orchestration changes.
 
 ---
 
 ## Roadmap
-
-### v1.1 — Polish (next)
-- [ ] Stream output live as models respond (currently waits for full response)
-- [ ] `--save debate.md` flag to write full transcript to file
-- [ ] `--verbose` flag to show raw CLI timing and output
 
 ### v2.0 — Arbiter for Dev Work
 - [ ] Role-based pipeline: `Planner → Implementer → Reviewer → Critic → Judge`
@@ -163,11 +150,11 @@ Adding a new model (Ollama, local LLM, etc.) requires only a new function in `mo
 
 ## The Insight Behind Arbiter
 
-The idea came from [WAT321](https://github.com/WillyDrucker/WAT321) — a VS Code extension with an "Epic Handshake" feature that lets Claude route questions to other models mid-session.
+The idea came while working: I used Claude's responses inside Codex to verify, validate, and refine plans.
 
-Arbiter takes that idea further: instead of one model asking another, all models debate each other from the start, with structured roles and a judge that applies an acceptance policy rather than picking the most confident-sounding answer.
+The same bet is now showing up at the platform layer. In June 2026, [OpenRouter launched **Fusion**](https://x.com/openrouter/status/2065856853989270011) — it routes a single prompt across 3–5 leading models in parallel, then uses *judge models* to synthesize the competing outputs into one answer. The lesson is the same one Arbiter is built on: **a panel of models that debate and a judge that selects beats any single model answering alone.**
 
-The architecture Arbiter uses to design its own v2 was itself generated by running Arbiter — Claude, Codex, and Gemini debating "what is the best architecture for a multi-agent coding debate tool?".
+Arbiter does this locally, over the CLI tools you already have — no extra API layer, full transcript in your terminal, and an arbiter you can keep talking to.
 
 ---
 
