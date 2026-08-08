@@ -414,16 +414,21 @@ Adding a provider is one `Provider` entry plus a branch in the event parser.
 ## Development
 
 ```bash
-uv pip install -e . pytest pytest-asyncio pytest-cov ruff
-pytest          # 247 tests
-ruff check src/ tests/
+make venv && make install
+make check          # lint + format + the full suite, in CI's order
+make test-unit      # ~5s, for iterating
+make demo           # run the gate on a seeded defect (real provider calls)
 ```
+
+`make` on its own lists every target. See **[DEVELOPMENT.md](DEVELOPMENT.md)**
+for the test architecture, how to add a provider, and debugging.
 
 Subprocess behaviour is tested against a **real fake CLI placed on `PATH`**, not
 by mocking `asyncio.create_subprocess_exec`. That's deliberate: the 64 KiB line
 limit that used to crash long answers lives inside the real `StreamReader`, so a
 mocked seam would pass a test that production fails. Same for exit codes, SIGTERM
-escalation, argv size limits, and stderr backpressure.
+escalation, argv size limits, and stderr backpressure. No test calls a real
+provider — `make check` costs nothing and needs no login.
 
 ---
 
