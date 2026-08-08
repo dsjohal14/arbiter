@@ -83,9 +83,11 @@ not a paragraph of concern**:
        implementer nothing to build or test against.
 ```
 
-`--apply` writes the revised criteria straight into the plan. It exits non-zero
-while blocking problems remain, so an agent can be told not to start until it
-passes.
+For an unpinned plan, Arbiter first extracts a complete baseline contract in
+memory, then asks the reviewers to edit it. `--apply` writes that full revised
+contract into the plan; it never pins only the reviewers' additions. The command
+exits non-zero while blocking problems remain, so an agent can be told not to
+start until it passes.
 
 | Kind | Blocks? | Meaning |
 |---|---|---|
@@ -154,10 +156,14 @@ approval; it does not make semantic relevance mechanically decidable. With
 `--require-pinned-evidence`, a model-chosen test cannot reach `met`, and an
 `untested` row fails the gate without separately passing `--require-tests`.
 
-If the diff *rewrites* a test the plan already selected, the approval is stale
-and Arbiter refuses `met` — in every mode, not just strict. A test the diff
-merely *adds* is fine: it was named in the contract before the code existed,
-which is the normal workflow.
+If the diff *rewrites the selected test node*, the approval is stale and Arbiter
+refuses `met` — in every mode, not just strict. A new test is fine even when it
+is appended to an existing test module: it was named in the contract before the
+code existed, which is the normal workflow.
+
+This staleness check is intentionally node-local. Rewriting a fixture or helper
+called by the selected test does not automatically revoke the plan selection;
+review those transitive test changes like any other change to trusted evidence.
 
 ### Does the test prove anything?
 
@@ -178,12 +184,18 @@ Fails at base and passes now → the change is what made it pass. Passes at base
 too → it proves nothing about this change. That second case is *reported* by
 default rather than punished, because a vacuous test and a legitimate regression
 guard are indistinguishable from outside; `--require-discriminating-tests` turns
-it into a failure when you want the stricter reading.
+it into a failure when you want the stricter reading. Strict mode also fails
+closed when the base cannot be checked, the test cannot collect there, or the
+baseline run times out.
 
 The base revision is inferred from `--diff` (`origin/main...HEAD` → `origin/main`,
 `staged` → `HEAD`) or set with `--base`. A diff read from a file or stdin has no
-base, so the check is skipped rather than guessed. It runs in a throwaway git
-worktree; your working tree is never touched.
+base, so `--require-discriminating-tests` requires an explicit `--base`; combining
+that strict flag with `--no-run-tests` is also a usage error. Both are rejected
+before any model calls. Baseline execution runs in a throwaway git worktree; your
+working tree is never touched. For Python projects, the runner removes editable
+paths for the active checkout and puts the worktree's `src/`, `lib/`, and
+repository root first, so it cannot silently import HEAD for both runs.
 
 ---
 
@@ -207,8 +219,9 @@ The verdict is derived mechanically. No model gets a vote:
 | any `untested`, with `--require-tests` | `fail` | `1` |
 | model-chosen evidence, with `--require-pinned-evidence` | `fail` | `1` |
 | a test that passes at base too, with `--require-discriminating-tests` | `fail` | `1` |
+| the base test cannot be checked, with `--require-discriminating-tests` | `fail` | `1` |
 | any `unverifiable` | `unclear` | `3` |
-| a reviewer failed to complete | `unclear` | `3` |
+| a reviewer failed or returned an incomplete review | `unclear` | `3` |
 | otherwise | `pass` | `0` |
 
 Also `2` usage error and `4` runtime error. `unclear` has its own code so CI can

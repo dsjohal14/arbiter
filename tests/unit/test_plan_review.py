@@ -19,7 +19,7 @@ from arbiter.plan_review import (
     PlanFinding,
     PlanReviewResult,
     build_plan_review_prompt,
-    parse_findings,
+    parse_findings_report,
     proposed_criteria,
 )
 
@@ -45,50 +45,81 @@ def _f(**kw):
 
 
 def test_a_finding_that_proposes_an_edit_is_kept():
-    findings = parse_findings(_report(_f()), CRITERIA)
+    findings = parse_findings_report(_report(_f()), CRITERIA).findings
     assert len(findings) == 1
     assert findings[0].proposed_criterion == "an empty list returns 0"
     assert findings[0].proposed_test == "tests/test_app.py::test_empty"
 
 
-def test_a_concern_with_no_proposed_criterion_is_dropped():
-    """This is the line between a product and a council: a worry with no edit
-    attached cannot be applied, so it is not a finding."""
-    assert parse_findings(_report(_f(proposed_criterion=None)), CRITERIA) == []
+def test_a_concern_with_no_proposed_criterion_invalidates_the_report():
+    """A concern with no edit cannot be applied, but it also cannot be mistaken
+    for a reviewer that found no problems."""
+    parsed = parse_findings_report(_report(_f(proposed_criterion=None)), CRITERIA)
+    assert parsed.findings == []
+    assert parsed.valid is False
 
 
-def test_a_revise_without_a_target_is_dropped():
+def test_a_revise_without_a_target_invalidates_the_report():
     revise = _f(kind="ambiguous", action="revise", target=None)
-    assert parse_findings(_report(revise), CRITERIA) == []
+    parsed = parse_findings_report(_report(revise), CRITERIA)
+    assert parsed.findings == []
+    assert parsed.valid is False
 
 
 def test_a_decide_finding_needs_no_proposed_criterion():
     """`decide` is the one action whose output is a question for the author, so
     it legitimately has no replacement text."""
     decide = _f(kind="needs_human", action="decide", proposed_criterion=None, proposed_test=None)
-    findings = parse_findings(_report(decide), CRITERIA)
+    findings = parse_findings_report(_report(decide), CRITERIA).findings
     assert len(findings) == 1
     assert findings[0].action == "decide"
 
 
-def test_an_unknown_kind_cannot_block_the_plan_by_accident():
-    findings = parse_findings(_report(_f(kind="vibes")), CRITERIA)
-    assert findings[0].kind == "unnecessary"
-    assert findings[0].blocking is False
+def test_an_unknown_kind_invalidates_the_report_instead_of_becoming_advisory():
+    parsed = parse_findings_report(_report(_f(kind="vibes")), CRITERIA)
+    assert parsed.findings == []
+    assert parsed.valid is False
 
 
 def test_targets_are_normalised_to_known_criterion_ids():
     revise = _f(action="revise", target="criterion ac-2 is vague", kind="ambiguous")
-    assert parse_findings(_report(revise), CRITERIA)[0].target == "AC-2"
+    findings = parse_findings_report(_report(revise), CRITERIA).findings
+    assert findings[0].target == "AC-2"
 
 
-def test_unparseable_reports_yield_nothing_rather_than_raising():
-    assert parse_findings("I like this plan!", CRITERIA) == []
+def test_unparseable_reports_are_distinct_from_a_valid_clean_review():
+    malformed = parse_findings_report("I like this plan!", CRITERIA)
+    clean = parse_findings_report(_report(), CRITERIA)
+    assert malformed.findings == clean.findings == []
+    assert malformed.valid is False
+    assert clean.valid is True
+
+
+def test_valid_findings_survive_one_malformed_finding():
+    valid_add = _f(proposed_criterion="negative inputs are rejected")
+    valid_revise = _f(
+        kind="ambiguous",
+        action="revise",
+        target="AC-1",
+        proposed_criterion="total() sums every numeric item",
+    )
+    invalid_target = _f(
+        kind="ambiguous",
+        action="revise",
+        target="AC-999",
+        proposed_criterion="invented target",
+    )
+    parsed = parse_findings_report(_report(valid_add, valid_revise, invalid_target), CRITERIA)
+    assert parsed.valid is False
+    assert [f.proposed_criterion for f in parsed.findings] == [
+        "negative inputs are rejected",
+        "total() sums every numeric item",
+    ]
 
 
 @pytest.mark.parametrize("kind", KINDS)
 def test_every_kind_round_trips(kind):
-    findings = parse_findings(_report(_f(kind=kind)), CRITERIA)
+    findings = parse_findings_report(_report(_f(kind=kind)), CRITERIA).findings
     assert findings and findings[0].kind == kind
     assert findings[0].blocking == (kind in BLOCKING_KINDS)
 
@@ -163,26 +194,38 @@ def test_a_clean_plan_produces_the_same_criteria_back():
 
 
 def test_only_blocking_kinds_hold_a_plan_back():
-    advisory = PlanReviewResult(findings=[_pf("add", kind="unnecessary")], reviewers=["claude"])
+    advisory = PlanReviewResult(
+        findings=[_pf("add", kind="unnecessary")], criteria=CRITERIA, reviewers=["claude"]
+    )
     assert advisory.ready and advisory.exit_code == 0
 
-    blocking = PlanReviewResult(findings=[_pf("revise", kind="ambiguous")], reviewers=["claude"])
+    blocking = PlanReviewResult(
+        findings=[_pf("revise", kind="ambiguous")], criteria=CRITERIA, reviewers=["claude"]
+    )
     assert not blocking.ready and blocking.exit_code == 1
 
 
 def test_an_open_decision_blocks():
     """Shipping a plan with an unmade decision means an agent quietly makes it."""
-    result = PlanReviewResult(findings=[_pf("decide", kind="needs_human")], reviewers=["claude"])
+    result = PlanReviewResult(
+        findings=[_pf("decide", kind="needs_human")], criteria=CRITERIA, reviewers=["claude"]
+    )
     assert not result.ready
 
 
 def test_a_missing_reviewer_prevents_a_ready_verdict():
-    result = PlanReviewResult(findings=[], reviewers=["claude"], failed_reviewers=["codex"])
+    result = PlanReviewResult(
+        findings=[], criteria=CRITERIA, reviewers=["claude"], failed_reviewers=["codex"]
+    )
     assert not result.ready
 
 
 def test_a_clean_plan_with_a_full_panel_is_ready():
-    assert PlanReviewResult(findings=[], reviewers=["claude", "codex"]).ready
+    assert PlanReviewResult(findings=[], criteria=CRITERIA, reviewers=["claude", "codex"]).ready
+
+
+def test_a_review_without_a_complete_contract_is_not_ready():
+    assert not PlanReviewResult(findings=[], criteria=[], reviewers=["claude", "codex"]).ready
 
 
 # ── Prompt ───────────────────────────────────────────────────────────────────

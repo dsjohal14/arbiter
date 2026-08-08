@@ -19,6 +19,7 @@ moment at which you cannot pick whichever test happens to be green.
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import asdict, dataclass, field
 
@@ -93,6 +94,13 @@ class PlanFinding:
 
 
 @dataclass
+class FindingParseResult:
+    findings: list[PlanFinding] = field(default_factory=list)
+    valid: bool = True
+    errors: list[str] = field(default_factory=list)
+
+
+@dataclass
 class PlanReviewResult:
     findings: list[PlanFinding]
     criteria: list[Criterion] = field(default_factory=list)
@@ -113,7 +121,7 @@ class PlanReviewResult:
         """A plan is ready when nothing blocking is outstanding, and when we
         actually heard from every reviewer — a missing reviewer is exactly the
         one that might have found the contradiction."""
-        return not self.blocking and not self.failed_reviewers
+        return bool(self.criteria) and not self.blocking and not self.failed_reviewers
 
     @property
     def exit_code(self) -> int:
@@ -246,32 +254,40 @@ def _clean(value) -> str | None:
     return s if s and s.lower() not in ("null", "none", "n/a") else None
 
 
-def parse_findings(raw: str, criteria: list[Criterion], source: str = "") -> list[PlanFinding]:
-    """Parse one reviewer's critique. Findings that propose no edit are dropped —
-    a concern with no proposed change to the contract is just commentary."""
+def parse_findings_report(
+    raw: str, criteria: list[Criterion], source: str = ""
+) -> FindingParseResult:
+    """Parse a critique without conflating invalid output with a clean review."""
     from .verify import extract_json
 
     obj = extract_json(raw)
-    if not obj:
-        return []
+    if obj is None:
+        return FindingParseResult(valid=False, errors=["response is not a JSON object"])
+    items = obj.get("findings")
+    if not isinstance(items, list):
+        return FindingParseResult(valid=False, errors=["response has no findings array"])
 
     known = {c.id.upper() for c in criteria}
     out: list[PlanFinding] = []
-    for item in obj.get("findings") or []:
+    errors: list[str] = []
+    for index, item in enumerate(items, 1):
+        prefix = f"finding {index}"
         if not isinstance(item, dict):
+            errors.append(f"{prefix} is not an object")
             continue
         problem = _clean(item.get("problem"))
         if not problem:
+            errors.append(f"{prefix} has no problem statement")
             continue
 
         kind = str(item.get("kind", "")).strip().lower()
         if kind not in KINDS:
-            # An unrecognised kind must not be able to block the plan by
-            # accident, so it degrades to the mildest advisory category.
-            kind = "unnecessary"
+            errors.append(f"{prefix} has unknown kind {kind!r}")
+            continue
         action = str(item.get("action", "")).strip().lower()
         if action not in ACTIONS:
-            action = "add"
+            errors.append(f"{prefix} has unknown action {action!r}")
+            continue
 
         target = _clean(item.get("target"))
         if target:
@@ -282,8 +298,13 @@ def parse_findings(raw: str, criteria: list[Criterion], source: str = "") -> lis
         # Every action except `decide` and `remove` must actually propose text;
         # otherwise there is nothing to apply and it is prose again.
         if action in ("add", "revise", "split") and not proposed:
+            errors.append(f"{prefix} proposes no criterion text")
             continue
         if action in ("revise", "split", "remove") and not target:
+            errors.append(f"{prefix} has no target criterion")
+            continue
+        if action in ("revise", "split", "remove") and known and target.upper() not in known:
+            errors.append(f"{prefix} targets unknown criterion {target!r}")
             continue
 
         out.append(
@@ -298,7 +319,27 @@ def parse_findings(raw: str, criteria: list[Criterion], source: str = "") -> lis
                 raised_by=[source] if source else [],
             )
         )
-    return out
+    return FindingParseResult(findings=out, valid=not errors, errors=errors)
+
+
+def _findings_json(findings: list[PlanFinding]) -> str:
+    """Sanitize usable edits before an incomplete review reaches the judge."""
+    return json.dumps(
+        {
+            "findings": [
+                {
+                    "kind": finding.kind,
+                    "action": finding.action,
+                    "target": finding.target,
+                    "problem": finding.problem,
+                    "proposed_criterion": finding.proposed_criterion,
+                    "proposed_test": finding.proposed_test,
+                    "quote": finding.quote,
+                }
+                for finding in findings
+            ]
+        }
+    )
 
 
 def proposed_criteria(existing: list[Criterion], findings: list[PlanFinding]) -> list[Criterion]:
@@ -381,19 +422,45 @@ async def run_plan_review(
         if not reports:
             raise ModelCallError("Every reviewer failed; cannot critique this plan.")
 
-        completed = [k for k, _ in reports]
-        failed = [k for k in reviewers if k not in completed]
-        if failed:
+        parsed_reports = [
+            (key, text, parse_findings_report(text, criteria, source=key)) for key, text in reports
+        ]
+        usable_reports = [
+            (key, text if parsed.valid else _findings_json(parsed.findings))
+            for key, text, parsed in parsed_reports
+            if parsed.valid or parsed.findings
+        ]
+        completed = [key for key, _, parsed in parsed_reports if parsed.valid]
+        failed = [key for key in reviewers if key not in completed]
+        transport_failed = [key for key in reviewers if key not in {k for k, _ in reports}]
+        incomplete = [key for key, _, parsed in parsed_reports if not parsed.valid]
+        for key, _, parsed in parsed_reports:
+            if not parsed.valid:
+                display.print_error(
+                    f"{names.get(key, key)} returned an incomplete review: "
+                    + "; ".join(parsed.errors[:3])
+                )
+        if not usable_reports:
+            raise ModelCallError("Every reviewer returned an unusable plan critique.")
+        if transport_failed:
             display.print_error(
-                f"{len(failed)} of {len(reviewers)} reviewers failed ({', '.join(failed)}). "
+                f"{len(transport_failed)} of {len(reviewers)} reviewers failed to complete "
+                f"({', '.join(transport_failed)}). The plan cannot be reported as ready."
+            )
+        if incomplete:
+            display.print_error(
+                f"{len(incomplete)} of {len(reviewers)} reviewers returned incomplete reviews "
+                f"({', '.join(incomplete)}). "
                 "The plan cannot be reported as ready."
             )
 
-        per_reviewer = [parse_findings(text, criteria, source=key) for key, text in reports]
+        # Keep every structurally usable edit. An incomplete report still blocks
+        # READY, but one hallucinated target must not erase its other findings.
+        per_reviewer = [parsed.findings for _, _, parsed in parsed_reports]
 
         # Blinded for the same reason the verify consolidator is: a model should
         # not know which critique is its own.
-        blinded, blinding = blind(reports, seed=seed)
+        blinded, blinding = blind(usable_reports, seed=seed)
 
         display.print_section("consolidation")
         display.print_note(f"{consolidator_name} is merging proposed edits (blinded)...")
@@ -403,6 +470,7 @@ async def run_plan_review(
                 display.print_verbose_cmd(cmd)
 
         findings: list[PlanFinding] = []
+        consolidation_valid = False
         try:
             resp = await call_session(
                 consolidator,
@@ -413,13 +481,21 @@ async def run_plan_review(
             )
             if verbose:
                 display.print_timing(consolidator_name, resp.duration)
-            findings = parse_findings(resp.content, criteria)
+            parsed = parse_findings_report(resp.content, criteria)
+            if parsed.valid:
+                findings = parsed.findings
+                consolidation_valid = True
+            else:
+                display.print_error(
+                    "consolidation returned an unusable review, using reviewer findings: "
+                    + "; ".join(parsed.errors[:3])
+                )
         except ModelCallError as e:
             display.print_error(f"consolidation failed, using reviewer findings: {e}")
 
-        if not findings:
-            # Consolidation produced nothing usable; fall back to the raw
-            # critiques rather than declaring the plan clean.
+        if not consolidation_valid:
+            # Only an unusable/failed consolidation falls back. A valid empty
+            # list means the consolidator deliberately rejected every finding.
             seen: set[tuple] = set()
             for group in per_reviewer:
                 for f in group:
@@ -442,7 +518,7 @@ def render(result: PlanReviewResult, show_criteria: bool = True) -> None:
     display.print_plan_verdict(result.ready, result.counts, len(result.blocking))
     if result.failed_reviewers:
         display.print_note(
-            f"⚠  reviewers that did not complete: {', '.join(result.failed_reviewers)}"
+            "⚠  reviewers without a complete usable review: " + ", ".join(result.failed_reviewers)
         )
 
     if result.findings:

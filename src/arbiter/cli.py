@@ -30,6 +30,7 @@ from .models import (
     DEFAULT_TIMEOUT,
     PROVIDERS,
     VALID_MODELS,
+    IsolationMode,
     ModelCallError,
     call_session,
     make_arbiter_session,
@@ -258,6 +259,34 @@ def _write_transcript(path: str, transcript: list[str]) -> None:
 # ── Commands ──────────────────────────────────────────────────────────────────
 
 
+async def _extract_acceptance_criteria(
+    text: str,
+    judge: str,
+    isolation: IsolationMode,
+    verbose: bool,
+    timeout: float,
+) -> list[crit.Criterion]:
+    """Extract a complete in-memory contract without modifying the plan."""
+    session = make_session(
+        "extractor",
+        judge,
+        model="opus" if judge == "claude" else None,
+        isolation=isolation,
+        output_schema=crit.EXTRACTION_SCHEMA,
+    )
+    display.print_note(f"Extracting baseline acceptance criteria with {session.label()}...")
+    with schema_writer() as write_schema:
+        resp = await call_session(
+            session,
+            crit.build_extraction_prompt(text),
+            on_cmd=(lambda _key, cmd: display.print_verbose_cmd(cmd)) if verbose else None,
+            timeout=timeout,
+            schema_path_writer=write_schema,
+        )
+    obj = verify.extract_json(resp.content) or {}
+    return crit.number([str(c) for c in obj.get("criteria") or []])
+
+
 async def cmd_plan_review(args: argparse.Namespace) -> int:
     """Critique a plan before anything is built from it.
 
@@ -273,18 +302,28 @@ async def cmd_plan_review(args: argparse.Namespace) -> int:
     if not text.strip():
         _usage_error("The plan is empty.")
 
-    # Criteria are optional here: reviewing an unpinned plan is the common case,
-    # since the point is to fix it *before* freezing a contract.
-    criteria = crit.read_criteria(text) if crit.is_pinned(text) else []
-
     isolation = "open" if args.allow_tools else "readonly"
+    if crit.is_pinned(text):
+        criteria = crit.read_criteria(text)
+        criteria_source = "pinned"
+    else:
+        # Reviewers propose edits, so an unpinned plan first needs a complete
+        # baseline to edit. This stays in memory until --apply is requested.
+        criteria = await _extract_acceptance_criteria(
+            text, judge, isolation, args.verbose, args.timeout
+        )
+        if not criteria:
+            display.print_error("No acceptance criteria could be extracted from this plan.")
+            return EXIT_RUNTIME
+        criteria_source = "extracted"
+
     reviewers, consolidator = plan_review.make_review_sessions(keys, judge, isolation)
     names = {k: s.label() for k, s in reviewers.items()}
 
     if not args.as_json:
         display.print_note(
             f"Critiquing {args.file} ({len(text.splitlines())} lines, "
-            f"{len(criteria)} pinned criteria) · reviewers: {', '.join(names.values())}"
+            f"{len(criteria)} {criteria_source} criteria) · reviewers: {', '.join(names.values())}"
         )
 
     result = await plan_review.run_plan_review(
@@ -338,26 +377,13 @@ async def cmd_plan_pin(args: argparse.Namespace) -> int:
             display.print(f"  {c.id}  {c.text}")
         return EXIT_PASS
 
-    session = make_session(
-        "extractor",
+    criteria = await _extract_acceptance_criteria(
+        text,
         judge,
-        model="opus" if judge == "claude" else None,
-        isolation="open" if args.allow_tools else "readonly",
-        output_schema=crit.EXTRACTION_SCHEMA,
+        "open" if args.allow_tools else "readonly",
+        args.verbose,
+        args.timeout,
     )
-    display.print_note(f"Extracting acceptance criteria with {session.label()}...")
-
-    with schema_writer() as write_schema:
-        resp = await call_session(
-            session,
-            crit.build_extraction_prompt(text),
-            on_cmd=(lambda _key, cmd: display.print_verbose_cmd(cmd)) if args.verbose else None,
-            timeout=args.timeout,
-            schema_path_writer=write_schema,
-        )
-
-    obj = verify.extract_json(resp.content) or {}
-    criteria = crit.number([str(c) for c in obj.get("criteria") or []])
     if not criteria:
         display.print_error("No acceptance criteria could be extracted from this plan.")
         return EXIT_RUNTIME
@@ -379,6 +405,22 @@ async def cmd_plan_pin(args: argparse.Namespace) -> int:
 async def cmd_verify(args: argparse.Namespace) -> int:
     keys, judge = _resolve_models(args.models, args.judge)
     isolation = "open" if args.allow_tools else "readonly"
+    base_ref = args.base or verify.resolve_base_ref(args.diff)
+
+    # Reject unwinnable strict configurations before reading the diff or paying
+    # for any provider calls. Fail-closed evidence semantics remain the backstop
+    # for runtime failures after a valid configuration starts.
+    if args.require_discriminating_tests:
+        if args.no_run_tests:
+            _usage_error(
+                "--require-discriminating-tests cannot be used with --no-run-tests; "
+                "cited tests must run on both revisions."
+            )
+        if not base_ref:
+            _usage_error(
+                "--require-discriminating-tests needs a base revision; pass --base <ref> "
+                "or use a --diff that names one."
+            )
 
     plan = verify.read_plan(args.plan)
     try:
@@ -415,7 +457,7 @@ async def cmd_verify(args: argparse.Namespace) -> int:
         require_tests=args.require_tests or args.require_pinned_evidence,
         require_pinned_evidence=args.require_pinned_evidence,
         scrub_env=not args.no_scrub_test_env,
-        base_ref=args.base or verify.resolve_base_ref(args.diff),
+        base_ref=base_ref,
         require_discriminating_tests=args.require_discriminating_tests,
     )
 

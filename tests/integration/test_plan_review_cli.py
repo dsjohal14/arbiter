@@ -6,7 +6,7 @@ import json
 
 from arbiter.cli import main
 from arbiter.criteria import read_criteria
-from conftest import claude_events
+from conftest import claude_events, codex_events
 
 RAW_PLAN = """# Plan: fix the totals bug
 
@@ -125,11 +125,82 @@ def test_apply_carries_the_proving_tests_into_the_contract(tmp_path, shim_path, 
 
 
 def test_an_unpinned_plan_can_still_be_reviewed(tmp_path, shim_path, monkeypatch):
-    """The common case is critiquing a plan before freezing a contract."""
+    """The common case extracts a complete baseline before proposing edits."""
     monkeypatch.chdir(tmp_path)
-    (tmp_path / "raw.md").write_text(RAW_PLAN)
-    shim_path(claude_events(_report(MISSING)))
-    assert main(["plan", "review", "raw.md", "--models", "claude"]) == 0
+    plan = tmp_path / "raw.md"
+    plan.write_text(RAW_PLAN)
+    combined = json.dumps(
+        {
+            "criteria": ["total() handles every supplied list"],
+            "findings": [MISSING],
+        }
+    )
+    # The fake returns the same content to extraction, review, and consolidation;
+    # each phase reads only the key its schema requested.
+    shim_path(claude_events(combined))
+    assert main(["plan", "review", "raw.md", "--models", "claude", "--apply"]) == 0
+    texts = [c.text for c in read_criteria(plan.read_text())]
+    assert texts == ["total() handles every supplied list", "total([]) returns 0"]
+
+
+def test_unparseable_reviewer_output_cannot_report_a_plan_ready(tmp_path, shim_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "plan.md").write_text(PINNED)
+    shim_path(claude_events("I reviewed it; looks fine."))
+    assert main(["plan", "review", "plan.md", "--models", "claude"]) == 4
+
+
+def test_a_valid_empty_consolidation_can_clear_raw_findings(
+    tmp_path, shim_path, monkeypatch, capsys
+):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "plan.md").write_text(PINNED)
+    shim_path(
+        per_provider={
+            "codex": codex_events(_report(AMBIGUOUS)),
+            "claude": claude_events(_report()),
+        }
+    )
+    code = main(["plan", "review", "plan.md", "--models", "codex", "--judge", "claude"])
+    assert code == 0
+    assert "ready to pin" in capsys.readouterr().out.lower()
+
+
+def test_an_incomplete_reviewer_keeps_its_usable_findings(tmp_path, shim_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "plan.md").write_text(PINNED)
+    bad_target = {
+        **AMBIGUOUS,
+        "target": "AC-999",
+        "problem": "this target was hallucinated",
+    }
+    shim_path(
+        per_provider={
+            "codex": codex_events(_report(AMBIGUOUS, MISSING, bad_target)),
+            "claude": claude_events(_report(AMBIGUOUS, MISSING)),
+        }
+    )
+    code = main(
+        [
+            "plan",
+            "review",
+            "plan.md",
+            "--models",
+            "codex",
+            "--judge",
+            "claude",
+            "--json",
+        ]
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert code == 1  # the incomplete reviewer still prevents READY
+    assert payload["failed_reviewers"] == ["codex"]
+    assert {finding["problem"] for finding in payload["findings"]} == {
+        AMBIGUOUS["problem"],
+        MISSING["problem"],
+    }
+    assert "incomplete review" in captured.err
 
 
 def test_json_output_is_machine_readable(tmp_path, shim_path, monkeypatch, capsys):

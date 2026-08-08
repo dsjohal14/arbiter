@@ -29,8 +29,8 @@ empty, because a user's repo can be in exactly that state.
 
 | | Count | Time | What it covers |
 |---|---|---|---|
-| `tests/unit/` | 177 | ~5s | Pure functions: parsing, verdict logic, prompt construction |
-| `tests/integration/` | 70 | ~30s | Real subprocesses, real git worktrees, the CLI through `main()` |
+| `tests/unit/` | 182 | ~5s | Pure functions: parsing, verdict logic, prompt construction |
+| `tests/integration/` | 75 | ~30s | Real subprocesses, real git worktrees, the CLI through `main()` |
 
 Iterate with `make test-unit`. Run `make check` before you push.
 
@@ -53,9 +53,13 @@ A mock has none of those. A test against one would pass while production failed.
 
 ```python
 def test_something(shim_path):
-    shim_path(claude_events("hello"))                    # same reply for all
-    shim_path(per_provider={"claude": claude_events("x")})  # or per provider
-    shim_path(hang=60)                                   # never exits
+    # the same reply for every provider
+    shim_path(claude_events("hello"))
+    # a different reply per provider
+    shim_path(per_provider={"claude": claude_events("x")})
+    # never exits, for timeout and cleanup tests
+    shim_path(hang=60)
+    # a provider that dies with a message on stderr
     shim_path(claude_events("x"), exit_code=2, stderr="auth expired")
 ```
 
@@ -69,7 +73,9 @@ simulate one reviewer failing.
 a fixing branch, because `check_test_discriminates` creates a git worktree and
 runs the cited test against the old code. One test asserts the working tree is
 left clean and the temporary worktree removed — that check is the reason it is
-safe to point this at your own repo.
+safe to point this at your own repo. Another plants the active branch's `src/`
+on `PYTHONPATH` and proves the base run still imports the checked-out package,
+guarding against editable installs that would compare HEAD with itself.
 
 ### The suite never calls a real provider
 

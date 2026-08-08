@@ -33,6 +33,7 @@ from .evidence import (
     check_test_citation,
     check_test_discriminates,
     test_citation_path,
+    test_node_changed,
 )
 from .models import IsolationMode, ModelCallError, Session, call_session, make_session
 from .prompts import Blinding, blind
@@ -545,14 +546,17 @@ def apply_evidence_checks(
                 "plan-selected test changed in this diff; strict evidence must be unchanged "
                 "from the trusted baseline",
             )
-        elif (
-            require_discriminating_tests
-            and result.baseline_check is not None
-            and (result.baseline_check.verified is False)
+        elif require_discriminating_tests and (
+            result.baseline_check is None or result.baseline_check.verified is not True
         ):
+            detail = (
+                result.baseline_check.detail
+                if result.baseline_check is not None
+                else "no base revision was available for comparison"
+            )
             downgrade(
                 "untested",
-                f"cited test {result.baseline_check.detail}",
+                f"test discrimination not confirmed: {detail}",
             )
         elif require_pinned_evidence and not result.is_unchanged_plan_selection:
             # The test passes, but nothing establishes that it covers THIS
@@ -661,6 +665,23 @@ def _merge(
     return results
 
 
+def refresh_plan_selected_evidence(
+    results: list[CriterionResult], root: Path, base_dir: Path
+) -> None:
+    """Refine file-level stale-evidence detection to the selected test node.
+
+    Diff parsing initially marks any selected test in a modified file as stale.
+    Before baseline checks replace that file in the temporary worktree, compare
+    the actual AST node. A newly added node—or an unchanged node beside another
+    edit—keeps the plan author's selection. An unreadable comparison fails closed.
+    """
+    for result in results:
+        if result.evidence_source != "plan_selected_changed" or not result.test_evidence:
+            continue
+        if test_node_changed(result.test_evidence, root, base_dir) is False:
+            result.evidence_source = "plan_selected"
+
+
 async def run_verify(
     plan: str,
     diff: str,
@@ -760,6 +781,10 @@ async def run_verify(
         if want_baseline
         else nullcontext(None) as base_dir
     ):
+        if base_dir is not None:
+            # Must happen before check_test_discriminates copies current test
+            # files over their base versions in the shared worktree.
+            refresh_plan_selected_evidence(results, root or Path.cwd(), base_dir)
         for r in results:
             apply_evidence_checks(
                 r,

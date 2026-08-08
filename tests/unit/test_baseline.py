@@ -16,8 +16,22 @@ import sys
 
 import pytest
 
-from arbiter.evidence import check_test_discriminates
-from arbiter.verify import added_paths, changed_paths, resolve_base_ref
+from arbiter.evidence import (
+    base_worktree,
+    check_test_discriminates,
+)
+from arbiter.evidence import (
+    test_node_changed as _test_node_changed,
+)
+from arbiter.verify import (
+    CriterionResult,
+    added_paths,
+    apply_evidence_checks,
+    changed_paths,
+    derive_verdict,
+    refresh_plan_selected_evidence,
+    resolve_base_ref,
+)
 
 PYTEST = [sys.executable, "-m", "pytest"]
 
@@ -30,7 +44,11 @@ def _git(*args, cwd):
 def repo(tmp_path):
     """A repo whose base is buggy and whose branch fixes it."""
     (tmp_path / "tests").mkdir()
+    (tmp_path / "src" / "samplepkg").mkdir(parents=True)
     (tmp_path / "app.py").write_text("def total(items):\n    return sum(items[1:])\n")
+    (tmp_path / "src" / "samplepkg" / "__init__.py").write_text(
+        "def total(items):\n    return sum(items[1:])\n"
+    )
     (tmp_path / "tests" / "test_app.py").write_text(
         "from app import total\n\n\ndef test_old():\n    assert total([9, 1, 2]) == 3\n"
     )
@@ -43,10 +61,18 @@ def repo(tmp_path):
     # The fix lands on a branch, so `main` keeps pointing at the buggy base.
     _git("checkout", "-qb", "feat", cwd=tmp_path)
     (tmp_path / "app.py").write_text("def total(items):\n    return sum(items)\n")
+    (tmp_path / "src" / "samplepkg" / "__init__.py").write_text(
+        "def total(items):\n    return sum(items)\n"
+    )
     (tmp_path / "tests" / "test_app.py").write_text(
         "from app import total\n\n\n"
         "def test_sums_all():\n    assert total([1, 2]) == 3\n\n\n"
-        "def test_vacuous():\n    assert True\n"
+        "def test_vacuous():\n    assert True\n\n\n"
+        "def test_added_to_existing_file():\n    assert total([1, 2]) == 3\n"
+    )
+    (tmp_path / "tests" / "test_src_layout.py").write_text(
+        "from samplepkg import total\n\n\n"
+        "def test_imports_the_checked_out_package():\n    assert total([1, 2]) == 3\n"
     )
     _git("add", "-A", cwd=tmp_path)
     _git("commit", "-qm", "fix", cwd=tmp_path)
@@ -66,6 +92,54 @@ def test_a_vacuous_test_does_not_discriminate(repo):
     check = check_test_discriminates("tests/test_app.py::test_vacuous", repo, "main", PYTEST)
     assert check.verified is False
     assert "does not distinguish" in check.detail
+
+
+def test_the_base_run_does_not_import_the_current_editable_source(repo, monkeypatch):
+    """An editable install commonly leaves the current src/ on PYTHONPATH. The
+    baseline must replace it with the checked-out src/ or it compares HEAD twice."""
+    monkeypatch.setenv("PYTHONPATH", str(repo / "src"))
+    check = check_test_discriminates(
+        "tests/test_src_layout.py::test_imports_the_checked_out_package", repo, "main", PYTEST
+    )
+    assert check.verified is True
+
+
+def test_a_new_node_in_an_existing_test_file_does_not_stale_plan_approval(repo):
+    with base_worktree(repo, "main") as base:
+        assert base is not None
+        assert (
+            _test_node_changed("tests/test_app.py::test_added_to_existing_file", repo, base)
+            is False
+        )
+        result = CriterionResult(
+            id="AC-1",
+            text="sum every item",
+            status="met",
+            test_evidence="tests/test_app.py::test_added_to_existing_file",
+            evidence_source="plan_selected_changed",
+        )
+        refresh_plan_selected_evidence([result], repo, base)
+        assert result.evidence_source == "plan_selected"
+
+
+def test_strict_discrimination_rejects_an_uncheckable_base(repo):
+    result = CriterionResult(
+        id="AC-1",
+        text="sum every item",
+        status="met",
+        implementation_evidence="app.py:2",
+        test_evidence="tests/test_app.py::test_sums_all",
+        evidence_source="plan_selected",
+    )
+    apply_evidence_checks(
+        result,
+        repo,
+        PYTEST,
+        base_ref="definitely-not-a-ref",
+        require_discriminating_tests=True,
+    )
+    assert result.status == "untested"
+    assert derive_verdict([result], require_pinned_evidence=True) == "fail"
 
 
 def test_the_working_tree_is_left_untouched(repo):

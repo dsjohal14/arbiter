@@ -418,6 +418,49 @@ def test_bare_diff_flag_defaults_to_staged(repo):
     )
 
 
+def test_strict_discrimination_without_a_base_is_a_usage_error_before_review(
+    repo, shim_path, capsys
+):
+    argv_log = shim_path(claude_events(_review()))
+    code = main(
+        [
+            "verify",
+            "--plan",
+            "plan.md",
+            "--diff",
+            "change.diff",
+            "--require-discriminating-tests",
+            "--models",
+            "claude",
+        ]
+    )
+    assert code == EXIT_USAGE
+    err = capsys.readouterr().err
+    assert "needs a base revision" in err
+    assert "--base <ref>" in err
+    assert not argv_log.exists(), "preflight must happen before any provider call"
+
+
+def test_strict_discrimination_cannot_disable_test_execution(repo, shim_path, capsys):
+    argv_log = shim_path(claude_events(_review()))
+    code = main(
+        [
+            "verify",
+            "--plan",
+            "plan.md",
+            "--diff",
+            "working",
+            "--require-discriminating-tests",
+            "--no-run-tests",
+            "--models",
+            "claude",
+        ]
+    )
+    assert code == EXIT_USAGE
+    assert "cannot be used with --no-run-tests" in capsys.readouterr().err
+    assert not argv_log.exists(), "preflight must happen before any provider call"
+
+
 # ── Relevance: what "verified by a test" does and does not prove ─────────────
 
 

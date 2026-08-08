@@ -13,6 +13,7 @@ Everything here is deliberately dumb and deterministic. No model is consulted.
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import importlib.util
 import os
@@ -74,6 +75,61 @@ def test_citation_path(citation: str) -> str | None:
     """Return the repository-relative path from a pytest node citation."""
     m = _TEST_CITATION_RE.search(citation or "")
     return m.group("path") if m else None
+
+
+def _test_ast_node(citation: str, root: Path) -> tuple[bool, ast.AST | None]:
+    """Return (readable, node) for a pytest function/class citation.
+
+    `node is None` with `readable=True` means the test did not exist in that
+    tree. Parse/read failures stay distinct so callers can fail closed.
+    """
+    m = _TEST_CITATION_RE.search(citation or "")
+    if not m:
+        return False, None
+    path = _safe_path(m.group("path"), root)
+    if path is None or not path.is_file():
+        return True, None
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, SyntaxError):
+        return False, None
+
+    names = m.group("node").split("::")
+    names[-1] = names[-1].split("[", 1)[0]
+    body = tree.body
+    found: ast.AST | None = None
+    for name in names:
+        found = next(
+            (
+                item
+                for item in body
+                if isinstance(item, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+                and item.name == name
+            ),
+            None,
+        )
+        if found is None:
+            return True, None
+        body = found.body if isinstance(found, ast.ClassDef) else []
+    return True, found
+
+
+def test_node_changed(citation: str, head: Path, base: Path) -> bool | None:
+    """Whether the selected pytest node itself changed from base to HEAD.
+
+    A node absent at base is newly written evidence, not a rewrite of evidence
+    the plan author previously approved. `None` means comparison was impossible
+    and callers must preserve the conservative changed-file classification.
+    """
+    head_ok, head_node = _test_ast_node(citation, head)
+    base_ok, base_node = _test_ast_node(citation, base)
+    if not head_ok or not base_ok or head_node is None:
+        return None
+    if base_node is None:
+        return False
+    return ast.dump(head_node, include_attributes=False) != ast.dump(
+        base_node, include_attributes=False
+    )
 
 
 @dataclass
@@ -255,6 +311,75 @@ def base_worktree(root: Path, ref: str) -> Iterator[Path | None]:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+_BASELINE_SITECUSTOMIZE = """\
+import os
+import sys
+from pathlib import Path
+
+
+def resolved(value):
+    try:
+        return str(Path(value or ".").resolve())
+    except OSError:
+        return value
+
+
+current = resolved(os.environ["ARBITER_CURRENT_ROOT"])
+base = Path(os.environ["ARBITER_BASE_ROOT"]).resolve()
+blocked = {current, str(Path(current) / "src"), str(Path(current) / "lib")}
+sys.path[:] = [entry for entry in sys.path if resolved(entry) not in blocked]
+
+# PEP 660 editable installs can use a meta-path finder rather than a plain .pth
+# entry. Drop only finders whose mapping points back into the active checkout.
+kept = []
+for finder in sys.meta_path:
+    module = sys.modules.get(getattr(finder, "__module__", ""))
+    mapping = getattr(module, "MAPPING", {}) if module else {}
+    if any(resolved(path) == current or resolved(path).startswith(current + os.sep) for path in mapping.values()):
+        continue
+    kept.append(finder)
+sys.meta_path[:] = kept
+
+candidates = [base / "src", base / "lib", base]
+for candidate in reversed([path for path in candidates if path.exists()]):
+    text = str(candidate)
+    if text not in sys.path:
+        sys.path.insert(0, text)
+"""
+
+
+def _baseline_env(root: Path, base: Path, scrub_env: bool) -> dict[str, str]:
+    """Build an environment that imports project code from the base worktree.
+
+    Reusing the caller's Python is intentional—it already has pytest and project
+    dependencies—but its editable install must not make the base run import HEAD.
+    A sitecustomize hook runs after .pth files and removes only paths/finders for
+    the active checkout, leaving the interpreter's site-packages available.
+    """
+    env = scrubbed_env() if scrub_env else os.environ.copy()
+    bootstrap = base / ".arbiter-pythonpath"
+    bootstrap.mkdir(exist_ok=True)
+    (bootstrap / "sitecustomize.py").write_text(_BASELINE_SITECUSTOMIZE, encoding="utf-8")
+
+    blocked = {root.resolve(), (root / "src").resolve(), (root / "lib").resolve()}
+    inherited = []
+    for raw in env.get("PYTHONPATH", "").split(os.pathsep):
+        if not raw:
+            continue
+        try:
+            if Path(raw).resolve() in blocked:
+                continue
+        except OSError:
+            pass
+        inherited.append(raw)
+
+    env["PYTHONPATH"] = os.pathsep.join([str(bootstrap), *inherited])
+    env["PYTHONNOUSERSITE"] = "1"
+    env["ARBITER_CURRENT_ROOT"] = str(root.resolve())
+    env["ARBITER_BASE_ROOT"] = str(base.resolve())
+    return env
+
+
 def check_test_discriminates(
     citation: str,
     root: Path,
@@ -304,6 +429,7 @@ def check_test_discriminates(
             return EvidenceCheck("baseline", node, None, "no test runner detected")
 
         try:
+            env = _baseline_env(root, base, scrub_env)
             proc = subprocess.run(
                 [*cmd, node, "-q", "--no-header"],
                 cwd=base,
@@ -311,7 +437,7 @@ def check_test_discriminates(
                 text=True,
                 timeout=TEST_TIMEOUT,
                 check=False,
-                env=scrubbed_env() if scrub_env else None,
+                env=env,
             )
         except subprocess.TimeoutExpired:
             return EvidenceCheck("baseline", node, None, "timed out against the base revision")
