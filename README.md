@@ -2,15 +2,20 @@
 
 [![CI](https://github.com/dsjohal/arbiter/actions/workflows/ci.yml/badge.svg)](https://github.com/dsjohal/arbiter/actions/workflows/ci.yml)
 
-> Did the implementation actually keep the plan's promises?
+> The contract layer between an AI coding plan and the code an agent ships.
 
-An agent wrote the plan. An agent wrote the code. Arbiter checks the contract
-between them — criterion by criterion, with evidence it verifies itself.
+Before coding, Arbiter finds the holes in the plan. After coding, it checks
+whether the agent kept every promise.
 
 ```bash
-arbiter plan pin plan.md          # extract acceptance criteria, once
-arbiter verify --plan plan.md --diff
+arbiter plan review plan.md    # is this plan good enough to build from?
+arbiter plan pin plan.md       # this is the approved contract
+arbiter verify --plan plan.md --diff   # did the implementation keep it?
 ```
+
+The failure mode this exists for is familiar: an agent writes a good-looking
+plan, implements most of it, reports success, and quietly skips an edge case, a
+migration step, or a security constraint.
 
 ```
 ╔══════════════════════════════════════════╗
@@ -45,6 +50,56 @@ arbiter verify --plan plan.md --diff
 Every criterion gets a row — including the ones that are fine. That is the point:
 a review tool that returns an empty list for a clean diff gives you no way to
 tell "everything checks out" from "nobody actually looked."
+
+---
+
+## Before the code: `arbiter plan review`
+
+A vague plan doesn't fail loudly — it produces an agent that picks an
+interpretation and calls it done. Plan review finds those spots while they're
+still cheap, and **every finding is a proposed edit to the acceptance criteria,
+not a paragraph of concern**:
+
+```
+╔══════════════════════════════════════════╗
+║  !  PLAN: 5 BLOCKING                     ║
+╚══════════════════════════════════════════╝
+
+  ambiguous 2   missing 3   needs_human 3
+
+  3. + ADD missing
+       The plan never states how a 'client' is identified for counting, so an
+       implementer could key on a spoofable header and let attackers bypass
+       the limiter entirely.
+       plan says: "Store the counters somewhere fast."
+       criterion: Requests are attributed to a client using a non-spoofable
+                  identifier, and forged client-identifying headers cannot be
+                  used to evade the limit.
+       test:      tests/integration/test_rate_limiter.py::test_spoofed_client_header_does_not_bypass_limit
+
+  6. ? DECIDE needs_human BLOCKING
+       The author must fix the request-rate threshold, the time window, and the
+       dimension being limited; 'a reasonable number of requests' gives an
+       implementer nothing to build or test against.
+```
+
+`--apply` writes the revised criteria straight into the plan. It exits non-zero
+while blocking problems remain, so an agent can be told not to start until it
+passes.
+
+| Kind | Blocks? | Meaning |
+|---|---|---|
+| `contradiction` | ✓ | two requirements that cannot both hold |
+| `ambiguous` | ✓ | an agent will pick an interpretation and call it done |
+| `untestable` | ✓ | no test could settle whether it was met |
+| `needs_human` | ✓ | a decision a model shouldn't make on your behalf |
+| `missing` | — | an edge case, error path, migration, or constraint |
+| `unnecessary` | — | scope that doesn't belong in this change |
+
+**This is also what makes strict verification affordable.** Naming the test that
+proves each criterion is tedious to retrofit — here it falls out of reviewing the
+plan, and it happens *before the code exists*, which is the only moment at which
+you can't pick whichever test happens to be green.
 
 ---
 
@@ -190,10 +245,13 @@ refuse to serve you.
 ## Usage
 
 ```bash
-# 1. Pin the criteria into the plan (once, then review and edit them)
+# 1. Critique the plan, and apply the proposed criteria
+arbiter plan review plan.md --apply
+
+# 2. Or extract criteria from a plan you're happy with
 arbiter plan pin plan.md
 
-# 2. Gate a change against them
+# 3. Gate a change against them
 arbiter verify --plan plan.md --diff                      # staged
 arbiter verify --plan plan.md --diff working              # unstaged
 arbiter verify --plan plan.md --diff origin/main...HEAD   # a revision range
@@ -230,6 +288,7 @@ The extracted list is a starting point. Read it and edit it — it's your contra
 
 | Flag | Default | Description |
 |------|---------|-------------|
+| `--apply` | off | (`plan review`) Write the proposed criteria into the plan |
 | `--plan` | — | Plan file (or `-` for stdin). Required by `verify`. |
 | `--diff` | `staged` | Bare, or `working`, a revision range, a path, or `-` |
 | `--require-tests` | off | Treat `untested` as a failure |
@@ -335,6 +394,7 @@ limits — `ARG_MAX` is 1 MiB on macOS, and Linux caps any single argument at
 ```
 src/arbiter/
 ├── cli.py           # subcommands, stdin, exit codes
+├── plan_review.py   # critique a plan into proposed contract edits
 ├── criteria.py      # extract, pin, and read acceptance criteria
 ├── verify.py        # the gate: prompts, statuses, verdict derivation
 ├── evidence.py      # mechanical checking — read lines, run tests
@@ -355,7 +415,7 @@ Adding a provider is one `Provider` entry plus a branch in the event parser.
 
 ```bash
 uv pip install -e . pytest pytest-asyncio pytest-cov ruff
-pytest          # 209 tests
+pytest          # 247 tests
 ruff check src/ tests/
 ```
 
@@ -383,8 +443,11 @@ escalation, argv size limits, and stderr backpressure.
 
 ## Roadmap
 
-- [ ] Validate against 15–20 real AI-generated changes with seeded defects;
-      measure confirmed findings, false positives, latency, and cost
+- [ ] Validate the loop on 15–20 real agent implementations: does plan review
+      catch the requirements verify later flags? Measure missed requirements,
+      false positives, latency, and cost
+- [ ] An Arbiter agent skill, so you can say "review this plan before
+      implementing" and "don't declare it done until the gate passes"
 - [ ] Test-runner support beyond pytest (jest, cargo, go test)
 - [ ] Record/replay of provider streams for deterministic, zero-cost reruns
 - [ ] Per-run cost and token accounting (the data is already in the stream)

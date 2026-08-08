@@ -322,3 +322,61 @@ def print_error(msg: str) -> None:
 
 def print_note(msg: str) -> None:
     print(_c(f"  {msg}", DIM))
+
+
+# ── Plan review ───────────────────────────────────────────────────────────────
+
+_KIND_COLORS = {
+    "contradiction": RED,
+    "ambiguous": RED,
+    "untestable": YELLOW,
+    "needs_human": MAGENTA,
+    "missing": YELLOW,
+    "unnecessary": CYAN,
+}
+
+_ACTION_GLYPH = {
+    "add": "+",
+    "revise": "~",
+    "split": "⑂",
+    "remove": "-",
+    "decide": "?",
+}
+
+
+def print_plan_verdict(ready: bool, counts: dict[str, int], blocking: int) -> None:
+    color = GREEN if ready else YELLOW
+    glyph = "✓" if ready else "!"
+    label = "READY TO PIN" if ready else f"{blocking} BLOCKING"
+    print()
+    print(_c("╔══════════════════════════════════════════╗", color))
+    print(_c(f"║  {glyph}  PLAN: {label:<31}║", BOLD, color))
+    print(_c("╚══════════════════════════════════════════╝", color))
+    print()
+    live = [(k, n) for k, n in counts.items() if n]
+    if live:
+        print("  " + "   ".join(f"{_c(k, _KIND_COLORS.get(k, WHITE))} {n}" for k, n in live))
+        print()
+
+
+def print_plan_finding(n: int, f: dict) -> None:
+    """One proposed edit to the contract. The point is that it is actionable —
+    a concern with no proposed change would just be commentary."""
+    kind = str(f.get("kind", ""))
+    action = str(f.get("action", ""))
+    color = _KIND_COLORS.get(kind, WHITE)
+    flag = _c(" BLOCKING", BOLD, RED) if f.get("blocking") else ""
+    target = f" {_c(f['target'], BOLD)}" if f.get("target") else ""
+
+    print(
+        f"  {_c(f'{n}.', BOLD)} {_c(_ACTION_GLYPH.get(action, '·'), BOLD, color)} "
+        f"{_c(action.upper(), BOLD, color)} {_c(kind, DIM)}{target}{flag}"
+    )
+    print(f"       {f.get('problem', '')}")
+    if f.get("quote"):
+        print(f"       {_c('plan says: ', DIM)}{_c(chr(34) + f['quote'] + chr(34), DIM)}")
+    if f.get("proposed_criterion"):
+        print(f"       {_c('criterion: ', DIM)}{f['proposed_criterion']}")
+    if f.get("proposed_test"):
+        print(f"       {_c('test:      ', DIM)}{_c(f['proposed_test'], CYAN)}")
+    print()

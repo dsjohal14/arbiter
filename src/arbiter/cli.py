@@ -3,6 +3,7 @@
 
 Drives locally installed CLI tools; no API keys needed.
 
+    arbiter plan review plan.md                 # is this plan good enough to build?
     arbiter plan pin plan.md                    # extract + pin acceptance criteria
     arbiter verify --plan plan.md --diff        # the gate
     arbiter debate "question"                   # multi-model debate + blinded judge
@@ -23,7 +24,7 @@ from pathlib import Path
 from typing import NoReturn
 
 from . import criteria as crit
-from . import display, doctor, verify
+from . import display, doctor, plan_review, verify
 from .debate import run_debate, run_followup_loop
 from .models import (
     DEFAULT_TIMEOUT,
@@ -174,6 +175,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     pl = sub.add_parser("plan", help="Work with plan files")
     plsub = pl.add_subparsers(dest="plan_command")
+    rev = plsub.add_parser("review", help="Critique a plan before it is built from")
+    rev.add_argument("file", help="Plan markdown file to critique")
+    rev.add_argument(
+        "--apply",
+        action="store_true",
+        help="Write the proposed criteria into the plan (review them first)",
+    )
+    _add_common(rev)
+
     pin = plsub.add_parser("pin", help="Extract acceptance criteria and pin them into the plan")
     pin.add_argument("file", help="Plan markdown file to pin criteria into")
     pin.add_argument("--force", action="store_true", help="Re-extract even if already pinned")
@@ -246,6 +256,65 @@ def _write_transcript(path: str, transcript: list[str]) -> None:
 
 
 # ── Commands ──────────────────────────────────────────────────────────────────
+
+
+async def cmd_plan_review(args: argparse.Namespace) -> int:
+    """Critique a plan before anything is built from it.
+
+    Exits non-zero while blocking problems remain, so an agent skill can be told
+    not to start implementing until this passes.
+    """
+    keys, judge = _resolve_models(args.models, args.judge)
+    path = Path(args.file)
+    if not path.is_file():
+        _usage_error(f"Plan file not found: {args.file}")
+
+    text = path.read_text(encoding="utf-8")
+    if not text.strip():
+        _usage_error("The plan is empty.")
+
+    # Criteria are optional here: reviewing an unpinned plan is the common case,
+    # since the point is to fix it *before* freezing a contract.
+    criteria = crit.read_criteria(text) if crit.is_pinned(text) else []
+
+    isolation = "open" if args.allow_tools else "readonly"
+    reviewers, consolidator = plan_review.make_review_sessions(keys, judge, isolation)
+    names = {k: s.label() for k, s in reviewers.items()}
+
+    if not args.as_json:
+        display.print_note(
+            f"Critiquing {args.file} ({len(text.splitlines())} lines, "
+            f"{len(criteria)} pinned criteria) · reviewers: {', '.join(names.values())}"
+        )
+
+    result = await plan_review.run_plan_review(
+        plan=text,
+        criteria=criteria,
+        reviewers=reviewers,
+        consolidator=consolidator,
+        consolidator_name=consolidator.label(),
+        names=names,
+        verbose=args.verbose,
+        timeout=args.timeout,
+        seed=args.seed,
+    )
+
+    if args.as_json:
+        json.dump(result.as_dict(), sys.stdout, indent=2)
+        sys.stdout.write("\n")
+    else:
+        plan_review.render(result, show_criteria=not args.apply)
+
+    if args.apply:
+        if not result.criteria:
+            display.print_error("Nothing to apply: no criteria were produced.")
+            return EXIT_RUNTIME
+        path.write_text(crit.pin_into(text, result.criteria), encoding="utf-8")
+        display.print_note(
+            f"✎  Wrote {len(result.criteria)} criteria into {args.file}. "
+            "Read them before implementing — they are the contract."
+        )
+    return result.exit_code
 
 
 async def cmd_plan_pin(args: argparse.Namespace) -> int:
@@ -439,9 +508,11 @@ async def _dispatch(args: argparse.Namespace) -> int:
     if args.command == "verify":
         return await cmd_verify(args)
     if args.command == "plan":
-        if args.plan_command != "pin":
-            _usage_error("usage: arbiter plan pin <plan.md>")
-        return await cmd_plan_pin(args)
+        if args.plan_command == "review":
+            return await cmd_plan_review(args)
+        if args.plan_command == "pin":
+            return await cmd_plan_pin(args)
+        _usage_error("usage: arbiter plan review <plan.md> | arbiter plan pin <plan.md>")
     if args.command == "debate":
         return await cmd_debate(args)
     if args.command == "doctor":
