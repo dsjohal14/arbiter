@@ -1,9 +1,10 @@
 """Transport layer: driving Claude Code, Codex, and Gemini CLI as persistent sessions.
 
 Each model runs as one *persistent* CLI session, streamed live. Session ids are
-pre-assigned as UUIDs where the provider supports it, so `_build_cmd` is a pure
-function of `(Session, prompt)` — which is what makes it testable, and what stops
-two sessions of the same provider from resuming each other.
+pre-assigned as UUIDs where the provider supports it, so `_build_cmd` is
+deterministic in `(Session, prompt)` — which is what makes every flag decision
+unit-testable, and what stops two sessions of the same provider from resuming
+each other.
 
 Providers differ in what they can be asked to do. Rather than pretend parity, the
 `Provider` record states each one's capabilities and `_build_cmd` reads from it.
@@ -169,13 +170,23 @@ def make_arbiter_session(
 
 
 def _schema_args(sess: Session, schema_path_writer: Callable[[dict], str] | None) -> list[str]:
-    """Structured-output flags, when the provider and caller both support it."""
+    """Structured-output flags, when the provider supports them.
+
+    A provider with no structured-output support (gemini) silently gets nothing —
+    that asymmetry is expected and handled by the prose fallback. A provider that
+    needs the schema on disk but was given no writer is a *caller* bug, and is
+    raised rather than swallowed: dropping it would run the model unstructured
+    with no signal that the requested schema never applied.
+    """
     p = sess.provider
     if not sess.output_schema or not p.output_schema_flag:
         return []
     if p.output_schema_as_file:
         if schema_path_writer is None:
-            return []
+            raise ValueError(
+                f"{p.cli} needs its schema written to a file, but no "
+                f"schema_path_writer was supplied to call_session()."
+            )
         return [p.output_schema_flag, schema_path_writer(sess.output_schema)]
     return [p.output_schema_flag, json.dumps(sess.output_schema)]
 
@@ -185,7 +196,13 @@ def _build_cmd(
     prompt: str,
     schema_path_writer: Callable[[dict], str] | None = None,
 ) -> list[str]:
-    """Build the CLI invocation for `sess`. Pure function of its arguments.
+    """Build the CLI invocation for `sess`.
+
+    Deterministic in `(sess, prompt)`: the same session and prompt always produce
+    the same command, which is what makes every flag decision unit-testable. The
+    one impurity is deliberate and injected — `schema_path_writer` materializes a
+    schema to disk for providers that take a path rather than inline JSON, and
+    the caller owns that file's lifetime.
 
     Uses the resume form once the session has been started. Session ids are
     pre-assigned where the provider allows, so two sessions of the same provider
@@ -237,6 +254,32 @@ def _build_cmd(
 # ── Streaming event parser ───────────────────────────────────────────────────
 
 
+def _unwrap_provider_error(msg: object) -> str:
+    """Pull the human-readable sentence out of a provider error.
+
+    Providers nest the real cause inside a JSON-encoded string, sometimes twice.
+    Left raw, a genuinely actionable message ("requires a newer version of
+    Codex") is buried under transport noise the user can do nothing with.
+    """
+    text = str(msg or "").strip()
+    for _ in range(3):
+        if not text.startswith("{"):
+            break
+        try:
+            obj = json.loads(text)
+        except json.JSONDecodeError:
+            break
+        if not isinstance(obj, dict):
+            break
+        nxt = obj.get("error") or obj.get("message")
+        if isinstance(nxt, dict):
+            nxt = nxt.get("message")
+        if not nxt:
+            break
+        text = str(nxt).strip()
+    return text or "provider reported an unspecified error"
+
+
 def _parse_event(cli: str, obj: dict) -> list[tuple[str, str | None]]:
     """Map one JSON event to ('session' | 'delta' | 'done', payload) pairs.
 
@@ -264,7 +307,10 @@ def _parse_event(cli: str, obj: dict) -> list[tuple[str, str | None]]:
                 if d.get("type") == "text_delta":
                     out.append(("delta", d.get("text", "")))
         elif t == "result":
-            out.append(("done", obj.get("result")))
+            if obj.get("is_error"):
+                out.append(("error", _unwrap_provider_error(obj.get("result"))))
+            else:
+                out.append(("done", obj.get("result")))
             if obj.get("session_id"):
                 out.append(("session", obj["session_id"]))
 
@@ -280,6 +326,9 @@ def _parse_event(cli: str, obj: dict) -> list[tuple[str, str | None]]:
                 out.append(("delta", item.get("text", "")))
         elif t == "turn.completed":
             out.append(("done", None))
+        elif t in ("error", "turn.failed"):
+            msg = obj.get("message") or (obj.get("error") or {}).get("message")
+            out.append(("error", _unwrap_provider_error(msg)))
 
     elif cli == "gemini":
         if t == "init":
@@ -289,6 +338,8 @@ def _parse_event(cli: str, obj: dict) -> list[tuple[str, str | None]]:
             out.append(("delta", obj.get("content", "")))
         elif t == "result":
             out.append(("done", None))
+        elif t == "error":
+            out.append(("error", _unwrap_provider_error(obj.get("message") or obj.get("error"))))
 
     return out
 
@@ -337,6 +388,7 @@ async def _consume(
     buf: list[str] = []
     final: str | None = None
     captured_sid: str | None = None
+    provider_error: str | None = None
 
     async for raw in proc.stdout:
         line = raw.decode(errors="replace").strip()
@@ -355,9 +407,16 @@ async def _consume(
                     await on_delta(sess.key, payload)
             elif kind == "done" and payload:
                 final = payload
+            elif kind == "error" and payload:
+                provider_error = payload
 
     await proc.wait()
     stderr = (await stderr_task).decode(errors="replace").strip()
+
+    # A provider that told us *why* it failed beats anything we can infer from an
+    # exit code or from stderr, which is usually startup noise.
+    if provider_error:
+        raise ModelCallError(f"{sess.cli}: {provider_error}")
 
     if proc.returncode not in (0, None):
         raise ModelCallError(

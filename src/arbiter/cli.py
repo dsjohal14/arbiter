@@ -18,6 +18,7 @@ import argparse
 import asyncio
 import json
 import sys
+from typing import NoReturn
 
 from . import display, doctor, verify
 from .debate import run_debate, run_followup_loop
@@ -142,6 +143,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
+def _usage_error(msg: str) -> NoReturn:
+    """Exit 2, not 1. `SystemExit("message")` exits 1, which collides with the
+    `fail` verdict — a CI job could not tell a real failure from a typo."""
+    display.print_error(msg)
+    raise SystemExit(EXIT_USAGE)
+
+
 def _resolve_models(spec: str, judge: str) -> tuple[list[str], str]:
     """Validate provider names. Unknown names are a usage error, not silently
     dropped — `--models claude,gpt4` used to run a one-model 'debate'."""
@@ -154,15 +162,13 @@ def _resolve_models(spec: str, judge: str) -> tuple[list[str], str]:
 
     valid = ", ".join(sorted(VALID_MODELS))
     if unknown:
-        raise SystemExit(
-            f"arbiter: unknown provider(s): {', '.join(unknown)}. Choose from: {valid}"
-        )
+        _usage_error(f"unknown provider(s): {', '.join(unknown)}. Choose from: {valid}")
     if not keys:
-        raise SystemExit(f"arbiter: no providers selected. Choose from: {valid}")
+        _usage_error(f"no providers selected. Choose from: {valid}")
 
     judge = judge.strip().lower()
     if judge not in VALID_MODELS:
-        raise SystemExit(f"arbiter: unknown judge '{judge}'. Choose from: {valid}")
+        _usage_error(f"unknown judge '{judge}'. Choose from: {valid}")
     return keys, judge
 
 
@@ -232,12 +238,12 @@ async def cmd_verify(args: argparse.Namespace) -> int:
 async def cmd_debate(args: argparse.Namespace) -> int:
     keys, judge = _resolve_models(args.models, args.judge)
     if args.rounds < 1:
-        raise SystemExit("arbiter: --rounds must be at least 1.")
+        _usage_error("--rounds must be at least 1.")
 
     isolation = "open" if args.allow_tools else "readonly"
     prompt = _read_prompt(args.prompt)
     if not prompt:
-        raise SystemExit("arbiter: prompt cannot be empty.")
+        _usage_error("prompt cannot be empty.")
 
     debaters = make_debater_sessions(keys, isolation=isolation)
     arbiter = make_arbiter_session(judge, isolation=isolation, output_schema=JUDGE_SCHEMA)

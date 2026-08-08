@@ -112,13 +112,23 @@ def test_seed_makes_a_run_reproducible(gate, capsys):
 # ── Usage errors ─────────────────────────────────────────────────────────────
 
 
-def test_unknown_provider_is_a_usage_error_not_a_silent_drop(tmp_path):
-    """`--models claude,gpt4` used to quietly run a one-model 'debate'."""
+def test_unknown_provider_is_a_usage_error_not_a_silent_drop(tmp_path, capsys):
+    """`--models claude,gpt4` used to quietly run a one-model 'debate'. It must
+    now exit 2 — not 1, which would be indistinguishable from a `fail` verdict."""
     plan = tmp_path / "p.md"
     plan.write_text("# Plan\n")
     with pytest.raises(SystemExit) as e:
         main(["verify", "--plan", str(plan), "--models", "claude,gpt4"])
-    assert "gpt4" in str(e.value)
+    assert e.value.code == EXIT_USAGE
+    assert "gpt4" in capsys.readouterr().err
+
+
+def test_unknown_judge_is_a_usage_error(tmp_path):
+    plan = tmp_path / "p.md"
+    plan.write_text("# Plan\n")
+    with pytest.raises(SystemExit) as e:
+        main(["verify", "--plan", str(plan), "--judge", "bogus"])
+    assert e.value.code == EXIT_USAGE
 
 
 def test_missing_plan_file_is_a_usage_error(tmp_path):
