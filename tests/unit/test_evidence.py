@@ -11,7 +11,7 @@ import sys
 
 import pytest
 
-from arbiter.evidence import check_file_citation, check_test_citation
+from arbiter.evidence import check_file_citation, check_test_citation, detect_test_command
 from arbiter.verify import CriterionResult, apply_evidence_checks
 
 # pytest is importable here but not necessarily on PATH.
@@ -50,13 +50,66 @@ def test_a_line_past_the_end_of_the_file_is_refuted(repo):
     assert "900 does not exist" in check.detail
 
 
-def test_a_path_escaping_the_repo_is_refused(repo, tmp_path_factory):
-    """A citation must not be able to read files outside the repository."""
-    outside = tmp_path_factory.mktemp("outside") / "secret.py"
+def test_a_path_escaping_the_repo_is_refused(repo):
+    """A citation must not be able to read files outside the repository.
+
+    The target must genuinely EXIST, or the test passes for the wrong reason:
+    a non-existent outside path is refused by the does-not-exist branch even
+    with the containment check deleted, so it proves nothing.
+    """
+    outside = repo.parent / "outside_secret.py"
     outside.write_text("SECRET = 1\n")
-    check = check_file_citation("../../../../etc/hosts.conf:1", repo)
+    assert outside.is_file()
+
+    check = check_file_citation(f"../{outside.name}:1", repo)
     assert check.verified is False
-    assert "escapes" in check.detail or "does not exist" in check.detail
+    assert "escapes" in check.detail, "must be refused for containment, not absence"
+    assert "SECRET" not in check.detail, "the outside file must never be read"
+
+
+def test_a_test_path_escaping_the_repo_is_refused(repo):
+    outside = repo.parent / "outside_test.py"
+    outside.write_text("def test_x():\n    pass\n")
+    check = check_test_citation(f"../{outside.name}::test_x", repo, PYTEST)
+    assert check.verified is False
+    assert "escapes" in check.detail
+
+
+# ── Runner detection ─────────────────────────────────────────────────────────
+
+
+def test_pytest_is_detected_in_a_python_project(repo):
+    assert detect_test_command(repo) is not None
+
+
+def test_a_project_with_no_python_test_markers_is_not_guessed_at(tmp_path):
+    """Guessing another project's runner wrong is worse than admitting we do not
+    know, so anything non-pytest must come from --test-command."""
+    (tmp_path / "Cargo.toml").write_text("[package]\nname = 'x'\n")
+    (tmp_path / "package.json").write_text('{"scripts": {"test": "jest"}}\n')
+    assert detect_test_command(tmp_path) is None
+
+
+def test_detection_falls_back_to_python_m_pytest(repo, monkeypatch):
+    """pytest is often importable without being on PATH — a venv whose scripts
+    were never rewritten, for instance."""
+    monkeypatch.setattr("arbiter.evidence.shutil.which", lambda _: None)
+    cmd = detect_test_command(repo)
+    assert cmd == [sys.executable, "-m", "pytest"]
+
+
+def test_detection_gives_up_when_pytest_is_absent_entirely(repo, monkeypatch):
+    monkeypatch.setattr("arbiter.evidence.shutil.which", lambda _: None)
+    monkeypatch.setattr("arbiter.evidence.importlib.util.find_spec", lambda _: None)
+    assert detect_test_command(repo) is None
+
+
+def test_an_undetectable_runner_leaves_the_test_unchecked(repo, monkeypatch):
+    """No runner must mean 'could not check', never 'checked and passed'."""
+    monkeypatch.setattr("arbiter.evidence.detect_test_command", lambda _root=None: None)
+    check = check_test_citation("tests/test_app.py::test_passes", repo, None)
+    assert check.verified is None
+    assert "no test runner" in check.detail
 
 
 def test_uncheckable_citation_is_none_not_false(repo):
