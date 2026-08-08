@@ -39,8 +39,19 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      - run: uv python install ${{ matrix.python }}
+      # `--system` resolves to the runner's OS python, which is externally
+      # managed on ubuntu and is 3.12 regardless of the matrix. A venv is what
+      # makes the matrix mean anything.
       - name: Install
-        run: uv pip install --system -e . pytest pytest-asyncio pytest-cov
+        run: |
+          uv venv --python ${{ matrix.python }}
+          uv pip install -e . pytest pytest-asyncio pytest-cov
+      - name: Confirm the interpreter matches the matrix
+        run: |
+          .venv/bin/python -c "import sys; \
+            got = '%d.%d' % sys.version_info[:2]; \
+            assert got == '${{ matrix.python }}', 'matrix says ${{ matrix.python }}, got ' + got"
+      # `.venv/bin/python -m pytest`, not `.venv/bin/pytest`: same reason the
+      # Makefile does it, see DEVELOPMENT.md.
       - name: Test
-        run: pytest tests/ --cov=arbiter --cov-report=term-missing --cov-fail-under=80
+        run: .venv/bin/python -m pytest tests/ --cov=arbiter --cov-report=term-missing --cov-fail-under=80

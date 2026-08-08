@@ -1,6 +1,6 @@
 # Arbiter
 
-[![CI](https://github.com/dsjohal/arbiter/actions/workflows/ci.yml/badge.svg)](https://github.com/dsjohal/arbiter/actions/workflows/ci.yml)
+[![CI](https://github.com/dsjohal14/arbiter/actions/workflows/ci.yml/badge.svg)](https://github.com/dsjohal14/arbiter/actions/workflows/ci.yml)
 
 > The contract layer between an AI coding plan and the code an agent ships.
 
