@@ -38,9 +38,8 @@ _PROOF_RE = re.compile(r"\s*[\[(]\s*proof:\s*`?(?P<node>[^`\]\)]+?)`?\s*[\]\)]\s
 class Criterion:
     id: str
     text: str
-    # A test the HUMAN says proves this criterion. When present it is used in
-    # place of whatever the reviewer cites, which is the only way relevance
-    # becomes a fact rather than a model's opinion.
+    # A test selected in the approved plan as intended coverage. This records a
+    # human assertion about relevance; it does not mechanically prove semantics.
     test_evidence: str | None = None
 
     def as_dict(self) -> dict:
@@ -106,12 +105,17 @@ def pin_into(plan_text: str, criteria: list[Criterion]) -> str:
 
 
 def number(texts: list[str]) -> list[Criterion]:
+    """Number model-extracted criteria without trusting model-proposed proofs.
+
+    Proof annotations are an explicit human approval step. If extraction emits
+    one anyway, keep the criterion text but discard the proposed citation.
+    """
     out: list[Criterion] = []
     for t in texts:
         if not t.strip():
             continue
-        text, proof = split_proof(t)
-        out.append(Criterion(id=f"AC-{len(out) + 1}", text=text, test_evidence=proof))
+        text, _ = split_proof(t)
+        out.append(Criterion(id=f"AC-{len(out) + 1}", text=text))
     return out
 
 
@@ -146,6 +150,8 @@ RULES:
   requirements the plan never makes.
 - Exclude background, rationale, and anything already true before this change.
 - Keep the plan's own wording where you can, so the criteria stay recognisable.
+- Never nominate a test or emit a `[proof: ...]` annotation. Test selection is a
+  separate human approval step after extraction.
 
 === PLAN ===
 {plan_text}

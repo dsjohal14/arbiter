@@ -445,13 +445,13 @@ def test_require_pinned_evidence_refuses_a_model_chosen_test(gate):
     )
     assert gate(report) == EXIT_PASS
     # Nothing establishes that these tests cover these criteria, so under the
-    # strict flag they cannot count as met.
-    assert gate(report, "--require-pinned-evidence", "--require-tests") == EXIT_FAIL
+    # strict flag they cannot count as met or produce a successful gate exit.
+    assert gate(report, "--require-pinned-evidence") == EXIT_FAIL
 
 
-def test_a_plan_pinned_proof_overrides_whatever_the_reviewer_cites(repo, shim_path, capsys):
-    """The human's `[proof: ...]` is the only path by which relevance becomes a
-    fact, so it wins over the model's choice."""
+def test_a_plan_selected_test_overrides_whatever_the_reviewer_cites(repo, shim_path, capsys):
+    """The human's `[proof: ...]` selection wins over the model's choice while
+    remaining explicitly labelled as a human assessment of relevance."""
     (repo / "pinned.md").write_text(
         "# Plan\n\n<!-- arbiter:criteria -->\n\n"
         "- **AC-1** — total() sums every item  [proof: tests/test_app.py::test_sums_all]\n"
@@ -486,6 +486,48 @@ def test_a_plan_pinned_proof_overrides_whatever_the_reviewer_cites(repo, shim_pa
     # and legitimately contains the citation we expect to be overridden.
     verdict = out[out.index("ACCEPTANCE CRITERIA") :]
     assert code == EXIT_PASS
-    assert "proof pinned in plan" in verdict
+    assert "selected in plan; relevance human-assessed" in verdict
     assert "test_broken" not in verdict, "the pinned proof must replace the reviewer's citation"
     assert "test_sums_all" in verdict and "test_empty_list" in verdict
+
+
+def test_a_changed_plan_selected_test_fails_strict_mode(repo, shim_path, capsys):
+    """The reviewed branch cannot weaken a selected test to `assert True` and
+    retain a strict PASS under the plan author's earlier approval."""
+    (repo / "tests" / "test_app.py").write_text("def test_empty_list():\n    assert True\n")
+    (repo / "pinned.md").write_text(
+        "# Plan\n\n<!-- arbiter:criteria -->\n\n"
+        "- **AC-1** — an empty list returns 0  [proof: tests/test_app.py::test_empty_list]\n\n"
+        "<!-- /arbiter:criteria -->\n"
+    )
+    (repo / "changed-test.diff").write_text(
+        "diff --git a/tests/test_app.py b/tests/test_app.py\n"
+        "index 1111111..2222222 100644\n"
+        "--- a/tests/test_app.py\n"
+        "+++ b/tests/test_app.py\n"
+        "@@ -1 +1,2 @@\n"
+        "+def test_empty_list():\n"
+        "+    assert True\n"
+    )
+    report = _review([_ac("AC-1", "met", "app.py:2", "tests/test_app.py::test_empty_list")])
+    shim_path(claude_events(report))
+
+    code = main(
+        [
+            "verify",
+            "--plan",
+            "pinned.md",
+            "--diff",
+            "changed-test.diff",
+            "--models",
+            "claude",
+            "--test-command",
+            PYTEST,
+            "--require-pinned-evidence",
+        ]
+    )
+
+    out = capsys.readouterr().out
+    assert code == EXIT_FAIL
+    assert "plan-selected test changed in diff" in out
+    assert "unchanged from the trusted baseline" in out

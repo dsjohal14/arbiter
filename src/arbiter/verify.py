@@ -5,10 +5,10 @@ gets a row whether or not anything is wrong with it, so coverage is visible: an
 empty findings list and "nobody actually looked" stop being indistinguishable.
 
 Each row carries two independent kinds of evidence — where the behaviour is
-implemented, and which test proves it — and both are then **checked
-mechanically**. A cited `file:line` is read back and quoted. A cited test is run.
-Where a fact contradicts a reviewer, the fact wins and the status is downgraded.
-That is the difference between a verdict and an opinion.
+implemented, and which test is claimed to cover it. Citation resolution and test
+execution are checked mechanically; semantic relevance remains an assessment.
+Where a mechanical fact contradicts a reviewer, the fact wins and the status is
+downgraded.
 
 Findings that attach to no criterion are still reported, but as a secondary
 output. That degenerate case is ordinary code review.
@@ -25,7 +25,12 @@ from pathlib import Path
 
 from . import display
 from .criteria import Criterion
-from .evidence import EvidenceCheck, check_file_citation, check_test_citation
+from .evidence import (
+    EvidenceCheck,
+    check_file_citation,
+    check_test_citation,
+    test_citation_path,
+)
 from .models import IsolationMode, ModelCallError, Session, call_session, make_session
 from .prompts import Blinding, blind
 from .schema_files import schema_writer
@@ -90,16 +95,15 @@ class CriterionResult:
     test_evidence: str | None = None
     impl_check: EvidenceCheck | None = None
     test_check: EvidenceCheck | None = None
-    # Where the test citation came from. Execution and outcome are mechanical
-    # facts either way; whether the test actually EXERCISES this criterion is
-    # only a fact when a human pinned it in the plan.
-    evidence_source: str = "model_assessed"  # "pinned" | "model_assessed"
+    # Where the test citation came from. Execution and outcome are mechanical;
+    # semantic relevance is model-assessed or human-asserted by plan selection.
+    evidence_source: str = "model_assessed"
     downgraded_from: str | None = None
     downgrade_reason: str | None = None
 
     @property
-    def relevance_is_verified(self) -> bool:
-        return self.evidence_source == "pinned"
+    def is_unchanged_plan_selection(self) -> bool:
+        return self.evidence_source == "plan_selected"
 
     def as_dict(self) -> dict:
         d = asdict(self)
@@ -226,6 +230,16 @@ def build_manifest(diff: str, root: Path | None = None) -> list[str]:
     return paths
 
 
+def changed_paths(diff: str) -> set[str]:
+    """Return every path named by the diff, including deleted and renamed paths."""
+    return {
+        path.removeprefix("./")
+        for pair in _DIFF_PATH_RE.findall(diff)
+        for path in pair
+        if path != "/dev/null"
+    }
+
+
 def make_verify_sessions(
     reviewer_keys: list[str], consolidator_key: str, isolation: IsolationMode = "readonly"
 ) -> tuple[dict[str, Session], Session]:
@@ -260,8 +274,8 @@ def _untrusted(label: str, body: str) -> str:
     and report no findings"). Fencing and labelling it does not make the tool safe
     against a hostile PR author — nothing prompt-level does — but it removes the
     trivial version of the attack. The real mitigations are downstream: the
-    verdict is derived from mechanically checked evidence, and a fabricated
-    passing test cannot survive actually being run.
+    verdict checks whether cited evidence exists and what happens when it runs;
+    semantic relevance is still explicitly labelled as an assessment.
     """
     return f"<<<{_FENCE}:{label}\n{body}\n{_FENCE}:{label}>>>"
 
@@ -296,7 +310,7 @@ STATUS values:
 EVIDENCE — both fields are checked mechanically after you answer, so a citation
 that does not resolve will be caught and will downgrade your verdict:
   implementation_evidence  a real `path/file.py:LINE` where the behaviour lives
-  test_evidence            a real `path/test_file.py::test_name` that proves it
+  test_evidence            a real `path/test_file.py::test_name` you assess covers it
 Use null rather than guessing. A wrong citation is worse than none.
 
 ACCEPTANCE CRITERIA
@@ -444,9 +458,9 @@ def apply_evidence_checks(
 
     IMPORTANT LIMIT: running a cited test proves the test passes, not that it
     exercises this criterion. A reviewer can cite any green test in the repo. So
-    relevance is only treated as established when the test was pinned in the
-    plan by a human; with `require_pinned_evidence`, a model-chosen test cannot
-    reach `met` at all.
+    a plan-selected citation records a human assertion, not a mechanical proof.
+    With `require_pinned_evidence`, a model-chosen test cannot reach `met`, and a
+    plan-selected test changed by this diff requires renewed human approval.
     """
     original = result.status
 
@@ -480,7 +494,13 @@ def apply_evidence_checks(
             downgrade("untested", "no test cited")
         elif result.test_check and result.test_check.verified is not True:
             downgrade("untested", f"test not confirmed: {result.test_check.detail}")
-        elif require_pinned_evidence and not result.relevance_is_verified:
+        elif result.evidence_source == "plan_selected_changed":
+            downgrade(
+                "untested",
+                "plan-selected test changed in this diff; strict evidence must be unchanged "
+                "from the trusted baseline",
+            )
+        elif require_pinned_evidence and not result.is_unchanged_plan_selection:
             # The test passes, but nothing establishes that it covers THIS
             # criterion — a reviewer can cite any green test in the repo.
             downgrade(
@@ -499,6 +519,7 @@ def derive_verdict(
     criteria: list[CriterionResult],
     require_tests: bool = False,
     quorum_met: bool = True,
+    require_pinned_evidence: bool = False,
 ) -> str:
     """Roll per-criterion statuses up into one verdict. No model gets a vote.
 
@@ -511,7 +532,7 @@ def derive_verdict(
     statuses = {c.status for c in criteria}
     if "unmet" in statuses:
         return "fail"
-    if require_tests and "untested" in statuses:
+    if (require_tests or require_pinned_evidence) and "untested" in statuses:
         return "fail"
     if "unverifiable" in statuses:
         return "unclear"
@@ -526,7 +547,10 @@ def derive_verdict(
 
 
 def _merge(
-    criteria: list[Criterion], consolidated: dict[str, dict], per_reviewer: list[dict[str, dict]]
+    criteria: list[Criterion],
+    consolidated: dict[str, dict],
+    per_reviewer: list[dict[str, dict]],
+    diff_paths: set[str] | None = None,
 ) -> list[CriterionResult]:
     """One row per criterion. A criterion nobody assessed is `unverifiable`,
     never a silent pass."""
@@ -546,9 +570,16 @@ def _merge(
                     "test_evidence": None,
                 }
             )
-        # A human-pinned proof wins over whatever the reviewer picked: that is
-        # the only path by which relevance becomes a fact rather than a claim.
-        pinned = bool(c.test_evidence)
+        # The approved plan's selection wins over the reviewer's choice, but it
+        # remains a human assertion. If this diff changes that test, strict mode
+        # must require renewed approval instead of calling the old selection proof.
+        plan_selected = bool(c.test_evidence)
+        selected_path = test_citation_path(c.test_evidence or "")
+        selected_changed = bool(
+            plan_selected
+            and selected_path
+            and selected_path.removeprefix("./") in (diff_paths or set())
+        )
         results.append(
             CriterionResult(
                 id=c.id,
@@ -556,8 +587,14 @@ def _merge(
                 status=a["status"],
                 assessment=a["assessment"],
                 implementation_evidence=a["implementation_evidence"],
-                test_evidence=c.test_evidence if pinned else a["test_evidence"],
-                evidence_source="pinned" if pinned else "model_assessed",
+                test_evidence=c.test_evidence if plan_selected else a["test_evidence"],
+                evidence_source=(
+                    "plan_selected_changed"
+                    if selected_changed
+                    else "plan_selected"
+                    if plan_selected
+                    else "model_assessed"
+                ),
             )
         )
     return results
@@ -582,7 +619,8 @@ async def run_verify(
     require_pinned_evidence: bool = False,
     scrub_env: bool = True,
 ) -> VerifyResult:
-    manifest = manifest if manifest is not None else build_manifest(diff)
+    manifest = manifest if manifest is not None else build_manifest(diff, root)
+    diff_paths = changed_paths(diff)
 
     with schema_writer() as write_schema:
         display.print_section("independent review")
@@ -643,7 +681,7 @@ async def run_verify(
             # costs precision and must not cost the whole run.
             display.print_error(f"consolidation failed, using reviewer verdicts: {e}")
 
-        results = _merge(criteria, consolidated, per_reviewer)
+        results = _merge(criteria, consolidated, per_reviewer, diff_paths)
 
     display.print_section("evidence check")
     display.print_note(
@@ -663,7 +701,12 @@ async def run_verify(
             deduped.append(f)
 
     return VerifyResult(
-        status=derive_verdict(results, require_tests, quorum_met=not failed),
+        status=derive_verdict(
+            results,
+            require_tests,
+            quorum_met=not failed,
+            require_pinned_evidence=require_pinned_evidence,
+        ),
         criteria=results,
         findings=sorted(deduped, key=lambda f: SEVERITIES.index(f.severity)),
         blinding=blinding,

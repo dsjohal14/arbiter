@@ -256,12 +256,14 @@ def print_criterion(c: dict) -> None:
             mark_color = {True: GREEN, False: RED}.get(verified, YELLOW)
         note = ""
         if label == "test":
-            # Execution is mechanical; relevance is not, unless a human pinned it.
-            note = (
-                _c("  (proof pinned in plan)", DIM)
-                if c.get("evidence_source") == "pinned"
-                else _c("  (relevance model-assessed)", DIM)
-            )
+            # Execution is mechanical; relevance is always an assessment.
+            source = c.get("evidence_source")
+            if source == "plan_selected_changed":
+                note = _c("  (plan-selected test changed in diff)", DIM)
+            elif source == "plan_selected":
+                note = _c("  (selected in plan; relevance human-assessed)", DIM)
+            else:
+                note = _c("  (relevance model-assessed)", DIM)
         print(f"       {_c(label + ':', DIM)} {citation}  {_c(mark, BOLD, mark_color)}{note}")
         if check and check.get("detail"):
             for line in str(check["detail"]).splitlines()[:5]:

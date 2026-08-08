@@ -32,10 +32,10 @@ _TEST_CITATION_RE = re.compile(r"(?P<path>[\w./\-]+\.py)::(?P<node>[\w:\[\]\-.]+
 TEST_TIMEOUT = 120.0
 
 # Running a cited test executes code from the branch under review. Only these
-# variables are passed through; everything else — cloud credentials, registry
-# tokens, CI secrets — is dropped, so a hostile test cannot exfiltrate them.
-# This is damage limitation, NOT a sandbox: the test still runs with the
-# invoking user's filesystem and network access.
+# variables are inherited directly by the child. This reduces accidental secret
+# exposure; it is NOT a security boundary. The test still runs as the invoking
+# user with that user's filesystem and network access, so untrusted code must
+# use --no-run-tests or an external sandbox.
 _ENV_ALLOWLIST = (
     "PATH",
     "HOME",
@@ -57,13 +57,20 @@ _ENV_ALLOWLIST = (
 )
 
 
-def sandboxed_env() -> dict[str, str]:
+def scrubbed_env() -> dict[str, str]:
+    """Return a minimally inherited environment, not a sandbox."""
     env = {k: os.environ[k] for k in _ENV_ALLOWLIST if k in os.environ}
     # Let a test detect that it is being run as evidence, if it cares.
     env["ARBITER_EVIDENCE_CHECK"] = "1"
     # Keep pytest from picking up ambient config that could re-widen the env.
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     return env
+
+
+def test_citation_path(citation: str) -> str | None:
+    """Return the repository-relative path from a pytest node citation."""
+    m = _TEST_CITATION_RE.search(citation or "")
+    return m.group("path") if m else None
 
 
 @dataclass
@@ -188,7 +195,7 @@ def check_test_citation(
             text=True,
             timeout=TEST_TIMEOUT,
             check=False,
-            env=sandboxed_env() if scrub_env else None,
+            env=scrubbed_env() if scrub_env else None,
         )
     except subprocess.TimeoutExpired:
         return EvidenceCheck("test", node, None, f"timed out after {TEST_TIMEOUT:.0f}s")

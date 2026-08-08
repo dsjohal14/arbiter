@@ -50,6 +50,14 @@ def test_blank_criteria_are_dropped():
     assert number(["a", "   ", ""]) == [Criterion("AC-1", "a")]
 
 
+def test_model_extraction_cannot_nominate_its_own_proof():
+    """A `[proof: ...]` becomes plan-selected evidence only after a human edits
+    the pinned plan; the extraction model cannot grant itself that authority."""
+    criterion = number(["empty list returns zero [proof: tests/test_app.py::test_empty]"])[0]
+    assert criterion.text == "empty list returns zero"
+    assert criterion.test_evidence is None
+
+
 @pytest.mark.parametrize(
     "line",
     [

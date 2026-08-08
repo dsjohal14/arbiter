@@ -181,7 +181,10 @@ async def test_timeout_covers_writing_the_prompt_not_just_reading(shim_path):
     from arbiter.models import ARGV_PROMPT_LIMIT
 
     shim_path(hang=60)  # never reads stdin, never exits
-    big = "x" * (ARGV_PROMPT_LIMIT + 5_000)
+    # Far beyond common 64 KiB pipe/transport buffers so drain must block when
+    # the child never reads stdin. A ~37 KiB payload can fit and test the wrong path.
+    big = "x" * 1_100_000
+    assert len(big) > ARGV_PROMPT_LIMIT
 
     start = time.monotonic()
     with pytest.raises(ModelCallError, match="timeout"):
@@ -204,9 +207,9 @@ async def test_a_child_that_never_reads_stdin_is_still_reaped(shim_path):
     asyncio.create_subprocess_exec = spy
     try:
         with pytest.raises(ModelCallError):
-            await call_session(
-                make_session("claude", "claude"), "x" * (ARGV_PROMPT_LIMIT + 5_000), timeout=2.0
-            )
+            big = "x" * 1_100_000
+            assert len(big) > ARGV_PROMPT_LIMIT
+            await call_session(make_session("claude", "claude"), big, timeout=2.0)
     finally:
         asyncio.create_subprocess_exec = real
 
@@ -220,7 +223,7 @@ async def test_a_flooded_stderr_does_not_deadlock_a_large_prompt(shim_path):
     from arbiter.models import ARGV_PROMPT_LIMIT
 
     shim_path(claude_events("survived"), stderr="noise\n" * 20_000)
-    resp = await call_session(
-        make_session("claude", "claude"), "y" * (ARGV_PROMPT_LIMIT + 5_000), timeout=30
-    )
+    big = "y" * 1_100_000
+    assert len(big) > ARGV_PROMPT_LIMIT
+    resp = await call_session(make_session("claude", "claude"), big, timeout=30)
     assert resp.content == "survived"

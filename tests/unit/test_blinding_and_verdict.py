@@ -76,6 +76,11 @@ def test_untested_passes_by_default_but_fails_under_require_tests():
     assert derive_verdict(criteria, require_tests=True) == "fail"
 
 
+def test_requiring_plan_selected_evidence_also_makes_untested_fail():
+    criteria = [_c("met"), _c("untested", "AC-2")]
+    assert derive_verdict(criteria, require_pinned_evidence=True) == "fail"
+
+
 def test_a_broken_promise_outranks_an_uncheckable_one():
     assert derive_verdict([_c("unmet"), _c("unverifiable", "AC-2")]) == "fail"
 

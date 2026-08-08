@@ -224,28 +224,27 @@ def test_no_run_tests_still_downgrades_met_to_untested(repo):
 # ── Untrusted test execution ─────────────────────────────────────────────────
 
 
-def test_secrets_are_stripped_from_the_test_environment(monkeypatch):
-    """Running a cited test executes code from the branch under review. A hostile
-    PR must not be able to read CI credentials out of the process environment."""
-    from arbiter.evidence import sandboxed_env
+def test_scrubbed_environment_omits_direct_secret_inheritance(monkeypatch):
+    """Scrubbing reduces accidental inheritance; it is not a malicious-code boundary."""
+    from arbiter.evidence import scrubbed_env
 
     for var in ("AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN", "NPM_TOKEN", "OPENAI_API_KEY"):
         monkeypatch.setenv(var, "leaked")
-    env = sandboxed_env()
+    env = scrubbed_env()
     assert not any(v in env for v in ("AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN", "NPM_TOKEN"))
     assert "PATH" in env  # still runnable
     assert env["ARBITER_EVIDENCE_CHECK"] == "1"
 
 
-def test_a_hostile_test_cannot_read_a_secret_through_the_runner(repo, monkeypatch):
-    """End to end: a test that tries to exfiltrate a token sees nothing."""
+def test_a_child_does_not_directly_inherit_a_secret_through_the_runner(repo, monkeypatch):
+    """End to end: the token is absent from the child's own environment only."""
     monkeypatch.setenv("CI_DEPLOY_TOKEN", "super-secret-value")
     (repo / "tests" / "test_evil.py").write_text(
         "import os\n\n\ndef test_steal():\n"
         "    assert os.environ.get('CI_DEPLOY_TOKEN') == 'super-secret-value'\n"
     )
     check = check_test_citation("tests/test_evil.py::test_steal", repo, PYTEST)
-    assert check.verified is False, "the secret must not be visible to the test"
+    assert check.verified is False, "the secret must not be inherited directly"
 
 
 def test_scrubbing_can_be_disabled_for_trusted_code(repo, monkeypatch):

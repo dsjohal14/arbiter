@@ -79,25 +79,28 @@ So Arbiter separates the two and never conflates them:
 |---|---|
 | the cited line exists, and says this | **mechanically verified** |
 | the cited test exists and passes | **mechanically verified** |
-| that test covers this criterion | **model-assessed**, unless you pin it |
+| that test covers this criterion | **model- or human-assessed**, never mechanically proven |
 
 Output always labels which you are looking at:
 
 ```
 test: tests/test_app.py::test_sums_all  ✓  (relevance model-assessed)
-test: tests/test_app.py::test_empty_list  ✓  (proof pinned in plan)
+test: tests/test_app.py::test_empty_list  ✓  (selected in plan; relevance human-assessed)
 ```
 
-To make relevance a fact too, pin the proving test in the plan:
+To record a human-reviewed test selection, annotate it in the plan:
 
 ```markdown
 - **AC-2** — an empty list still returns 0  [proof: tests/test_app.py::test_empty_list]
 ```
 
-A pinned proof overrides whatever the reviewer cites. With
-`--require-pinned-evidence`, a model-chosen test cannot reach `met` at all —
-which is the setting to use if you want the word "verified" to mean what it
-sounds like.
+The plan's selection overrides whatever the reviewer cites. This records human
+approval; it does not make semantic relevance mechanically decidable. With
+`--require-pinned-evidence`, a model-chosen test cannot reach `met`, and an
+`untested` row fails the gate even without separately passing `--require-tests`.
+If the reviewed diff changes the selected test file, Arbiter also refuses `met`
+in strict mode. Establish that test in a trusted baseline first, then verify the
+implementation in a separate diff.
 
 ---
 
@@ -110,7 +113,7 @@ sounds like.
 | `unmet` | not implemented, or the diff contradicts it |
 | `unverifiable` | can't be determined from the plan, diff, and repo |
 
-¹ That the test *covers* the criterion is model-assessed unless pinned — see
+¹ That the test *covers* the criterion is model- or human-assessed — see
 [the honest limit](#the-honest-limit).
 
 The verdict is derived mechanically. No model gets a vote:
@@ -119,7 +122,7 @@ The verdict is derived mechanically. No model gets a vote:
 |---|---|---|
 | any `unmet` | `fail` | `1` |
 | any `untested`, with `--require-tests` | `fail` | `1` |
-| a model-chosen test, with `--require-pinned-evidence` | `untested` | — |
+| model-chosen or changed plan evidence, with `--require-pinned-evidence` | `fail` | `1` |
 | any `unverifiable` | `unclear` | `3` |
 | a reviewer failed to complete | `unclear` | `3` |
 | otherwise | `pass` | `0` |
@@ -201,7 +204,7 @@ The extracted list is a starting point. Read it and edit it — it's your contra
 | `--plan` | — | Plan file (or `-` for stdin). Required by `verify`. |
 | `--diff` | `staged` | Bare, or `working`, a revision range, a path, or `-` |
 | `--require-tests` | off | Treat `untested` as a failure |
-| `--require-pinned-evidence` | off | Only accept `met` when the plan pins the proof |
+| `--require-pinned-evidence` | off | Require unchanged, plan-selected tests; implies `--require-tests` |
 | `--no-run-tests` | off | Check cited tests exist, don't execute them |
 | `--no-scrub-test-env` | off | Run cited tests with the full environment |
 | `--test-command` | autodetect | Test runner (only pytest is autodetected) |
@@ -237,9 +240,10 @@ against someone deliberately trying to talk a reviewer into a pass.
 **2. Code execution.** This is the serious one. Checking test evidence *runs a
 test from the branch under review*. A hostile PR can put arbitrary Python in
 that test and get whatever the invoking process has — credentials, filesystem,
-network. Arbiter strips secrets from the child environment by default (only
+network. Arbiter scrubs directly inherited environment variables by default (only
 `PATH`, `HOME`, `LANG` and similar survive; disable with `--no-scrub-test-env`),
-but **that is damage limitation, not a sandbox.**
+but **that is accidental-exposure reduction, not a sandbox or malicious-code
+defense.**
 
 ### Running it on code you don't trust
 
@@ -320,7 +324,7 @@ Adding a provider is one `Provider` entry plus a branch in the event parser.
 
 ```bash
 uv pip install -e . pytest pytest-asyncio pytest-cov ruff
-pytest          # 193 tests
+pytest          # 196 tests
 ruff check src/ tests/
 ```
 
