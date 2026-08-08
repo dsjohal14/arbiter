@@ -1,0 +1,167 @@
+"""Mechanical checking of cited evidence.
+
+A reviewer saying "src/arbiter/cli.py:84" and "verified by tests/test_cli.py::
+test_unknown_model" is making two claims. Both are checkable, and checking them
+is what separates this from a tool that reports opinions:
+
+  - the file:line either exists or it does not, and we can print what is actually
+    on that line next to the claim, so a fabricated citation dies immediately
+  - the test either exists and passes, or it does not
+
+Everything here is deliberately dumb and deterministic. No model is consulted.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import re
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+# "src/app.py:84", "src/app.py:84-91", "./app.py line 84"
+_FILE_CITATION_RE = re.compile(
+    r"(?P<path>[\w./\-]+\.\w+)\s*(?::|\s+lines?\s+)\s*(?P<start>\d+)(?:\s*[-–]\s*(?P<end>\d+))?",  # noqa: RUF001 - models write en dashes in ranges
+)
+# "tests/test_cli.py::test_unknown_model", "tests/test_cli.py::TestX::test_y"
+_TEST_CITATION_RE = re.compile(r"(?P<path>[\w./\-]+\.py)::(?P<node>[\w:\[\]\-.]+)")
+
+TEST_TIMEOUT = 120.0
+
+
+@dataclass
+class EvidenceCheck:
+    """The result of checking one citation. `verified is None` means we could not
+    check it at all, which is different from checking it and finding it false."""
+
+    kind: str  # "file" | "test"
+    citation: str
+    verified: bool | None
+    detail: str
+
+    def as_dict(self) -> dict:
+        return {
+            "kind": self.kind,
+            "citation": self.citation,
+            "verified": self.verified,
+            "detail": self.detail,
+        }
+
+
+def _safe_path(raw: str, root: Path) -> Path | None:
+    """Resolve a cited path inside the repo, refusing anything that escapes it."""
+    try:
+        candidate = (root / raw).resolve()
+        candidate.relative_to(root.resolve())
+    except (ValueError, OSError):
+        return None
+    return candidate
+
+
+def check_file_citation(citation: str, root: Path | None = None) -> EvidenceCheck:
+    """Confirm a cited file:line exists, and quote what is actually there."""
+    root = root or Path.cwd()
+    m = _FILE_CITATION_RE.search(citation or "")
+    if not m:
+        return EvidenceCheck("file", citation, None, "no file:line citation found")
+
+    rel, start = m.group("path"), int(m.group("start"))
+    end = int(m.group("end") or start)
+    path = _safe_path(rel, root)
+    if path is None:
+        return EvidenceCheck("file", citation, False, f"{rel} escapes the repository root")
+    if not path.is_file():
+        return EvidenceCheck("file", citation, False, f"{rel} does not exist")
+
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as e:
+        return EvidenceCheck("file", citation, None, f"could not read {rel}: {e}")
+
+    if start < 1 or start > len(lines):
+        return EvidenceCheck(
+            "file", citation, False, f"{rel} has {len(lines)} lines; line {start} does not exist"
+        )
+
+    end = min(end, len(lines), start + 4)  # quote at most 5 lines
+    quoted = "\n".join(lines[start - 1 : end]).strip()
+    return EvidenceCheck("file", citation, True, quoted or "(blank line)")
+
+
+# ── Tests ─────────────────────────────────────────────────────────────────────
+
+
+def detect_test_command(root: Path | None = None) -> list[str] | None:
+    """Only pytest is auto-detected. Anything else must be passed explicitly with
+    --test-command: guessing a project's runner wrong is worse than admitting we
+    do not know.
+
+    Falls back to `python -m pytest`, because pytest is frequently importable in
+    an environment without being on PATH — a venv whose scripts were never
+    rewritten, for instance.
+    """
+    root = root or Path.cwd()
+    markers = ("pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini", "conftest.py")
+    if not (any((root / m).exists() for m in markers) or (root / "tests").is_dir()):
+        return None
+    if shutil.which("pytest"):
+        return ["pytest"]
+    if importlib.util.find_spec("pytest") is not None:
+        return [sys.executable, "-m", "pytest"]
+    return None
+
+
+def check_test_citation(
+    citation: str,
+    root: Path | None = None,
+    test_command: list[str] | None = None,
+    run: bool = True,
+) -> EvidenceCheck:
+    """Confirm a cited test exists and, when permitted, that it passes."""
+    root = root or Path.cwd()
+    m = _TEST_CITATION_RE.search(citation or "")
+    if not m:
+        return EvidenceCheck("test", citation, None, "no test node id found")
+
+    node = m.group(0)
+    path = _safe_path(m.group("path"), root)
+    if path is None:
+        return EvidenceCheck("test", node, False, f"{m.group('path')} escapes the repository root")
+    if not path.is_file():
+        return EvidenceCheck("test", node, False, f"{m.group('path')} does not exist")
+
+    if not run:
+        return EvidenceCheck("test", node, None, "test file exists; not executed (--no-run-tests)")
+
+    cmd = test_command or detect_test_command(root)
+    if not cmd:
+        return EvidenceCheck("test", node, None, "no test runner detected; not executed")
+
+    try:
+        proc = subprocess.run(
+            [*cmd, node, "-q", "--no-header"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=TEST_TIMEOUT,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return EvidenceCheck("test", node, None, f"timed out after {TEST_TIMEOUT:.0f}s")
+    except OSError as e:
+        return EvidenceCheck("test", node, None, f"could not run tests: {e}")
+
+    out = (proc.stdout + proc.stderr).strip()
+    if proc.returncode == 0:
+        return EvidenceCheck("test", node, True, "passed")
+    # pytest exits 4 for collection errors — the test does not exist under that id.
+    if proc.returncode == 4 or "no tests ran" in out.lower() or "not found" in out.lower():
+        return EvidenceCheck("test", node, False, "no such test")
+    return EvidenceCheck("test", node, False, f"failed\n{_tail(out)}")
+
+
+def _tail(text: str, lines: int = 6) -> str:
+    kept = [ln for ln in text.splitlines() if ln.strip()][-lines:]
+    return "\n".join(kept)

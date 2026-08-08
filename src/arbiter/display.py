@@ -204,6 +204,10 @@ def print_prompt_hint() -> None:
 # ── Verify output ─────────────────────────────────────────────────────────────
 
 
+_STATUS_COLORS = {"met": GREEN, "untested": YELLOW, "unmet": RED, "unverifiable": MAGENTA}
+_STATUS_GLYPH = {"met": "✓", "untested": "~", "unmet": "✗", "unverifiable": "?"}
+
+
 def print_verdict_banner(status: str, counts: dict[str, int]) -> None:
     palette = {"pass": GREEN, "fail": RED, "unclear": YELLOW}
     glyph = {"pass": "✓", "fail": "✗", "unclear": "?"}
@@ -213,11 +217,53 @@ def print_verdict_banner(status: str, counts: dict[str, int]) -> None:
     print(_c(f"║  {glyph.get(status, '·')}  VERDICT: {status.upper():<28}║", BOLD, color))
     print(_c("╚══════════════════════════════════════════╝", color))
     print()
-    summary = "  ".join(
-        f"{_c(sev, _SEVERITY_COLORS.get(sev, WHITE))} {counts.get(sev, 0)}"
-        for sev in ("blocking", "major", "minor", "question")
+    order = ("met", "untested", "unmet", "unverifiable")
+    keys = order if any(k in counts for k in order) else ("blocking", "major", "minor", "question")
+    palette2 = _STATUS_COLORS if keys == order else _SEVERITY_COLORS
+    print("  " + "   ".join(f"{_c(k, palette2.get(k, WHITE))} {counts.get(k, 0)}" for k in keys))
+    print()
+
+
+def print_criterion(c: dict) -> None:
+    """One acceptance criterion: its verdict, then the evidence for it.
+
+    Checked citations are shown with what was actually found, so a claim and its
+    proof sit next to each other and a fabricated citation is obvious.
+    """
+    status = str(c.get("status", "unverifiable"))
+    color = _STATUS_COLORS.get(status, WHITE)
+    glyph = _STATUS_GLYPH.get(status, "·")
+
+    print(
+        f"  {_c(glyph, BOLD, color)} {_c(c.get('id', '?'), BOLD)}  "
+        f"{_c(status.upper(), BOLD, color)}  {c.get('text', '')}"
     )
-    print(f"  {summary}")
+    if c.get("assessment"):
+        print(f"       {c['assessment']}")
+
+    for label, key, check_key in (
+        ("code", "implementation_evidence", "impl_check"),
+        ("test", "test_evidence", "test_check"),
+    ):
+        citation, check = c.get(key), c.get(check_key)
+        if not citation:
+            continue
+        mark = "·"
+        mark_color = DIM
+        if check:
+            verified = check.get("verified")
+            mark = {True: "✓", False: "✗"}.get(verified, "?")
+            mark_color = {True: GREEN, False: RED}.get(verified, YELLOW)
+        print(f"       {_c(label + ':', DIM)} {citation}  {_c(mark, BOLD, mark_color)}")
+        if check and check.get("detail"):
+            for line in str(check["detail"]).splitlines()[:5]:
+                print(f"         {_c('│ ' + line, DIM)}")
+
+    if c.get("downgrade_reason"):
+        print(
+            f"       {_c('downgraded from ' + str(c.get('downgraded_from')) + ': ', DIM)}"
+            f"{_c(c['downgrade_reason'], YELLOW)}"
+        )
     print()
 
 

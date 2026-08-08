@@ -3,6 +3,7 @@
 
 Drives locally installed CLI tools; no API keys needed.
 
+    arbiter plan pin plan.md                    # extract + pin acceptance criteria
     arbiter verify --plan plan.md --diff        # the gate
     arbiter debate "question"                   # multi-model debate + blinded judge
     arbiter doctor                              # provider install/auth/capability check
@@ -18,8 +19,10 @@ import argparse
 import asyncio
 import json
 import sys
+from pathlib import Path
 from typing import NoReturn
 
+from . import criteria as crit
 from . import display, doctor, verify
 from .debate import run_debate, run_followup_loop
 from .models import (
@@ -27,10 +30,13 @@ from .models import (
     PROVIDERS,
     VALID_MODELS,
     ModelCallError,
+    call_session,
     make_arbiter_session,
     make_debater_sessions,
+    make_session,
 )
 from .prompts import JUDGE_SCHEMA
+from .schema_files import schema_writer
 from .verify import (
     EXIT_FAIL,
     EXIT_PASS,
@@ -104,9 +110,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     v.add_argument(
         "--diff",
+        nargs="?",
+        const="staged",
         default="staged",
         metavar="SPEC",
-        help="'staged' (default), 'working', a path, or '-' for stdin",
+        help="bare, or 'staged' (default), 'working', a revision range like "
+        "origin/main...HEAD, a path, or '-' for stdin",
+    )
+    v.add_argument(
+        "--require-tests",
+        action="store_true",
+        help="Treat an untested criterion as a failure rather than a warning",
+    )
+    v.add_argument(
+        "--no-run-tests",
+        action="store_true",
+        help="Check that cited tests exist, but do not execute them",
+    )
+    v.add_argument(
+        "--test-command",
+        metavar="CMD",
+        help="Test runner for cited tests (default: autodetect pytest)",
     )
     _add_common(v)
 
@@ -127,6 +151,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Skip the interactive follow-up loop (implied when not a TTY)",
     )
     _add_common(d)
+
+    pl = sub.add_parser("plan", help="Work with plan files")
+    plsub = pl.add_subparsers(dest="plan_command")
+    pin = plsub.add_parser("pin", help="Extract acceptance criteria and pin them into the plan")
+    pin.add_argument("file", help="Plan markdown file to pin criteria into")
+    pin.add_argument("--force", action="store_true", help="Re-extract even if already pinned")
+    pin.add_argument("--dry-run", action="store_true", help="Print the criteria, do not write")
+    _add_common(pin)
 
     doc = sub.add_parser("doctor", help="Check provider install, auth, and capabilities")
     doc.add_argument(
@@ -196,42 +228,109 @@ def _write_transcript(path: str, transcript: list[str]) -> None:
 # ── Commands ──────────────────────────────────────────────────────────────────
 
 
+async def cmd_plan_pin(args: argparse.Namespace) -> int:
+    """Extract acceptance criteria once and pin them into the plan.
+
+    Kept out of `verify` on purpose: this writes to the user's plan file, and a
+    verification run should never mutate its own input.
+    """
+    _, judge = _resolve_models(args.models, args.judge)
+    path = Path(args.file)
+    if not path.is_file():
+        _usage_error(f"Plan file not found: {args.file}")
+
+    text = path.read_text(encoding="utf-8")
+    if crit.is_pinned(text) and not args.force:
+        existing = crit.read_criteria(text)
+        display.print_note(
+            f"Already pinned with {len(existing)} criteria. Use --force to re-extract."
+        )
+        for c in existing:
+            display.print(f"  {c.id}  {c.text}")
+        return EXIT_PASS
+
+    session = make_session(
+        "extractor",
+        judge,
+        model="opus" if judge == "claude" else None,
+        isolation="open" if args.allow_tools else "readonly",
+        output_schema=crit.EXTRACTION_SCHEMA,
+    )
+    display.print_note(f"Extracting acceptance criteria with {session.label()}...")
+
+    with schema_writer() as write_schema:
+        resp = await call_session(
+            session,
+            crit.build_extraction_prompt(text),
+            on_cmd=(lambda _key, cmd: display.print_verbose_cmd(cmd)) if args.verbose else None,
+            timeout=args.timeout,
+            schema_path_writer=write_schema,
+        )
+
+    obj = verify.extract_json(resp.content) or {}
+    criteria = crit.number([str(c) for c in obj.get("criteria") or []])
+    if not criteria:
+        display.print_error("No acceptance criteria could be extracted from this plan.")
+        return EXIT_RUNTIME
+
+    display.print_section(f"{len(criteria)} acceptance criteria")
+    for c in criteria:
+        display.print(f"  {display._c(c.id, display.BOLD)}  {c.text}")
+    display.print()
+
+    if args.dry_run:
+        display.print_note("--dry-run: plan not modified.")
+        return EXIT_PASS
+
+    path.write_text(crit.pin_into(text, criteria), encoding="utf-8")
+    display.print_note(f"✎  Pinned into {args.file}. Review and edit them before verifying.")
+    return EXIT_PASS
+
+
 async def cmd_verify(args: argparse.Namespace) -> int:
     keys, judge = _resolve_models(args.models, args.judge)
     isolation = "open" if args.allow_tools else "readonly"
 
     plan = verify.read_plan(args.plan)
+    try:
+        criteria = crit.read_criteria(plan)
+    except crit.CriteriaError as e:
+        _usage_error(str(e))
+
     diff = verify.read_diff(args.diff)
     manifest = verify.build_manifest(diff)
 
     reviewers, consolidator = make_verify_sessions(keys, judge, isolation)
     names = {k: s.label() for k, s in reviewers.items()}
-    consolidator_name = consolidator.label()
 
     if not args.as_json:
         display.print_note(
-            f"Reviewing {len(diff.splitlines())} diff lines against {args.plan} · "
+            f"{len(criteria)} criteria · {len(diff.splitlines())} diff lines · "
             f"{len(manifest)} file(s) in scope · reviewers: {', '.join(names.values())}"
         )
 
     result = await verify.run_verify(
         plan=plan,
         diff=diff,
+        criteria=criteria,
         reviewers=reviewers,
         consolidator=consolidator,
-        consolidator_name=consolidator_name,
+        consolidator_name=consolidator.label(),
         names=names,
         verbose=args.verbose,
         timeout=args.timeout,
         seed=args.seed,
         manifest=manifest,
+        test_command=args.test_command.split() if args.test_command else None,
+        run_tests=not args.no_run_tests,
+        require_tests=args.require_tests,
     )
 
     if args.as_json:
         json.dump(result.as_dict(), sys.stdout, indent=2)
         sys.stdout.write("\n")
     else:
-        verify.render(result, names)
+        verify.render(result)
     return result.exit_code
 
 
@@ -315,6 +414,10 @@ async def _dispatch(args: argparse.Namespace) -> int:
     display.set_json_mode(getattr(args, "as_json", False))
     if args.command == "verify":
         return await cmd_verify(args)
+    if args.command == "plan":
+        if args.plan_command != "pin":
+            _usage_error("usage: arbiter plan pin <plan.md>")
+        return await cmd_plan_pin(args)
     if args.command == "debate":
         return await cmd_debate(args)
     if args.command == "doctor":
@@ -323,7 +426,10 @@ async def _dispatch(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv)
+    try:
+        args = parse_args(argv)
+    except SystemExit as e:  # argparse errors and --help
+        return e.code if isinstance(e.code, int) else EXIT_USAGE
     try:
         return asyncio.run(_dispatch(args))
     except KeyboardInterrupt:
@@ -336,8 +442,10 @@ def main(argv: list[str] | None = None) -> int:
     except ModelCallError as e:
         display.print_error(str(e))
         return EXIT_RUNTIME
-    except SystemExit:
-        raise
+    except SystemExit as e:
+        # main() always *returns* its exit code rather than sometimes returning
+        # and sometimes raising, so callers (and tests) have one contract.
+        return e.code if isinstance(e.code, int) else EXIT_USAGE
     except Exception as e:
         display.print_error(f"{type(e).__name__}: {e}")
         if args.verbose:

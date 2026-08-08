@@ -138,3 +138,34 @@ async def test_cancellation_still_reaps_the_child(shim_path):
             break
         await asyncio.sleep(0.05)
     assert procs[0].returncode is not None, "child was orphaned after cancellation"
+
+
+# ── Large prompts ────────────────────────────────────────────────────────────
+
+
+async def test_a_prompt_too_large_for_argv_is_delivered_on_stdin(shim_path):
+    """execve fails with E2BIG well before the provider launches: ARG_MAX is
+    1 MiB on macOS and Linux caps a single argument at 128 KiB regardless. A plan
+    plus a real diff clears that easily, so the prompt moves to stdin."""
+    from arbiter.models import ARGV_PROMPT_LIMIT
+
+    big = "d" * (ARGV_PROMPT_LIMIT + 5_000)
+    argv_log = shim_path(claude_events("reviewed"))
+    resp = await call_session(make_session("claude", "claude"), big)
+
+    assert resp.content == "reviewed"
+    argv = json.loads(argv_log.read_text().splitlines()[0])
+    assert all(big not in arg for arg in argv), "prompt must not be in argv"
+
+
+async def test_a_one_megabyte_prompt_does_not_raise_e2big(shim_path):
+    shim_path(claude_events("ok"))
+    resp = await call_session(make_session("claude", "claude"), "x" * 1_100_000)
+    assert resp.content == "ok"
+
+
+async def test_small_prompts_still_travel_in_argv(shim_path):
+    argv_log = shim_path(claude_events("ok"))
+    await call_session(make_session("claude", "claude"), "tiny question")
+    argv = json.loads(argv_log.read_text().splitlines()[0])
+    assert "tiny question" in argv

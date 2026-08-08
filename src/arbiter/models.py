@@ -27,6 +27,12 @@ STREAM_LIMIT = 8 * 1024 * 1024
 
 DEFAULT_TIMEOUT = 300.0
 
+# Above this, the prompt travels on stdin instead of argv. A plan plus a real
+# diff blows past OS limits fast: ARG_MAX is 1 MiB on macOS, and Linux caps any
+# single argument at 128 KiB (MAX_ARG_STRLEN) regardless of ARG_MAX. Verified:
+# execve fails with E2BIG at ~1.1 MB here.
+ARGV_PROMPT_LIMIT = 32 * 1024
+
 # How long a child gets to exit after SIGTERM before we SIGKILL it.
 _TERM_GRACE = 2.0
 
@@ -67,7 +73,7 @@ PROVIDERS: dict[str, Provider] = {
         preassigns_session=True,
         output_schema_flag="--json-schema",
         readonly_flags=("--permission-mode", "plan"),
-        isolate_flags=("--strict-mcp-config",),
+        isolate_flags=("--safe-mode", "--strict-mcp-config"),
     ),
     "codex": Provider(
         key="codex",
@@ -77,7 +83,9 @@ PROVIDERS: dict[str, Provider] = {
         output_schema_flag="--output-schema",
         output_schema_as_file=True,
         readonly_flags=("-s", "read-only"),
-        isolate_flags=("--ignore-user-config", "--ephemeral"),
+        # NOT --ephemeral: it stops codex persisting session files, which breaks
+        # `codex exec resume` and therefore multi-round debate and follow-ups.
+        isolate_flags=("--ignore-user-config",),
     ),
     "gemini": Provider(
         key="gemini",
@@ -191,18 +199,28 @@ def _schema_args(sess: Session, schema_path_writer: Callable[[dict], str] | None
     return [p.output_schema_flag, json.dumps(sess.output_schema)]
 
 
+def prompt_goes_on_stdin(prompt: str) -> bool:
+    """Whether this prompt is too big to survive execve as an argument."""
+    return len(prompt.encode("utf-8", errors="replace")) > ARGV_PROMPT_LIMIT
+
+
 def _build_cmd(
     sess: Session,
     prompt: str,
     schema_path_writer: Callable[[dict], str] | None = None,
+    via_stdin: bool = False,
 ) -> list[str]:
     """Build the CLI invocation for `sess`.
 
-    Deterministic in `(sess, prompt)`: the same session and prompt always produce
+    Deterministic in `(sess, prompt, via_stdin)`: the same inputs always produce
     the same command, which is what makes every flag decision unit-testable. The
     one impurity is deliberate and injected — `schema_path_writer` materializes a
     schema to disk for providers that take a path rather than inline JSON, and
     the caller owns that file's lifetime.
+
+    With `via_stdin`, the prompt is omitted from argv entirely; all three CLIs
+    read it from stdin when no prompt argument is present. A plan plus a real
+    diff exceeds OS argument limits well before the provider even launches.
 
     Uses the resume form once the session has been started. Session ids are
     pre-assigned where the provider allows, so two sessions of the same provider
@@ -215,15 +233,10 @@ def _build_cmd(
     extra += _schema_args(sess, schema_path_writer)
 
     if p.cli == "claude":
-        cmd = [
-            "claude",
-            "-p",
-            prompt,
-            "--output-format",
-            "stream-json",
-            "--include-partial-messages",
-            "--verbose",
-        ]
+        cmd = ["claude", "-p"]
+        if not via_stdin:
+            cmd.append(prompt)
+        cmd += ["--output-format", "stream-json", "--include-partial-messages", "--verbose"]
         if sess.model:
             cmd += ["--model", sess.model]
         if sess.session_id:
@@ -238,10 +251,13 @@ def _build_cmd(
             cmd = ["codex", "exec", "--json", "--skip-git-repo-check"]
             if sess.model:
                 cmd += ["-m", sess.model]
-        return cmd + extra + ["--", prompt]
+        cmd += extra
+        # `--` guards a prompt that starts with a dash from being read as a flag.
+        return cmd if via_stdin else [*cmd, "--", prompt]
 
     if p.cli == "gemini":
-        cmd = ["gemini", "-p", prompt, "--output-format", "stream-json"]
+        cmd = ["gemini"] if via_stdin else ["gemini", "-p", prompt]
+        cmd += ["--output-format", "stream-json"]
         if sess.model:
             cmd += ["-m", sess.model]
         if sess.session_id:
@@ -453,7 +469,8 @@ async def call_session(
     None of the three CLIs offers a timeout flag, so the deadline is enforced
     here. Marks the session started on success so later calls use the resume form.
     """
-    cmd = _build_cmd(sess, prompt, schema_path_writer)
+    via_stdin = prompt_goes_on_stdin(prompt)
+    cmd = _build_cmd(sess, prompt, schema_path_writer, via_stdin=via_stdin)
     if on_cmd:
         on_cmd(sess.key, cmd)
 
@@ -461,7 +478,9 @@ async def call_session(
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
-            stdin=asyncio.subprocess.DEVNULL,  # codex reads stdin otherwise
+            # DEVNULL when the prompt is in argv — codex otherwise blocks reading
+            # stdin. A PIPE only when we actually have a prompt to write.
+            stdin=asyncio.subprocess.PIPE if via_stdin else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             limit=STREAM_LIMIT,
@@ -470,6 +489,17 @@ async def call_session(
         raise ModelCallError(
             f"{sess.cli} is not installed or not on PATH. Run 'arbiter doctor'."
         ) from e
+    except OSError as e:
+        raise ModelCallError(f"could not launch {sess.cli}: {e}") from e
+
+    if via_stdin and proc.stdin is not None:
+        try:
+            proc.stdin.write(prompt.encode())
+            await proc.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # the child died early; _consume reports the real reason
+        finally:
+            proc.stdin.close()
 
     assert proc.stderr is not None
     # Drain stderr concurrently so a full stderr pipe can't deadlock stdout.

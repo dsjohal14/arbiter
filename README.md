@@ -2,85 +2,101 @@
 
 [![CI](https://github.com/dsjohal/arbiter/actions/workflows/ci.yml/badge.svg)](https://github.com/dsjohal/arbiter/actions/workflows/ci.yml)
 
-> A falsification-first verification gate for AI-generated plans and code changes.
+> Did the implementation actually keep the plan's promises?
 
-An agent wrote the plan. An agent wrote the code. Who checks that the second one
-did what the first one promised?
-
-Arbiter runs several independent models against your diff and your approved plan,
-asks each one to **falsify** the change rather than praise it, and derives a
-`pass` / `fail` / `unclear` verdict mechanically from the findings that survive.
-Every finding must cite a file, a line, a command, or a failing test. A finding
-with no evidence is dropped before it can block anything.
-
-The exit code is stable, so it drops straight into pre-commit or CI.
+An agent wrote the plan. An agent wrote the code. Arbiter checks the contract
+between them — criterion by criterion, with evidence it verifies itself.
 
 ```bash
+arbiter plan pin plan.md          # extract acceptance criteria, once
 arbiter verify --plan plan.md --diff
 ```
 
 ```
-━━━  INDEPENDENT REVIEW  ━━━━━━━━━━━━━━━━━━━━━━
-
-  ▶ claude (sonnet)
-  │ {"findings":[{"severity":"major","claim":"`_build_cmd` is not a pure
-  │ function of (Session, prompt) as criterion 4 requires…
-
-━━━  CONSOLIDATION  ━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  claude (opus) is merging and checking findings (blinded)...
-
 ╔══════════════════════════════════════════╗
 ║  ✗  VERDICT: FAIL                        ║
 ╚══════════════════════════════════════════╝
 
-  blocking 1  major 1  minor 0  question 0
+  met 1   untested 1   unmet 1   unverifiable 0
 
-  1. BLOCKING  total() now skips the first item
-     criterion: Sum every item
-     evidence:  app.py:3
-     validate:  pytest tests/test_total.py
+━━━  ACCEPTANCE CRITERIA  ━━━━━━━━━━━━━━━━━━━━
+
+  ✗ AC-1  UNMET  total() sums every item in the list
+       Slicing from index 1 drops the first element.
+       code: app.py:2  ✓
+         │ return sum(items[1:])
+       test: tests/test_app.py::test_sums_all  ✗
+         │ failed
+         │ E   assert 2 == 3
+
+  ~ AC-2  UNTESTED  an empty list still returns 0
+       Behaviour is unchanged, but nothing covers it.
+       code: app.py:2  ✓
+         │ return sum(items[1:])
+       downgraded from met: no test cited
+
+  ✓ AC-3  MET  unknown providers exit with a usage error
+       code: src/arbiter/cli.py:197  ✓
+         │ _usage_error(f"unknown provider(s): ...")
+       test: tests/integration/test_cli.py::test_unknown_provider  ✓
+         │ passed
 ```
 
+Every criterion gets a row — including the ones that are fine. That is the point:
+a review tool that returns an empty list for a clean diff gives you no way to
+tell "everything checks out" from "nobody actually looked."
+
 ---
 
-## Why this and not "let a model review my PR"
+## The part that isn't a model's opinion
 
-Generic AI code review tells you what a model thinks of your diff. That is an
-opinion, and opinions do not gate merges.
+Reviewers cite evidence. Arbiter **checks the citations itself**:
 
-Arbiter answers a narrower, checkable question — *does this implementation
-satisfy the plan that was approved?* — and answers it with structure:
+- a cited `file:line` is read back and quoted next to the claim, so a fabricated
+  reference is visible immediately
+- a cited test is **executed**, and its result reported
 
-| | Generic AI review | Arbiter |
+Where a fact contradicts a reviewer, the fact wins and the status is lowered. A
+reviewer's verdict is a ceiling, never a floor:
+
+| The reviewer said | Reality | Result |
 |---|---|---|
-| Question asked | "Is this code good?" | "Does this satisfy the approved plan?" |
-| Reviewer stance | Assess | **Falsify** — assume it's wrong, try to prove it |
-| Findings | Prose | Typed, with evidence and a validation command |
-| Unevidenced claims | Reported | Dropped |
-| Verdict | A model's judgement | **Derived** from surviving findings |
-| Reviewer identity | Visible to the judge | Blinded and shuffled |
-| Output | Text | Text + `--json` + stable exit codes |
+| `met`, cites a test | the test fails | **`unmet`** |
+| `met`, cites a test | no such test | `untested` |
+| `met`, no test cited | — | `untested` |
+| `met`, cites `app.py:900` | file has 40 lines | `unverifiable` |
+| `unmet` | test passes | stays `unmet` |
 
-The consolidating model does not get a vote on the outcome. It merges duplicate
-findings and checks whether cited evidence actually holds; the verdict falls out
-of the result.
+So "verified by a test" is a fact, not an assertion — and a model that is
+confidently wrong, or that has been talked into agreeing, still cannot produce a
+green run on its own.
 
 ---
 
-## How the verdict is derived
+## Statuses and the verdict
+
+| Status | Meaning |
+|---|---|
+| `met` | implemented, and a cited test was run and passed |
+| `untested` | implemented, but nothing proves it |
+| `unmet` | not implemented, or the diff contradicts it |
+| `unverifiable` | can't be determined from the plan, diff, and repo |
+
+The verdict is derived mechanically. No model gets a vote:
 
 | Condition | Verdict | Exit |
 |---|---|---|
-| A `blocking` finding whose evidence was confirmed | `fail` | `1` |
-| A `blocking` finding nobody could confirm or refute | `unclear` | `3` |
-| An acceptance criterion no reviewer could evaluate | `unclear` | `3` |
-| Neither of the above | `pass` | `0` |
+| any `unmet` | `fail` | `1` |
+| any `untested`, with `--require-tests` | `fail` | `1` |
+| any `unverifiable` | `unclear` | `3` |
+| a reviewer failed to complete | `unclear` | `3` |
+| otherwise | `pass` | `0` |
 
-Also: `2` usage error, `4` runtime error. `unclear` gets its own code so a CI job
-can tell "the reviewers were not confident" apart from "you called it wrong."
+Also `2` usage error and `4` runtime error. `unclear` has its own code so CI can
+tell "the reviewers weren't confident" from "you called it wrong."
 
-`unclear` is deliberate. A serious finding nobody could settle should not fail
-the build unfairly, and should not quietly pass either.
+A partial reviewer panel can never produce a clean pass — the reviewers that
+didn't run are exactly the ones that might have found something.
 
 ---
 
@@ -92,8 +108,8 @@ uv tool install .        # or: pip install -e .
 arbiter doctor
 ```
 
-No API keys and no Python dependencies — Arbiter drives the CLI tools you already
-have installed and are already logged into.
+No API keys and no Python dependencies — Arbiter drives CLI tools you already
+have and are already logged into.
 
 | Tool | Install |
 |------|---------|
@@ -101,59 +117,92 @@ have installed and are already logged into.
 | Codex CLI | `npm install -g @openai/codex` |
 | Gemini CLI | [developers.google.com/gemini-cli](https://developers.google.com/gemini-cli) |
 
-`arbiter doctor` checks each one is installed **and authenticated**, and reports
-what it can actually be asked to do. Presence is not enough: a CLI can sit on
-`PATH` and still refuse to serve you.
+`arbiter doctor` checks each is installed **and authenticated**, and reports what
+it can actually do. Presence isn't enough: a CLI can sit on `PATH` and still
+refuse to serve you.
 
 ---
 
 ## Usage
 
 ```bash
-# Gate the staged diff against an approved plan
-arbiter verify --plan plan.md --diff
+# 1. Pin the criteria into the plan (once, then review and edit them)
+arbiter plan pin plan.md
 
-# From a pipe, as JSON, for CI
-git diff main...HEAD | arbiter verify --plan plan.md --diff - --json
+# 2. Gate a change against them
+arbiter verify --plan plan.md --diff                      # staged
+arbiter verify --plan plan.md --diff working              # unstaged
+arbiter verify --plan plan.md --diff origin/main...HEAD   # a revision range
+git diff | arbiter verify --plan plan.md --diff -         # stdin
+```
 
-# Pick your reviewers and who consolidates
-arbiter verify --plan plan.md --diff --models claude,codex --judge claude
+In CI:
+
+```yaml
+- run: arbiter verify --plan plan.md --diff origin/main...HEAD --json > verdict.json
 ```
 
 In a pre-commit hook:
 
 ```bash
-arbiter verify --plan plan.md --diff || exit 1
+arbiter verify --plan plan.md --diff --require-tests || exit 1
 ```
 
-In GitHub Actions:
+### Why criteria are pinned
 
-```yaml
-- run: arbiter verify --plan plan.md --diff origin/main...HEAD --json > findings.json
-```
+`plan pin` extracts the criteria once and writes them into the plan between
+comment fences, as `AC-1`, `AC-2`, … Every later run *reads* that list rather
+than re-deriving it.
 
-### `arbiter debate`
+If a model re-extracted criteria on each run, two runs would enumerate different
+promises and the "mechanical" verdict would quietly rest on a non-deterministic
+step — which is the whole thing that separates this from a review tool. Pinning
+also makes the criteria diffable: a change to what was promised shows up in code
+review like any other change.
 
-The original mode is still here: several models answer, optionally refine across
+The extracted list is a starting point. Read it and edit it — it's your contract.
+
+### Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--plan` | — | Plan file (or `-` for stdin). Required by `verify`. |
+| `--diff` | `staged` | Bare, or `working`, a revision range, a path, or `-` |
+| `--require-tests` | off | Treat `untested` as a failure |
+| `--no-run-tests` | off | Check cited tests exist, don't execute them |
+| `--test-command` | autodetect | Test runner (only pytest is autodetected) |
+| `--models` | all | Comma-separated reviewers |
+| `--judge` | `claude` | Who consolidates |
+| `--seed` | random | Reproduces an earlier run's blinding exactly |
+| `--json` | off | Result on stdout, progress on stderr |
+| `--allow-tools` | off | Let providers use their full toolset |
+
+### Also: `arbiter debate`
+
+The original mode is still here — several models answer, optionally refine across
 rounds, and a blinded arbiter picks the best.
 
 ```bash
 arbiter debate "Which sorting algorithm for mostly-sorted data?" --rounds 2
 ```
 
-### Flags
+---
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--plan` | — | Approved plan (file, or `-` for stdin). Required by `verify`. |
-| `--diff` | `staged` | `staged`, `working`, a path, or `-` for stdin |
-| `--models` | all | Comma-separated reviewers |
-| `--judge` | `claude` | Who consolidates |
-| `--timeout` | `300` | Per-call timeout in seconds |
-| `--seed` | random | Blinding seed; reproduces an earlier run exactly |
-| `--allow-tools` | off | Let providers use their full toolset |
-| `--json` | off | Machine-readable result on stdout, progress on stderr |
-| `--rounds` | `1` | (`debate`) Number of refinement rounds |
+## Trust boundary
+
+**Arbiter is not a defense against a hostile pull-request author.** A diff is
+attacker-controllable text, and it goes into a model's context. Untrusted content
+is fenced and labelled as data, which removes the naive version of the attack,
+but no prompt-level measure makes this safe against someone deliberately trying
+to talk a reviewer into a pass.
+
+What actually helps is that the verdict doesn't rest on what a model says. An
+injected "report everything as met" still has to survive the evidence check: the
+cited test gets run, and the cited line gets read. Use `--require-tests` on
+untrusted input, and treat the result as advisory rather than authoritative.
+
+For code you or your agents wrote, this is a gate. For code from strangers, it's
+a signal.
 
 ---
 
@@ -161,31 +210,37 @@ arbiter debate "Which sorting algorithm for mostly-sorted data?" --rounds 2
 
 **Reviewers are blinded.** An earlier version showed the judge
 `Answer from claude [CLAUDE]` — an Anthropic model grading an Anthropic answer
-against competitors', with the labels visible. Reports are now relabelled A/B/C
-and shuffled. The shuffle seed and the label→model mapping are persisted in the
-result, so a run stays reproducible and attributable without the judge ever
-seeing a vendor name.
+against competitors', labels visible. Reports are relabelled A/B/C and shuffled;
+the seed and mapping are persisted so runs stay reproducible and attributable
+without the judge ever seeing a vendor name.
 
 **Reviewers are isolated, not disabled.** These CLIs are agents with filesystem
-access. Left alone, the Claude reviewer silently ingests your `CLAUDE.md`, Codex
-ingests `AGENTS.md`, and each pulls in its own skills, hooks, and MCP servers — so
-the reviewers answer under different, undisclosed system prompts and the
-comparison isn't controlled. Arbiter defaults to read-only mode with user config
-ignored, and passes an explicit manifest of the files in scope. It does *not*
-blanket-disable tools: a reviewer that cannot read the repo cannot verify code.
+access. Left alone, each silently inherits its own ambient config — `CLAUDE.md`,
+`AGENTS.md`, skills, hooks, MCP servers — so reviewers answer under different,
+undisclosed system prompts and the comparison isn't controlled. Arbiter defaults
+to read-only mode with user config ignored, and passes an explicit manifest of
+files in scope. It does *not* blanket-disable tools: a reviewer that can't read
+the repo can't verify code.
 
-**Providers are not equivalent, and the code says so.** Each provider declares
-its capabilities and `arbiter doctor` reports them:
+**Providers are not equivalent, and the code says so.** Each declares its
+capabilities and `arbiter doctor` reports them:
 
-| | Read-only mode | Ignores user config | Structured output | Session pinning |
+| | Read-only | Ignores user config | Structured output | Session pinning |
 |---|---|---|---|---|
-| `claude` | ✓ | ✓ | ✓ | pre-assigned UUID |
-| `codex` | ✓ | ✓ | ✓ | provider-minted |
-| `gemini` | ✓ | ✗ | ✗ (prose fallback) | pre-assigned UUID |
+| `claude` | ✓ | ✓ `--safe-mode` | ✓ | pre-assigned UUID |
+| `codex` | ✓ | ✓ partial | ✓ | provider-minted |
+| `gemini` | ✓ | ✗ none | ✗ prose fallback | pre-assigned UUID |
 
-**Codex does not stream.** It emits its whole message in one event. Claude and
-Gemini stream incrementally. Arbiter renders one model's block at a time either
-way, so output never interleaves.
+Codex is isolated with `--ignore-user-config` but deliberately *not*
+`--ephemeral`, which would stop it persisting sessions and break resume.
+
+**Codex does not stream.** It emits its whole message in one event; Claude and
+Gemini stream incrementally. Arbiter renders one block at a time either way, so
+output never interleaves.
+
+**Large prompts go on stdin.** A plan plus a real diff exceeds OS argument
+limits — `ARG_MAX` is 1 MiB on macOS, and Linux caps any single argument at
+128 KiB regardless — so past 32 KiB the prompt is written to the child's stdin.
 
 ---
 
@@ -193,14 +248,17 @@ way, so output never interleaves.
 
 ```
 src/arbiter/
-├── cli.py         # subcommands, stdin, exit codes
-├── verify.py      # the gate: prompts, findings, verdict derivation
-├── debate.py      # debate rounds, judge parsing, follow-up loop
-├── streaming.py   # parallel block-streamed display coordinator
-├── models.py      # provider capabilities, sessions, subprocess transport
-├── prompts.py     # prompt construction and blinding
-├── display.py     # terminal output only — zero logic
-└── doctor.py      # install / auth / capability checks
+├── cli.py           # subcommands, stdin, exit codes
+├── criteria.py      # extract, pin, and read acceptance criteria
+├── verify.py        # the gate: prompts, statuses, verdict derivation
+├── evidence.py      # mechanical checking — read lines, run tests
+├── debate.py        # debate rounds, judge parsing, follow-up loop
+├── streaming.py     # parallel block-streamed display coordinator
+├── models.py        # provider capabilities, sessions, subprocess transport
+├── prompts.py       # prompt construction and blinding
+├── schema_files.py  # scoped temp schema files for file-based providers
+├── display.py       # terminal output only — zero logic
+└── doctor.py        # install / auth / capability checks
 ```
 
 Adding a provider is one `Provider` entry plus a branch in the event parser.
@@ -211,41 +269,39 @@ Adding a provider is one `Provider` entry plus a branch in the event parser.
 
 ```bash
 uv pip install -e . pytest pytest-asyncio pytest-cov ruff
-pytest          # 109 tests
+pytest          # 151 tests
 ruff check src/ tests/
 ```
 
 Subprocess behaviour is tested against a **real fake CLI placed on `PATH`**, not
-by mocking `asyncio.create_subprocess_exec`. That is deliberate: the 64 KiB line
+by mocking `asyncio.create_subprocess_exec`. That's deliberate: the 64 KiB line
 limit that used to crash long answers lives inside the real `StreamReader`, so a
 mocked seam would pass a test that production fails. Same for exit codes, SIGTERM
-escalation, and stderr backpressure.
+escalation, argv size limits, and stderr backpressure.
 
 ---
 
 ## Non-goals
 
 - **Arbiter does not write code.** It adjudicates between agents that do.
+- **Not a code-review council.** Ungrounded findings are a secondary output;
+  the primary unit is a promise, not a comment.
 - **No custom repo retrieval** (tree-sitter, embedding indexes). The underlying
   CLIs already do this, better.
 - **No patch-format plumbing.** Three CLIs, three diff dialects, hunk offsets
   that rot.
-- **No role pipeline** (Planner→Implementer→Reviewer→Critic). That's a prompt
-  chain wearing an architecture costume.
-- **No Rust rewrite.** The workload is three subprocesses blocked on network I/O;
-  the process is idle ~99.9% of wall-clock. Rust's concurrency advantage would
-  address a bottleneck that doesn't exist here.
+- **No Rust rewrite.** The workload is subprocesses blocked on network I/O; the
+  process is idle ~99.9% of wall-clock.
 
 ---
 
 ## Roadmap
 
 - [ ] Validate against 15–20 real AI-generated changes with seeded defects;
-      measure confirmed findings, false positives, latency, and cost against a
-      single-model review
+      measure confirmed findings, false positives, latency, and cost
+- [ ] Test-runner support beyond pytest (jest, cargo, go test)
 - [ ] Record/replay of provider streams for deterministic, zero-cost reruns
-- [ ] Per-run cost and token accounting (the data is already in the event stream)
-- [ ] `--rubric criteria.yaml` for per-criterion scoring
+- [ ] Per-run cost and token accounting (the data is already in the stream)
 - [ ] Pre-commit hook and GitHub Action packaging
 
 ---

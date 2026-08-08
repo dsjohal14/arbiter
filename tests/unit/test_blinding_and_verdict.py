@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import json
+
+from arbiter.criteria import number
 from arbiter.prompts import blind, build_judge_prompt
-from arbiter.verify import Finding, derive_verdict, parse_findings
+from arbiter.verify import CriterionResult, derive_verdict, parse_review
 
 ANSWERS = [("claude", "alpha"), ("codex", "beta"), ("gemini", "gamma")]
+CRITERIA = number(["total() sums every item", "empty list returns 0"])
 
 
 # ── Blinding ─────────────────────────────────────────────────────────────────
@@ -28,8 +32,7 @@ def test_same_seed_reproduces_the_same_arrangement():
 def test_mapping_reverses_the_blinding():
     blinded, b = blind(ANSWERS, seed=99)
     for label, text in blinded:
-        model = b.resolve(label)
-        assert (model, text) in ANSWERS
+        assert (b.resolve(label), text) in ANSWERS
 
 
 def test_resolve_is_case_insensitive_and_handles_none():
@@ -43,108 +46,132 @@ def test_judge_prompt_leaks_no_vendor_name():
     """The judge used to be shown 'Answer from claude [CLAUDE]', which let an
     Anthropic model recognise its own answer."""
     blinded, _ = blind(ANSWERS, seed=5)
-    prompt = build_judge_prompt("Which sorting algorithm?", blinded)
-    lowered = prompt.lower()
+    lowered = build_judge_prompt("Which sorting algorithm?", blinded).lower()
     for vendor in ("claude", "codex", "gemini", "anthropic", "openai", "google"):
         assert vendor not in lowered
 
 
-def test_blinding_round_trips_through_its_serialised_form():
-    _, b = blind(ANSWERS, seed=42)
-    d = b.as_dict()
-    assert d["seed"] == 42
-    assert d["label_to_model"] == b.label_to_model
+# ── Verdict roll-up ──────────────────────────────────────────────────────────
 
 
-# ── Verdict derivation ───────────────────────────────────────────────────────
+def _c(status: str, cid: str = "AC-1") -> CriterionResult:
+    return CriterionResult(id=cid, text="t", status=status)
 
 
-def _f(severity, status="confirmed"):
-    return Finding(severity=severity, claim="c", evidence="f.py:1", status=status)
+def test_all_met_passes():
+    assert derive_verdict([_c("met"), _c("met", "AC-2")]) == "pass"
 
 
-def test_no_findings_passes():
-    status, counts = derive_verdict([], [])
-    assert status == "pass"
-    assert counts["blocking"] == 0
+def test_a_broken_promise_fails():
+    assert derive_verdict([_c("met"), _c("unmet", "AC-2")]) == "fail"
 
 
-def test_confirmed_blocking_fails():
-    status, _ = derive_verdict([_f("blocking")], [])
-    assert status == "fail"
+def test_an_uncheckable_promise_is_unclear_not_a_pass():
+    assert derive_verdict([_c("met"), _c("unverifiable", "AC-2")]) == "unclear"
 
 
-def test_unresolved_blocking_is_unclear_not_a_pass():
-    """Reviewers raised something serious that nobody could settle. Failing
-    would be unfair; passing would be a lie."""
-    status, _ = derive_verdict([_f("blocking", "unresolved")], [])
-    assert status == "unclear"
+def test_untested_passes_by_default_but_fails_under_require_tests():
+    criteria = [_c("met"), _c("untested", "AC-2")]
+    assert derive_verdict(criteria) == "pass"
+    assert derive_verdict(criteria, require_tests=True) == "fail"
 
 
-def test_refuted_blocking_does_not_fail_the_gate():
-    status, counts = derive_verdict([_f("blocking", "refuted")], [])
-    assert status == "pass"
-    assert counts["blocking"] == 0
+def test_a_broken_promise_outranks_an_uncheckable_one():
+    assert derive_verdict([_c("unmet"), _c("unverifiable", "AC-2")]) == "fail"
 
 
-def test_unevaluable_criteria_make_the_result_unclear():
-    status, _ = derive_verdict([], ["Criterion 3: end-to-end test"])
-    assert status == "unclear"
+def test_a_partial_reviewer_panel_cannot_produce_a_clean_pass():
+    """If two of three reviewers die and the survivor reports nothing wrong, the
+    gate used to exit 0. The reviewers that never ran are exactly the ones that
+    might have found something."""
+    assert derive_verdict([_c("met")], quorum_met=True) == "pass"
+    assert derive_verdict([_c("met")], quorum_met=False) == "unclear"
 
 
-def test_non_blocking_findings_still_pass():
-    status, counts = derive_verdict([_f("major"), _f("minor")], [])
-    assert status == "pass"
-    assert counts["major"] == 1 and counts["minor"] == 1
+def test_quorum_does_not_mask_a_real_failure():
+    assert derive_verdict([_c("unmet")], quorum_met=False) == "fail"
 
 
-def test_confirmed_blocking_outranks_unevaluable():
-    status, _ = derive_verdict([_f("blocking")], ["something"])
-    assert status == "fail"
+# ── Review parsing ───────────────────────────────────────────────────────────
 
 
-# ── Finding parsing ──────────────────────────────────────────────────────────
+def _review(criteria=(), findings=()):
+    return json.dumps({"criteria": list(criteria), "ungrounded_findings": list(findings)})
 
 
-def test_findings_without_evidence_are_dropped():
-    """The whole discipline of the tool: an unevidenced claim is not a finding."""
-    raw = """{"findings": [
-        {"severity": "blocking", "claim": "It is broken", "evidence": "", "confidence": "high"},
-        {"severity": "blocking", "claim": "Off by one", "evidence": "a.py:12", "confidence": "high"}
-    ], "unevaluable_criteria": []}"""
-    findings, _ = parse_findings(raw)
-    assert len(findings) == 1
-    assert findings[0].claim == "Off by one"
-
-
-def test_findings_parse_from_a_fenced_block():
-    raw = '```json\n{"findings": [], "unevaluable_criteria": ["c1"]}\n```'
-    findings, unevaluable = parse_findings(raw)
+def test_parses_a_full_review():
+    raw = _review(
+        [
+            {
+                "id": "AC-1",
+                "status": "met",
+                "assessment": "ok",
+                "implementation_evidence": "app.py:3",
+                "test_evidence": "tests/t.py::test_x",
+            }
+        ]
+    )
+    assessed, findings = parse_review(raw, CRITERIA)
+    assert assessed["AC-1"]["status"] == "met"
+    assert assessed["AC-1"]["implementation_evidence"] == "app.py:3"
     assert findings == []
-    assert unevaluable == ["c1"]
 
 
-def test_findings_parse_when_wrapped_in_prose():
-    raw = 'Here is my review:\n{"findings": [], "unevaluable_criteria": []}\nHope that helps.'
-    findings, unevaluable = parse_findings(raw)
-    assert (findings, unevaluable) == ([], [])
+def test_a_skipped_criterion_is_absent_rather_than_defaulted():
+    """A silent omission must not be able to read as a pass, so an unassessed
+    criterion simply does not appear and the caller supplies `unverifiable`."""
+    raw = _review([{"id": "AC-1", "status": "met", "assessment": "ok"}])
+    assessed, _ = parse_review(raw, CRITERIA)
+    assert "AC-2" not in assessed
+
+
+def test_invented_criteria_are_discarded():
+    raw = _review([{"id": "AC-99", "status": "met", "assessment": "made up"}])
+    assessed, _ = parse_review(raw, CRITERIA)
+    assert assessed == {}
+
+
+def test_unknown_status_degrades_to_unverifiable_not_met():
+    """A garbled status must never be able to pass the gate by accident."""
+    raw = _review([{"id": "AC-1", "status": "looks-fine", "assessment": "x"}])
+    assessed, _ = parse_review(raw, CRITERIA)
+    assert assessed["AC-1"]["status"] == "unverifiable"
+
+
+def test_null_string_evidence_is_treated_as_absent():
+    raw = _review(
+        [
+            {
+                "id": "AC-1",
+                "status": "met",
+                "assessment": "x",
+                "implementation_evidence": "null",
+                "test_evidence": "N/A",
+            }
+        ]
+    )
+    assessed, _ = parse_review(raw, CRITERIA)
+    assert assessed["AC-1"]["implementation_evidence"] is None
+    assert assessed["AC-1"]["test_evidence"] is None
+
+
+def test_ungrounded_findings_need_evidence():
+    raw = _review(
+        findings=[
+            {"severity": "blocking", "claim": "feels wrong", "evidence": ""},
+            {"severity": "major", "claim": "off by one", "evidence": "a.py:1"},
+        ]
+    )
+    _, findings = parse_review(raw, CRITERIA)
+    assert [f.claim for f in findings] == ["off by one"]
+
+
+def test_fenced_and_prose_wrapped_json_both_parse():
+    body = _review([{"id": "AC-1", "status": "met", "assessment": "x"}])
+    for raw in (f"```json\n{body}\n```", f"Here you go:\n{body}\nHope that helps."):
+        assessed, _ = parse_review(raw, CRITERIA)
+        assert assessed["AC-1"]["status"] == "met"
 
 
 def test_unparseable_report_yields_nothing_rather_than_raising():
-    findings, unevaluable = parse_findings("I could not review this.")
-    assert (findings, unevaluable) == ([], [])
-
-
-def test_unknown_severity_degrades_to_minor_not_blocking():
-    """A garbled severity must never be able to fail the gate by accident."""
-    raw = """{"findings": [{"severity": "catastrophic", "claim": "x",
-        "evidence": "a.py:1", "confidence": "high"}], "unevaluable_criteria": []}"""
-    findings, _ = parse_findings(raw)
-    assert findings[0].severity == "minor"
-
-
-def test_source_is_recorded_when_given():
-    raw = """{"findings": [{"severity": "major", "claim": "x",
-        "evidence": "a.py:1", "confidence": "high"}], "unevaluable_criteria": []}"""
-    findings, _ = parse_findings(raw, source="codex")
-    assert findings[0].raised_by == ["codex"]
+    assert parse_review("I could not review this.", CRITERIA) == ({}, [])

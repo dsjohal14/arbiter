@@ -55,5 +55,8 @@ src = ["src", "tests"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC", "RUF"]
 # ASYNC109: threading an explicit `timeout` down the call chain is the point —
-# it is a user-facing --timeout flag, not an internal deadline.
-ignore = ["E501", "ASYNC109"]
+#   it is a user-facing --timeout flag, not an internal deadline.
+# ASYNC240: reading a plan file or a cited source line is a few KB of sync I/O.
+#   Async file access would mean an anyio/trio dependency, and "no runtime
+#   dependencies" is a deliberate property of this tool.
+ignore = ["E501", "ASYNC109", "ASYNC240"]

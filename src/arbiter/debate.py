@@ -18,6 +18,7 @@ from .prompts import (
     build_repair_prompt,
     build_round_prompt,
 )
+from .schema_files import schema_writer
 from .streaming import stream_parallel
 
 
@@ -206,20 +207,32 @@ async def judge(
         if verbose:
             display.print_verbose_cmd(cmd)
 
-    resp = await call_session(
-        arbiter, build_judge_prompt(prompt, blinded), on_cmd=on_cmd, timeout=timeout
-    )
-    if verbose:
-        display.print_timing(arbiter_name, resp.duration)
-
-    label, reason, best = parse_judge_response(resp.content, labels)
-
-    if label is None:
-        # One repair attempt, then report honestly rather than guessing.
-        retry = await call_session(
-            arbiter, build_repair_prompt(labels), on_cmd=on_cmd, timeout=timeout
+    # The writer must wrap BOTH calls: a codex arbiter needs its schema on disk,
+    # and omitting it here is what made `--judge codex` crash before reaching a
+    # provider at all.
+    with schema_writer() as write_schema:
+        resp = await call_session(
+            arbiter,
+            build_judge_prompt(prompt, blinded),
+            on_cmd=on_cmd,
+            timeout=timeout,
+            schema_path_writer=write_schema,
         )
-        label, _, _ = parse_judge_response(retry.content, labels)
+        if verbose:
+            display.print_timing(arbiter_name, resp.duration)
+
+        label, reason, best = parse_judge_response(resp.content, labels)
+
+        if label is None:
+            # One repair attempt, then report honestly rather than guessing.
+            retry = await call_session(
+                arbiter,
+                build_repair_prompt(labels),
+                on_cmd=on_cmd,
+                timeout=timeout,
+                schema_path_writer=write_schema,
+            )
+            label, _, _ = parse_judge_response(retry.content, labels)
 
     return Verdict(
         winner=blinding.resolve(label),
@@ -294,12 +307,14 @@ async def run_followup_loop(
 
         # Buffered, so a REPOLL directive can be detected before anything is
         # shown — streaming would leak the "REPOLL:" scaffolding to the user.
-        resp = await call_session(
-            arbiter,
-            build_followup_prompt(user_in),
-            on_cmd=(lambda k, c: display.print_verbose_cmd(c)) if verbose else None,
-            timeout=timeout,
-        )
+        with schema_writer() as write_schema:
+            resp = await call_session(
+                arbiter,
+                build_followup_prompt(user_in),
+                on_cmd=(lambda k, c: display.print_verbose_cmd(c)) if verbose else None,
+                timeout=timeout,
+                schema_path_writer=write_schema,
+            )
         text = resp.content.strip()
         first_line = text.splitlines()[0] if text else ""
 
