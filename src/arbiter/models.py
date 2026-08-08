@@ -39,6 +39,16 @@ _TERM_GRACE = 2.0
 IsolationMode = Literal["readonly", "open"]
 
 
+class _Unset:
+    """Sentinel: 'use the session default' as distinct from 'explicitly none'."""
+
+    def __repr__(self) -> str:  # pragma: no cover - debug aid
+        return "<unset>"
+
+
+UNSET = _Unset()
+
+
 # ── Provider capabilities ────────────────────────────────────────────────────
 
 
@@ -177,7 +187,11 @@ def make_arbiter_session(
 # ── Command construction ─────────────────────────────────────────────────────
 
 
-def _schema_args(sess: Session, schema_path_writer: Callable[[dict], str] | None) -> list[str]:
+def _schema_args(
+    sess: Session,
+    schema_path_writer: Callable[[dict], str] | None,
+    schema: dict | _Unset | None = UNSET,
+) -> list[str]:
     """Structured-output flags, when the provider supports them.
 
     A provider with no structured-output support (gemini) silently gets nothing —
@@ -187,7 +201,8 @@ def _schema_args(sess: Session, schema_path_writer: Callable[[dict], str] | None
     with no signal that the requested schema never applied.
     """
     p = sess.provider
-    if not sess.output_schema or not p.output_schema_flag:
+    schema = sess.output_schema if isinstance(schema, _Unset) else schema
+    if not schema or not p.output_schema_flag:
         return []
     if p.output_schema_as_file:
         if schema_path_writer is None:
@@ -195,8 +210,8 @@ def _schema_args(sess: Session, schema_path_writer: Callable[[dict], str] | None
                 f"{p.cli} needs its schema written to a file, but no "
                 f"schema_path_writer was supplied to call_session()."
             )
-        return [p.output_schema_flag, schema_path_writer(sess.output_schema)]
-    return [p.output_schema_flag, json.dumps(sess.output_schema)]
+        return [p.output_schema_flag, schema_path_writer(schema)]
+    return [p.output_schema_flag, json.dumps(schema)]
 
 
 def prompt_goes_on_stdin(prompt: str) -> bool:
@@ -209,6 +224,7 @@ def _build_cmd(
     prompt: str,
     schema_path_writer: Callable[[dict], str] | None = None,
     via_stdin: bool = False,
+    schema: dict | _Unset | None = UNSET,
 ) -> list[str]:
     """Build the CLI invocation for `sess`.
 
@@ -230,7 +246,7 @@ def _build_cmd(
     extra: list[str] = []
     if sess.isolation == "readonly":
         extra += list(p.readonly_flags) + list(p.isolate_flags)
-    extra += _schema_args(sess, schema_path_writer)
+    extra += _schema_args(sess, schema_path_writer, schema)
 
     if p.cli == "claude":
         cmd = ["claude", "-p"]
@@ -463,14 +479,19 @@ async def call_session(
     on_cmd: OnCmd = None,
     timeout: float = DEFAULT_TIMEOUT,
     schema_path_writer: Callable[[dict], str] | None = None,
+    output_schema: dict | _Unset | None = UNSET,
 ) -> ModelResponse:
     """Run (or resume) `sess` with `prompt`, streaming deltas via `on_delta`.
+
+    `output_schema` overrides the session's schema for this turn only. Pass None
+    to force a free-form reply: a session created for structured judging would
+    otherwise keep emitting that JSON during follow-ups that expect prose.
 
     None of the three CLIs offers a timeout flag, so the deadline is enforced
     here. Marks the session started on success so later calls use the resume form.
     """
     via_stdin = prompt_goes_on_stdin(prompt)
-    cmd = _build_cmd(sess, prompt, schema_path_writer, via_stdin=via_stdin)
+    cmd = _build_cmd(sess, prompt, schema_path_writer, via_stdin=via_stdin, schema=output_schema)
     if on_cmd:
         on_cmd(sess.key, cmd)
 
@@ -492,7 +513,16 @@ async def call_session(
     except OSError as e:
         raise ModelCallError(f"could not launch {sess.cli}: {e}") from e
 
-    if via_stdin and proc.stdin is not None:
+    assert proc.stderr is not None
+    # Start draining stderr BEFORE anything else can block. A child that fills
+    # its stderr pipe stops reading stdin, so writing the prompt first can
+    # deadlock — and it used to do so outside the timeout, where neither the
+    # deadline nor the cleanup could reach it.
+    stderr_task = asyncio.create_task(proc.stderr.read())
+
+    async def _write_prompt() -> None:
+        if not (via_stdin and proc.stdin is not None):
+            return
         try:
             proc.stdin.write(prompt.encode())
             await proc.stdin.drain()
@@ -501,16 +531,17 @@ async def call_session(
         finally:
             proc.stdin.close()
 
-    assert proc.stderr is not None
-    # Drain stderr concurrently so a full stderr pipe can't deadlock stdout.
-    stderr_task = asyncio.create_task(proc.stderr.read())
+    async def _run() -> ModelResponse:
+        await _write_prompt()
+        return await _consume(sess, proc, stderr_task, on_delta, start, cmd)
 
     try:
-        return await asyncio.wait_for(
-            _consume(sess, proc, stderr_task, on_delta, start, cmd), timeout
-        )
+        # One scope covers writing the prompt AND reading the response, so a
+        # child that stops consuming stdin cannot hang past the deadline.
+        return await asyncio.wait_for(_run(), timeout)
     except TimeoutError as e:
         raise ModelCallError(f"{sess.cli} exceeded the {timeout:.0f}s timeout") from e
     finally:
+        # `finally`, so cancellation during the stdin write still reaps the child.
         stderr_task.cancel()
         await _reap(proc)

@@ -169,3 +169,58 @@ async def test_small_prompts_still_travel_in_argv(shim_path):
     await call_session(make_session("claude", "claude"), "tiny question")
     argv = json.loads(argv_log.read_text().splitlines()[0])
     assert "tiny question" in argv
+
+
+# ── Timeout coverage of the stdin write ──────────────────────────────────────
+
+
+async def test_timeout_covers_writing_the_prompt_not_just_reading(shim_path):
+    """The prompt write used to happen BEFORE the timeout scope, so a child that
+    stopped consuming stdin could hang indefinitely with neither the deadline nor
+    the cleanup active. A live run exceeded --timeout 180 until interrupted."""
+    from arbiter.models import ARGV_PROMPT_LIMIT
+
+    shim_path(hang=60)  # never reads stdin, never exits
+    big = "x" * (ARGV_PROMPT_LIMIT + 5_000)
+
+    start = time.monotonic()
+    with pytest.raises(ModelCallError, match="timeout"):
+        await call_session(make_session("claude", "claude"), big, timeout=2.0)
+    assert time.monotonic() - start < 15
+
+
+async def test_a_child_that_never_reads_stdin_is_still_reaped(shim_path):
+    from arbiter.models import ARGV_PROMPT_LIMIT
+
+    shim_path(hang=60)
+    procs: list = []
+    real = asyncio.create_subprocess_exec
+
+    async def spy(*a, **kw):
+        p = await real(*a, **kw)
+        procs.append(p)
+        return p
+
+    asyncio.create_subprocess_exec = spy
+    try:
+        with pytest.raises(ModelCallError):
+            await call_session(
+                make_session("claude", "claude"), "x" * (ARGV_PROMPT_LIMIT + 5_000), timeout=2.0
+            )
+    finally:
+        asyncio.create_subprocess_exec = real
+
+    assert procs and procs[0].returncode is not None, "child orphaned during stdin write"
+
+
+async def test_a_flooded_stderr_does_not_deadlock_a_large_prompt(shim_path):
+    """stderr is drained from the moment the child starts: a full stderr pipe
+    makes the child stop reading stdin, which would otherwise deadlock the
+    write."""
+    from arbiter.models import ARGV_PROMPT_LIMIT
+
+    shim_path(claude_events("survived"), stderr="noise\n" * 20_000)
+    resp = await call_session(
+        make_session("claude", "claude"), "y" * (ARGV_PROMPT_LIMIT + 5_000), timeout=30
+    )
+    assert resp.content == "survived"

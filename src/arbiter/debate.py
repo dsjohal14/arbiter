@@ -307,14 +307,16 @@ async def run_followup_loop(
 
         # Buffered, so a REPOLL directive can be detected before anything is
         # shown — streaming would leak the "REPOLL:" scaffolding to the user.
-        with schema_writer() as write_schema:
-            resp = await call_session(
-                arbiter,
-                build_followup_prompt(user_in),
-                on_cmd=(lambda k, c: display.print_verbose_cmd(c)) if verbose else None,
-                timeout=timeout,
-                schema_path_writer=write_schema,
-            )
+        # output_schema=None: the arbiter session carries JUDGE_SCHEMA, which
+        # would force {winner, reason, best_answer} JSON here and make the
+        # REPOLL: directive undetectable. Follow-ups are free-form.
+        resp = await call_session(
+            arbiter,
+            build_followup_prompt(user_in),
+            on_cmd=(lambda k, c: display.print_verbose_cmd(c)) if verbose else None,
+            timeout=timeout,
+            output_schema=None,
+        )
         text = resp.content.strip()
         first_line = text.splitlines()[0] if text else ""
 

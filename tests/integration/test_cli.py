@@ -63,6 +63,7 @@ def repo(tmp_path, monkeypatch):
     (tmp_path / "tests" / "test_app.py").write_text(
         "from app import total\n\n\n"
         "def test_sums_all():\n    assert total([1, 2]) == 3\n\n\n"
+        "def test_empty_list():\n    assert total([]) == 0\n\n\n"
         "def test_broken():\n    assert total([1, 2]) == 99\n"
     )
     (tmp_path / "plan.md").write_text(PINNED_PLAN)
@@ -100,7 +101,7 @@ def test_all_criteria_met_with_passing_tests_exits_0(gate, capsys):
     report = _review(
         [
             _ac("AC-1", "met", "app.py:2", "tests/test_app.py::test_sums_all"),
-            _ac("AC-2", "met", "app.py:2", "tests/test_app.py::test_sums_all"),
+            _ac("AC-2", "met", "app.py:2", "tests/test_app.py::test_empty_list"),
         ]
     )
     assert gate(report) == EXIT_PASS
@@ -111,7 +112,7 @@ def test_a_broken_promise_exits_1(gate, capsys):
     report = _review(
         [
             _ac("AC-1", "unmet", "app.py:2", assessment="skips the first element"),
-            _ac("AC-2", "met", "app.py:2", "tests/test_app.py::test_sums_all"),
+            _ac("AC-2", "met", "app.py:2", "tests/test_app.py::test_empty_list"),
         ]
     )
     assert gate(report) == EXIT_FAIL
@@ -125,7 +126,7 @@ def test_every_criterion_is_listed_even_when_nothing_is_wrong(gate, capsys):
     report = _review(
         [
             _ac("AC-1", "met", "app.py:2", "tests/test_app.py::test_sums_all"),
-            _ac("AC-2", "met", "app.py:2", "tests/test_app.py::test_sums_all"),
+            _ac("AC-2", "met", "app.py:2", "tests/test_app.py::test_empty_list"),
         ]
     )
     gate(report)
@@ -153,7 +154,7 @@ def test_a_cited_test_that_fails_overturns_a_met_claim(gate, capsys):
     report = _review(
         [
             _ac("AC-1", "met", "app.py:2", "tests/test_app.py::test_broken"),
-            _ac("AC-2", "met", "app.py:2", "tests/test_app.py::test_sums_all"),
+            _ac("AC-2", "met", "app.py:2", "tests/test_app.py::test_empty_list"),
         ]
     )
     assert gate(report) == EXIT_FAIL
@@ -164,7 +165,7 @@ def test_a_fabricated_citation_cannot_produce_a_pass(gate, capsys):
     report = _review(
         [
             _ac("AC-1", "met", "app.py:9999", "tests/test_app.py::test_sums_all"),
-            _ac("AC-2", "met", "app.py:2", "tests/test_app.py::test_sums_all"),
+            _ac("AC-2", "met", "app.py:2", "tests/test_app.py::test_empty_list"),
         ]
     )
     assert gate(report) == EXIT_UNCLEAR
@@ -184,7 +185,7 @@ def test_verified_citations_quote_the_real_source_line(gate, capsys):
     report = _review(
         [
             _ac("AC-1", "met", "app.py:2", "tests/test_app.py::test_sums_all"),
-            _ac("AC-2", "met", "app.py:2", "tests/test_app.py::test_sums_all"),
+            _ac("AC-2", "met", "app.py:2", "tests/test_app.py::test_empty_list"),
         ]
     )
     gate(report)
@@ -198,7 +199,7 @@ def test_json_output_is_machine_readable(gate, capsys):
     report = _review(
         [
             _ac("AC-1", "unmet", "app.py:2"),
-            _ac("AC-2", "met", "app.py:2", "tests/test_app.py::test_sums_all"),
+            _ac("AC-2", "met", "app.py:2", "tests/test_app.py::test_empty_list"),
         ]
     )
     code = gate(report, "--json")
@@ -311,7 +312,7 @@ def test_a_failed_reviewer_prevents_a_clean_pass(repo, shim_path, capsys):
     report = _review(
         [
             _ac("AC-1", "met", "app.py:2", "tests/test_app.py::test_sums_all"),
-            _ac("AC-2", "met", "app.py:2", "tests/test_app.py::test_sums_all"),
+            _ac("AC-2", "met", "app.py:2", "tests/test_app.py::test_empty_list"),
         ]
     )
     # claude replies; codex and gemini get a stream their parsers cannot use, so
@@ -385,7 +386,7 @@ def test_injection_cannot_fabricate_a_passing_test(repo, shim_path):
     report = _review(
         [
             _ac("AC-1", "met", "app.py:2", "tests/test_app.py::test_does_not_exist"),
-            _ac("AC-2", "met", "app.py:2", "tests/test_app.py::test_sums_all"),
+            _ac("AC-2", "met", "app.py:2", "tests/test_app.py::test_empty_list"),
         ]
     )
     shim_path(claude_events(report))
@@ -415,3 +416,76 @@ def test_bare_diff_flag_defaults_to_staged(repo):
     assert parse_args(["verify", "--plan", "p.md", "--diff", "origin/main...HEAD"]).diff == (
         "origin/main...HEAD"
     )
+
+
+# ── Relevance: what "verified by a test" does and does not prove ─────────────
+
+
+def test_an_unrelated_passing_test_is_flagged_as_model_assessed(gate, capsys):
+    """Running a cited test proves the test passes — NOT that it exercises this
+    criterion. A reviewer (or an injected diff) can cite any green test in the
+    repo, so the provenance of the citation is reported, never hidden."""
+    report = _review(
+        [
+            _ac("AC-1", "met", "app.py:2", "tests/test_app.py::test_sums_all"),
+            # test_sums_all only checks [1, 2]; it says nothing about empty lists.
+            _ac("AC-2", "met", "app.py:2", "tests/test_app.py::test_sums_all"),
+        ]
+    )
+    gate(report)
+    assert "relevance model-assessed" in capsys.readouterr().out
+
+
+def test_require_pinned_evidence_refuses_a_model_chosen_test(gate):
+    report = _review(
+        [
+            _ac("AC-1", "met", "app.py:2", "tests/test_app.py::test_sums_all"),
+            _ac("AC-2", "met", "app.py:2", "tests/test_app.py::test_sums_all"),
+        ]
+    )
+    assert gate(report) == EXIT_PASS
+    # Nothing establishes that these tests cover these criteria, so under the
+    # strict flag they cannot count as met.
+    assert gate(report, "--require-pinned-evidence", "--require-tests") == EXIT_FAIL
+
+
+def test_a_plan_pinned_proof_overrides_whatever_the_reviewer_cites(repo, shim_path, capsys):
+    """The human's `[proof: ...]` is the only path by which relevance becomes a
+    fact, so it wins over the model's choice."""
+    (repo / "pinned.md").write_text(
+        "# Plan\n\n<!-- arbiter:criteria -->\n\n"
+        "- **AC-1** — total() sums every item  [proof: tests/test_app.py::test_sums_all]\n"
+        "- **AC-2** — an empty list returns 0  [proof: tests/test_app.py::test_empty_list]\n\n"
+        "<!-- /arbiter:criteria -->\n"
+    )
+    report = _review(
+        [
+            # The reviewer cites a failing test; the pinned proof must be used.
+            _ac("AC-1", "met", "app.py:2", "tests/test_app.py::test_broken"),
+            _ac("AC-2", "met", "app.py:2", "tests/test_app.py::test_broken"),
+        ]
+    )
+    shim_path(claude_events(report))
+    code = main(
+        [
+            "verify",
+            "--plan",
+            "pinned.md",
+            "--diff",
+            "change.diff",
+            "--models",
+            "claude",
+            "--test-command",
+            PYTEST,
+            "--require-pinned-evidence",
+            "--require-tests",
+        ]
+    )
+    out = capsys.readouterr().out
+    # Scope to the verdict section: the raw reviewer stream is echoed above it
+    # and legitimately contains the citation we expect to be overridden.
+    verdict = out[out.index("ACCEPTANCE CRITERIA") :]
+    assert code == EXIT_PASS
+    assert "proof pinned in plan" in verdict
+    assert "test_broken" not in verdict, "the pinned proof must replace the reviewer's citation"
+    assert "test_sums_all" in verdict and "test_empty_list" in verdict

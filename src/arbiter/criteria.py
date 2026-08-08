@@ -30,13 +30,29 @@ _BLOCK_RE = re.compile(
 )
 
 
+# `[proof: tests/x.py::test_y]` at the end of a criterion line.
+_PROOF_RE = re.compile(r"\s*[\[(]\s*proof:\s*`?(?P<node>[^`\]\)]+?)`?\s*[\]\)]\s*$", re.I)
+
+
 @dataclass(frozen=True)
 class Criterion:
     id: str
     text: str
+    # A test the HUMAN says proves this criterion. When present it is used in
+    # place of whatever the reviewer cites, which is the only way relevance
+    # becomes a fact rather than a model's opinion.
+    test_evidence: str | None = None
 
     def as_dict(self) -> dict:
-        return {"id": self.id, "text": self.text}
+        return {"id": self.id, "text": self.text, "test_evidence": self.test_evidence}
+
+
+def split_proof(text: str) -> tuple[str, str | None]:
+    """Separate a criterion's prose from any `[proof: ...]` annotation."""
+    m = _PROOF_RE.search(text)
+    if not m:
+        return text.strip(), None
+    return text[: m.start()].strip(), m.group("node").strip()
 
 
 class CriteriaError(ValueError):
@@ -56,10 +72,10 @@ def read_criteria(plan_text: str) -> list[Criterion]:
             "  Run:  arbiter plan pin <plan.md>\n"
             "  Then: arbiter verify --plan <plan.md> --diff"
         )
-    criteria = [
-        Criterion(id=m.group(1), text=m.group(2).strip())
-        for m in _CRITERION_RE.finditer(block.group(1))
-    ]
+    criteria = []
+    for m in _CRITERION_RE.finditer(block.group(1)):
+        text, proof = split_proof(m.group(2))
+        criteria.append(Criterion(id=m.group(1), text=text, test_evidence=proof))
     if not criteria:
         raise CriteriaError("The pinned criteria block is empty.")
 
@@ -73,7 +89,9 @@ def read_criteria(plan_text: str) -> list[Criterion]:
 
 def render_block(criteria: list[Criterion]) -> str:
     lines = [OPEN_FENCE, "", "## Acceptance criteria", ""]
-    lines += [f"- **{c.id}** — {c.text}" for c in criteria]
+    for c in criteria:
+        proof = f"  [proof: {c.test_evidence}]" if c.test_evidence else ""
+        lines.append(f"- **{c.id}** — {c.text}{proof}")
     lines += ["", CLOSE_FENCE]
     return "\n".join(lines)
 
@@ -88,7 +106,13 @@ def pin_into(plan_text: str, criteria: list[Criterion]) -> str:
 
 
 def number(texts: list[str]) -> list[Criterion]:
-    return [Criterion(id=f"AC-{i}", text=t.strip()) for i, t in enumerate(texts, 1) if t.strip()]
+    out: list[Criterion] = []
+    for t in texts:
+        if not t.strip():
+            continue
+        text, proof = split_proof(t)
+        out.append(Criterion(id=f"AC-{len(out) + 1}", text=text, test_evidence=proof))
+    return out
 
 
 # ── Extraction ────────────────────────────────────────────────────────────────

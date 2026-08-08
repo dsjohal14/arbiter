@@ -128,6 +128,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Check that cited tests exist, but do not execute them",
     )
     v.add_argument(
+        "--require-pinned-evidence",
+        action="store_true",
+        help="Only accept `met` when the plan pins the proving test with [proof: ...]",
+    )
+    v.add_argument(
+        "--no-scrub-test-env",
+        action="store_true",
+        help="Run cited tests with the full environment (default: secrets stripped)",
+    )
+    v.add_argument(
         "--test-command",
         metavar="CMD",
         help="Test runner for cited tests (default: autodetect pytest)",
@@ -324,6 +334,8 @@ async def cmd_verify(args: argparse.Namespace) -> int:
         test_command=args.test_command.split() if args.test_command else None,
         run_tests=not args.no_run_tests,
         require_tests=args.require_tests,
+        require_pinned_evidence=args.require_pinned_evidence,
+        scrub_env=not args.no_scrub_test_env,
     )
 
     if args.as_json:

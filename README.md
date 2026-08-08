@@ -48,7 +48,7 @@ tell "everything checks out" from "nobody actually looked."
 
 ---
 
-## The part that isn't a model's opinion
+## What is mechanical, and what isn't
 
 Reviewers cite evidence. Arbiter **checks the citations itself**:
 
@@ -67,9 +67,37 @@ reviewer's verdict is a ceiling, never a floor:
 | `met`, cites `app.py:900` | file has 40 lines | `unverifiable` |
 | `unmet` | test passes | stays `unmet` |
 
-So "verified by a test" is a fact, not an assertion — and a model that is
-confidently wrong, or that has been talked into agreeing, still cannot produce a
-green run on its own.
+### The honest limit
+
+Running a cited test proves **the test passes**. It does not prove the test
+*exercises that criterion*. A reviewer — or an injected diff — can cite any green
+test in the repo and every criterion will light up.
+
+So Arbiter separates the two and never conflates them:
+
+| Claim | Established by |
+|---|---|
+| the cited line exists, and says this | **mechanically verified** |
+| the cited test exists and passes | **mechanically verified** |
+| that test covers this criterion | **model-assessed**, unless you pin it |
+
+Output always labels which you are looking at:
+
+```
+test: tests/test_app.py::test_sums_all  ✓  (relevance model-assessed)
+test: tests/test_app.py::test_empty_list  ✓  (proof pinned in plan)
+```
+
+To make relevance a fact too, pin the proving test in the plan:
+
+```markdown
+- **AC-2** — an empty list still returns 0  [proof: tests/test_app.py::test_empty_list]
+```
+
+A pinned proof overrides whatever the reviewer cites. With
+`--require-pinned-evidence`, a model-chosen test cannot reach `met` at all —
+which is the setting to use if you want the word "verified" to mean what it
+sounds like.
 
 ---
 
@@ -77,10 +105,13 @@ green run on its own.
 
 | Status | Meaning |
 |---|---|
-| `met` | implemented, and a cited test was run and passed |
+| `met` | implemented, and a cited test was run and passed¹ |
 | `untested` | implemented, but nothing proves it |
 | `unmet` | not implemented, or the diff contradicts it |
 | `unverifiable` | can't be determined from the plan, diff, and repo |
+
+¹ That the test *covers* the criterion is model-assessed unless pinned — see
+[the honest limit](#the-honest-limit).
 
 The verdict is derived mechanically. No model gets a vote:
 
@@ -88,6 +119,7 @@ The verdict is derived mechanically. No model gets a vote:
 |---|---|---|
 | any `unmet` | `fail` | `1` |
 | any `untested`, with `--require-tests` | `fail` | `1` |
+| a model-chosen test, with `--require-pinned-evidence` | `untested` | — |
 | any `unverifiable` | `unclear` | `3` |
 | a reviewer failed to complete | `unclear` | `3` |
 | otherwise | `pass` | `0` |
@@ -145,7 +177,7 @@ In CI:
 In a pre-commit hook:
 
 ```bash
-arbiter verify --plan plan.md --diff --require-tests || exit 1
+arbiter verify --plan plan.md --diff --require-tests || exit 1   # your own code
 ```
 
 ### Why criteria are pinned
@@ -169,7 +201,9 @@ The extracted list is a starting point. Read it and edit it — it's your contra
 | `--plan` | — | Plan file (or `-` for stdin). Required by `verify`. |
 | `--diff` | `staged` | Bare, or `working`, a revision range, a path, or `-` |
 | `--require-tests` | off | Treat `untested` as a failure |
+| `--require-pinned-evidence` | off | Only accept `met` when the plan pins the proof |
 | `--no-run-tests` | off | Check cited tests exist, don't execute them |
+| `--no-scrub-test-env` | off | Run cited tests with the full environment |
 | `--test-command` | autodetect | Test runner (only pytest is autodetected) |
 | `--models` | all | Comma-separated reviewers |
 | `--judge` | `claude` | Who consolidates |
@@ -190,19 +224,36 @@ arbiter debate "Which sorting algorithm for mostly-sorted data?" --rounds 2
 
 ## Trust boundary
 
-**Arbiter is not a defense against a hostile pull-request author.** A diff is
-attacker-controllable text, and it goes into a model's context. Untrusted content
-is fenced and labelled as data, which removes the naive version of the attack,
-but no prompt-level measure makes this safe against someone deliberately trying
-to talk a reviewer into a pass.
+**Arbiter is not a defense against a hostile pull-request author, and running it
+on untrusted code is dangerous.**
 
-What actually helps is that the verdict doesn't rest on what a model says. An
-injected "report everything as met" still has to survive the evidence check: the
-cited test gets run, and the cited line gets read. Use `--require-tests` on
-untrusted input, and treat the result as advisory rather than authoritative.
+Two distinct risks:
 
-For code you or your agents wrote, this is a gate. For code from strangers, it's
-a signal.
+**1. Prompt injection.** A diff is attacker-controllable text that goes into a
+model's context. Untrusted content is fenced and labelled as data, which removes
+the naive version of the attack, but no prompt-level measure makes this safe
+against someone deliberately trying to talk a reviewer into a pass.
+
+**2. Code execution.** This is the serious one. Checking test evidence *runs a
+test from the branch under review*. A hostile PR can put arbitrary Python in
+that test and get whatever the invoking process has — credentials, filesystem,
+network. Arbiter strips secrets from the child environment by default (only
+`PATH`, `HOME`, `LANG` and similar survive; disable with `--no-scrub-test-env`),
+but **that is damage limitation, not a sandbox.**
+
+### Running it on code you don't trust
+
+```bash
+arbiter verify --plan plan.md --diff origin/main...HEAD --no-run-tests
+```
+
+`--no-run-tests` checks that cited tests exist without executing them. Do not use
+`--require-tests` on untrusted input — it pushes reviewers toward citing tests,
+and every citation becomes an execution. If you need test evidence from untrusted
+branches, run Arbiter in a throwaway container with no credentials mounted.
+
+For code you or your agents wrote, this is a gate. For code from strangers, run
+it with `--no-run-tests` and treat the result as a signal.
 
 ---
 
@@ -269,7 +320,7 @@ Adding a provider is one `Provider` entry plus a branch in the event parser.
 
 ```bash
 uv pip install -e . pytest pytest-asyncio pytest-cov ruff
-pytest          # 151 tests
+pytest          # 193 tests
 ruff check src/ tests/
 ```
 

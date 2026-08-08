@@ -90,8 +90,16 @@ class CriterionResult:
     test_evidence: str | None = None
     impl_check: EvidenceCheck | None = None
     test_check: EvidenceCheck | None = None
+    # Where the test citation came from. Execution and outcome are mechanical
+    # facts either way; whether the test actually EXERCISES this criterion is
+    # only a fact when a human pinned it in the plan.
+    evidence_source: str = "model_assessed"  # "pinned" | "model_assessed"
     downgraded_from: str | None = None
     downgrade_reason: str | None = None
+
+    @property
+    def relevance_is_verified(self) -> bool:
+        return self.evidence_source == "pinned"
 
     def as_dict(self) -> dict:
         d = asdict(self)
@@ -425,12 +433,20 @@ def apply_evidence_checks(
     root: Path | None = None,
     test_command: list[str] | None = None,
     run_tests: bool = True,
+    scrub_env: bool = True,
+    require_pinned_evidence: bool = False,
 ) -> CriterionResult:
     """Check the cited evidence and let facts override the reviewer.
 
     A status is only ever lowered here, never raised: the reviewer's word is a
     ceiling and reality brings it down. This is what stops a confident assertion —
     or an injected one — from producing a pass on its own.
+
+    IMPORTANT LIMIT: running a cited test proves the test passes, not that it
+    exercises this criterion. A reviewer can cite any green test in the repo. So
+    relevance is only treated as established when the test was pinned in the
+    plan by a human; with `require_pinned_evidence`, a model-chosen test cannot
+    reach `met` at all.
     """
     original = result.status
 
@@ -438,7 +454,7 @@ def apply_evidence_checks(
         result.impl_check = check_file_citation(result.implementation_evidence, root)
     if result.test_evidence:
         result.test_check = check_test_citation(
-            result.test_evidence, root, test_command, run=run_tests
+            result.test_evidence, root, test_command, run=run_tests, scrub_env=scrub_env
         )
 
     def downgrade(to: str, why: str) -> None:
@@ -464,6 +480,14 @@ def apply_evidence_checks(
             downgrade("untested", "no test cited")
         elif result.test_check and result.test_check.verified is not True:
             downgrade("untested", f"test not confirmed: {result.test_check.detail}")
+        elif require_pinned_evidence and not result.relevance_is_verified:
+            # The test passes, but nothing establishes that it covers THIS
+            # criterion — a reviewer can cite any green test in the repo.
+            downgrade(
+                "untested",
+                "test passed, but relevance is model-assessed; pin it with "
+                f"[proof: {result.test_evidence}] to accept it",
+            )
 
     return result
 
@@ -522,6 +546,9 @@ def _merge(
                     "test_evidence": None,
                 }
             )
+        # A human-pinned proof wins over whatever the reviewer picked: that is
+        # the only path by which relevance becomes a fact rather than a claim.
+        pinned = bool(c.test_evidence)
         results.append(
             CriterionResult(
                 id=c.id,
@@ -529,7 +556,8 @@ def _merge(
                 status=a["status"],
                 assessment=a["assessment"],
                 implementation_evidence=a["implementation_evidence"],
-                test_evidence=a["test_evidence"],
+                test_evidence=c.test_evidence if pinned else a["test_evidence"],
+                evidence_source="pinned" if pinned else "model_assessed",
             )
         )
     return results
@@ -551,6 +579,8 @@ async def run_verify(
     test_command: list[str] | None = None,
     run_tests: bool = True,
     require_tests: bool = False,
+    require_pinned_evidence: bool = False,
+    scrub_env: bool = True,
 ) -> VerifyResult:
     manifest = manifest if manifest is not None else build_manifest(diff)
 
@@ -620,7 +650,7 @@ async def run_verify(
         "Reading cited lines" + (" and running cited tests..." if run_tests else " (tests not run)")
     )
     for r in results:
-        apply_evidence_checks(r, root, test_command, run_tests)
+        apply_evidence_checks(r, root, test_command, run_tests, scrub_env, require_pinned_evidence)
 
     results.sort(key=lambda r: (STATUSES.index(r.status), r.id))
 

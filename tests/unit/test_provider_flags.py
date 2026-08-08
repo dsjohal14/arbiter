@@ -94,3 +94,32 @@ def test_stdin_mode_keeps_every_other_flag(key):
 def test_argv_mode_still_guards_a_dash_leading_prompt():
     cmd = _build_cmd(make_session("codex", "codex"), "--help me")
     assert cmd[-2:] == ["--", "--help me"]
+
+
+# ── Per-turn schema override ─────────────────────────────────────────────────
+
+
+def test_a_judge_session_can_be_called_free_form_for_follow_ups():
+    """The arbiter session carries JUDGE_SCHEMA. Reusing it for a follow-up used
+    to force {winner, reason, best_answer} JSON, which makes the `REPOLL:`
+    directive undetectable."""
+    sess = make_arbiter_session("claude", output_schema=JUDGE_SCHEMA)
+    assert "--json-schema" in _build_cmd(sess, "judge this")
+    assert "--json-schema" not in _build_cmd(sess, "follow up", schema=None)
+
+
+def test_omitting_the_override_keeps_the_session_schema():
+    sess = make_arbiter_session("claude", output_schema=JUDGE_SCHEMA)
+    assert "--json-schema" in _build_cmd(sess, "q")
+
+
+def test_a_per_turn_schema_can_replace_the_session_one():
+    sess = make_arbiter_session("claude", output_schema=JUDGE_SCHEMA)
+    cmd = _build_cmd(sess, "q", schema={"type": "object", "properties": {"zzz": {}}})
+    assert "zzz" in cmd[cmd.index("--json-schema") + 1]
+
+
+def test_free_form_override_needs_no_schema_writer_for_codex():
+    """Otherwise a codex follow-up would raise instead of simply going free-form."""
+    sess = make_arbiter_session("codex", output_schema=JUDGE_SCHEMA)
+    assert "--output-schema" not in _build_cmd(sess, "follow up", schema=None)

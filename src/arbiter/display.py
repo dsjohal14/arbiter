@@ -254,7 +254,15 @@ def print_criterion(c: dict) -> None:
             verified = check.get("verified")
             mark = {True: "✓", False: "✗"}.get(verified, "?")
             mark_color = {True: GREEN, False: RED}.get(verified, YELLOW)
-        print(f"       {_c(label + ':', DIM)} {citation}  {_c(mark, BOLD, mark_color)}")
+        note = ""
+        if label == "test":
+            # Execution is mechanical; relevance is not, unless a human pinned it.
+            note = (
+                _c("  (proof pinned in plan)", DIM)
+                if c.get("evidence_source") == "pinned"
+                else _c("  (relevance model-assessed)", DIM)
+            )
+        print(f"       {_c(label + ':', DIM)} {citation}  {_c(mark, BOLD, mark_color)}{note}")
         if check and check.get("detail"):
             for line in str(check["detail"]).splitlines()[:5]:
                 print(f"         {_c('│ ' + line, DIM)}")

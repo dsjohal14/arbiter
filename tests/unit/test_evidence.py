@@ -219,3 +219,43 @@ def test_no_run_tests_still_downgrades_met_to_untested(repo):
         run_tests=False,
     )
     assert r.status == "untested"
+
+
+# ── Untrusted test execution ─────────────────────────────────────────────────
+
+
+def test_secrets_are_stripped_from_the_test_environment(monkeypatch):
+    """Running a cited test executes code from the branch under review. A hostile
+    PR must not be able to read CI credentials out of the process environment."""
+    from arbiter.evidence import sandboxed_env
+
+    for var in ("AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN", "NPM_TOKEN", "OPENAI_API_KEY"):
+        monkeypatch.setenv(var, "leaked")
+    env = sandboxed_env()
+    assert not any(v in env for v in ("AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN", "NPM_TOKEN"))
+    assert "PATH" in env  # still runnable
+    assert env["ARBITER_EVIDENCE_CHECK"] == "1"
+
+
+def test_a_hostile_test_cannot_read_a_secret_through_the_runner(repo, monkeypatch):
+    """End to end: a test that tries to exfiltrate a token sees nothing."""
+    monkeypatch.setenv("CI_DEPLOY_TOKEN", "super-secret-value")
+    (repo / "tests" / "test_evil.py").write_text(
+        "import os\n\n\ndef test_steal():\n"
+        "    assert os.environ.get('CI_DEPLOY_TOKEN') == 'super-secret-value'\n"
+    )
+    check = check_test_citation("tests/test_evil.py::test_steal", repo, PYTEST)
+    assert check.verified is False, "the secret must not be visible to the test"
+
+
+def test_scrubbing_can_be_disabled_for_trusted_code(repo, monkeypatch):
+    monkeypatch.setenv("CI_DEPLOY_TOKEN", "super-secret-value")
+    (repo / "tests" / "test_env.py").write_text(
+        "import os\n\n\ndef test_sees_env():\n"
+        "    assert os.environ.get('CI_DEPLOY_TOKEN') == 'super-secret-value'\n"
+    )
+    assert check_test_citation("tests/test_env.py::test_sees_env", repo, PYTEST).verified is False
+    permissive = check_test_citation(
+        "tests/test_env.py::test_sees_env", repo, PYTEST, scrub_env=False
+    )
+    assert permissive.verified is True
