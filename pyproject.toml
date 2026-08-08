@@ -1,0 +1,62 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "arbiter"
+version = "0.2.0"
+description = "A falsification-first verification gate for AI-generated plans and code changes."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.12"
+authors = [{ name = "Daljit Singh" }]
+keywords = ["llm", "code-review", "verification", "ci", "multi-model"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Quality Assurance",
+]
+
+# No runtime dependencies. Arbiter drives CLI tools the user already has.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/dsjohal/arbiter"
+Issues = "https://github.com/dsjohal/arbiter/issues"
+
+[project.scripts]
+arbiter = "arbiter.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "pytest-cov>=5.0", "ruff>=0.6"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/arbiter"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-q"
+
+[tool.coverage.run]
+source = ["arbiter"]
+# display.py is terminal output with no logic; cli.py is argument wiring.
+# A defended, uneven target beats an inflated overall number.
+omit = ["*/display.py", "*/cli.py"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC", "RUF"]
+# ASYNC109: threading an explicit `timeout` down the call chain is the point —
+#   it is a user-facing --timeout flag, not an internal deadline.
+# ASYNC240: reading a plan file or a cited source line is a few KB of sync I/O.
+#   Async file access would mean an anyio/trio dependency, and "no runtime
+#   dependencies" is a deliberate property of this tool.
+ignore = ["E501", "ASYNC109", "ASYNC240"]

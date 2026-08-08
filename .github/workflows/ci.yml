@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv python install 3.12
+      - name: ruff check
+        run: uvx ruff check src/ tests/
+      - name: ruff format
+        run: uvx ruff format --check src/ tests/
+
+  test:
+    runs-on: ${{ matrix.os }}
+    # A tool whose whole problem is hanging subprocesses must not be able to
+    # hang its own CI.
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      # `--system` resolves to the runner's OS python, which is externally
+      # managed on ubuntu and is 3.12 regardless of the matrix. A venv is what
+      # makes the matrix mean anything.
+      - name: Install
+        run: |
+          uv venv --python ${{ matrix.python }}
+          uv pip install -e . pytest pytest-asyncio pytest-cov
+      - name: Confirm the interpreter matches the matrix
+        run: |
+          .venv/bin/python -c "import sys; \
+            got = '%d.%d' % sys.version_info[:2]; \
+            assert got == '${{ matrix.python }}', 'matrix says ${{ matrix.python }}, got ' + got"
+      # `.venv/bin/python -m pytest`, not `.venv/bin/pytest`: same reason the
+      # Makefile does it, see DEVELOPMENT.md.
+      - name: Test
+        run: .venv/bin/python -m pytest tests/ --cov=arbiter --cov-report=term-missing --cov-fail-under=80
