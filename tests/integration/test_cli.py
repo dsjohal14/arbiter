@@ -531,3 +531,42 @@ def test_a_changed_plan_selected_test_fails_strict_mode(repo, shim_path, capsys)
     assert code == EXIT_FAIL
     assert "plan-selected test changed in diff" in out
     assert "unchanged from the trusted baseline" in out
+
+
+def test_a_newly_added_plan_selected_test_is_not_treated_as_stale(repo, shim_path, capsys):
+    """The common workflow — agent implements the feature AND writes its test in
+    one diff — must not be rejected. Any-change-invalidates would fail every new
+    test; only a REWRITE of a test the plan author already approved is stale."""
+    (repo / "adds_test.diff").write_text(
+        "diff --git a/tests/test_new.py b/tests/test_new.py\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/tests/test_new.py\n"
+        "@@ -0,0 +1,2 @@\n"
+        "+def test_fresh():\n"
+        "+    assert True\n"
+    )
+    (repo / "tests" / "test_new.py").write_text("def test_fresh():\n    assert True\n")
+    (repo / "pinned.md").write_text(
+        "# Plan\n\n<!-- arbiter:criteria -->\n\n"
+        "- **AC-1** — total() sums every item  [proof: tests/test_new.py::test_fresh]\n\n"
+        "<!-- /arbiter:criteria -->\n"
+    )
+    shim_path(claude_events(_review([_ac("AC-1", "met", "app.py:2")])))
+    code = main(
+        [
+            "verify",
+            "--plan",
+            "pinned.md",
+            "--diff",
+            "adds_test.diff",
+            "--models",
+            "claude",
+            "--test-command",
+            PYTEST,
+            "--require-pinned-evidence",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert code == EXIT_PASS
+    assert "changed in this diff" not in out

@@ -97,10 +97,38 @@ To record a human-reviewed test selection, annotate it in the plan:
 The plan's selection overrides whatever the reviewer cites. This records human
 approval; it does not make semantic relevance mechanically decidable. With
 `--require-pinned-evidence`, a model-chosen test cannot reach `met`, and an
-`untested` row fails the gate even without separately passing `--require-tests`.
-If the reviewed diff changes the selected test file, Arbiter also refuses `met`
-in strict mode. Establish that test in a trusted baseline first, then verify the
-implementation in a separate diff.
+`untested` row fails the gate without separately passing `--require-tests`.
+
+If the diff *rewrites* a test the plan already selected, the approval is stale
+and Arbiter refuses `met` — in every mode, not just strict. A test the diff
+merely *adds* is fine: it was named in the contract before the code existed,
+which is the normal workflow.
+
+### Does the test prove anything?
+
+A test can pass for the wrong reason. `assert True` passes everywhere, and so
+does a test that never exercises the change. Point Arbiter at a base revision
+and it re-runs each cited test against the old code:
+
+```bash
+arbiter verify --plan plan.md --diff origin/main...HEAD --require-discriminating-tests
+```
+
+```
+test: tests/test_app.py::test_sums_all  ✓  (relevance model-assessed)
+base: ✓ fails against origin/main, passes here
+```
+
+Fails at base and passes now → the change is what made it pass. Passes at base
+too → it proves nothing about this change. That second case is *reported* by
+default rather than punished, because a vacuous test and a legitimate regression
+guard are indistinguishable from outside; `--require-discriminating-tests` turns
+it into a failure when you want the stricter reading.
+
+The base revision is inferred from `--diff` (`origin/main...HEAD` → `origin/main`,
+`staged` → `HEAD`) or set with `--base`. A diff read from a file or stdin has no
+base, so the check is skipped rather than guessed. It runs in a throwaway git
+worktree; your working tree is never touched.
 
 ---
 
@@ -122,7 +150,8 @@ The verdict is derived mechanically. No model gets a vote:
 |---|---|---|
 | any `unmet` | `fail` | `1` |
 | any `untested`, with `--require-tests` | `fail` | `1` |
-| model-chosen or changed plan evidence, with `--require-pinned-evidence` | `fail` | `1` |
+| model-chosen evidence, with `--require-pinned-evidence` | `fail` | `1` |
+| a test that passes at base too, with `--require-discriminating-tests` | `fail` | `1` |
 | any `unverifiable` | `unclear` | `3` |
 | a reviewer failed to complete | `unclear` | `3` |
 | otherwise | `pass` | `0` |
@@ -204,7 +233,9 @@ The extracted list is a starting point. Read it and edit it — it's your contra
 | `--plan` | — | Plan file (or `-` for stdin). Required by `verify`. |
 | `--diff` | `staged` | Bare, or `working`, a revision range, a path, or `-` |
 | `--require-tests` | off | Treat `untested` as a failure |
-| `--require-pinned-evidence` | off | Require unchanged, plan-selected tests; implies `--require-tests` |
+| `--require-pinned-evidence` | off | Require plan-selected tests; implies `--require-tests` |
+| `--require-discriminating-tests` | off | Reject cited tests that pass against the base too |
+| `--base` | inferred | Base revision for the discrimination check |
 | `--no-run-tests` | off | Check cited tests exist, don't execute them |
 | `--no-scrub-test-env` | off | Run cited tests with the full environment |
 | `--test-command` | autodetect | Test runner (only pytest is autodetected) |
@@ -324,7 +355,7 @@ Adding a provider is one `Provider` entry plus a branch in the event parser.
 
 ```bash
 uv pip install -e . pytest pytest-asyncio pytest-cov ruff
-pytest          # 196 tests
+pytest          # 209 tests
 ruff check src/ tests/
 ```
 

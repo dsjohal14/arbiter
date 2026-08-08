@@ -269,6 +269,15 @@ def print_criterion(c: dict) -> None:
             for line in str(check["detail"]).splitlines()[:5]:
                 print(f"         {_c('│ ' + line, DIM)}")
 
+    baseline = c.get("baseline_check")
+    if baseline:
+        verified = baseline.get("verified")
+        mark = {True: "✓", False: "✗"}.get(verified, "?")
+        color = {True: GREEN, False: YELLOW}.get(verified, DIM)
+        print(
+            f"       {_c('base:', DIM)} {_c(mark, BOLD, color)} {_c(baseline.get('detail', ''), DIM)}"
+        )
+
     if c.get("downgrade_reason"):
         print(
             f"       {_c('downgraded from ' + str(c.get('downgraded_from')) + ': ', DIM)}"

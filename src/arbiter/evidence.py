@@ -13,12 +13,15 @@ Everything here is deliberately dumb and deterministic. No model is consulted.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -214,3 +217,123 @@ def check_test_citation(
 def _tail(text: str, lines: int = 6) -> str:
     kept = [ln for ln in text.splitlines() if ln.strip()][-lines:]
     return "\n".join(kept)
+
+
+# ── Baseline discrimination ──────────────────────────────────────────────────
+
+
+@contextlib.contextmanager
+def base_worktree(root: Path, ref: str) -> Iterator[Path | None]:
+    """Check out `ref` into a throwaway worktree, leaving the user's tree alone.
+
+    Yields None if the worktree cannot be created — a missing ref, a shallow
+    clone, no git. Callers must treat that as "could not check", never as a
+    failure of the change under review.
+    """
+    tmp = tempfile.mkdtemp(prefix="arbiter-base-")
+    created = False
+    try:
+        proc = subprocess.run(
+            ["git", "worktree", "add", "--detach", tmp, ref],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        created = proc.returncode == 0
+        yield Path(tmp) if created else None
+    except OSError:
+        yield None
+    finally:
+        if created:
+            subprocess.run(
+                ["git", "worktree", "remove", "--force", tmp],
+                cwd=root,
+                capture_output=True,
+                check=False,
+            )
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def check_test_discriminates(
+    citation: str,
+    root: Path,
+    base_ref: str,
+    test_command: list[str] | None = None,
+    scrub_env: bool = True,
+    base_dir: Path | None = None,
+) -> EvidenceCheck:
+    """Does this test actually distinguish the change, or would it pass anyway?
+
+    Runs the *current* version of the cited test against the *base* revision's
+    code. A test that fails there and passes now is proof the change is what
+    made it pass. A test that passes at base proves nothing about the change —
+    it is either a pre-existing regression guard or vacuous (`assert True`
+    passes everywhere), and those two are not distinguishable from the outside.
+
+    This is why the check reports rather than punishes: `verified is False` means
+    "does not discriminate", which is a legitimate state for an invariant.
+    """
+    m = _TEST_CITATION_RE.search(citation or "")
+    if not m:
+        return EvidenceCheck("baseline", citation, None, "no test node id found")
+
+    node, rel = m.group(0), m.group("path")
+    head_file = _safe_path(rel, root)
+    if head_file is None or not head_file.is_file():
+        return EvidenceCheck("baseline", node, None, "test file not readable at HEAD")
+
+    with contextlib.ExitStack() as stack:
+        # One checkout serves every criterion; creating one per test would make
+        # this unusably slow on a real plan.
+        base = base_dir or stack.enter_context(base_worktree(root, base_ref))
+        if base is None:
+            return EvidenceCheck("baseline", node, None, f"could not check out {base_ref}")
+
+        # Carry the test itself back to the old code: we are asking what the
+        # change did, not what the old test suite said.
+        target = base / rel
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(head_file, target)
+        except OSError as e:
+            return EvidenceCheck("baseline", node, None, f"could not stage the test: {e}")
+
+        cmd = test_command or detect_test_command(root) or detect_test_command(base)
+        if not cmd:
+            return EvidenceCheck("baseline", node, None, "no test runner detected")
+
+        try:
+            proc = subprocess.run(
+                [*cmd, node, "-q", "--no-header"],
+                cwd=base,
+                capture_output=True,
+                text=True,
+                timeout=TEST_TIMEOUT,
+                check=False,
+                env=scrubbed_env() if scrub_env else None,
+            )
+        except subprocess.TimeoutExpired:
+            return EvidenceCheck("baseline", node, None, "timed out against the base revision")
+        except OSError as e:
+            return EvidenceCheck("baseline", node, None, f"could not run against base: {e}")
+
+    out = (proc.stdout + proc.stderr).strip()
+    if proc.returncode == 0:
+        return EvidenceCheck(
+            "baseline",
+            node,
+            False,
+            f"passes against {base_ref} too, so it does not distinguish this change",
+        )
+    # Collection errors mean the test could not even load against the old code —
+    # usually it imports something this change introduced. That is not evidence
+    # either way.
+    collection_error = proc.returncode == 4 or (
+        "error" in out.lower()[:400] and "assert" not in out.lower()
+    )
+    if collection_error:
+        return EvidenceCheck(
+            "baseline", node, None, f"could not run against {base_ref} (likely new imports)"
+        )
+    return EvidenceCheck("baseline", node, True, f"fails against {base_ref}, passes here")

@@ -20,6 +20,7 @@ import json
 import re
 import subprocess
 import sys
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -27,8 +28,10 @@ from . import display
 from .criteria import Criterion
 from .evidence import (
     EvidenceCheck,
+    base_worktree,
     check_file_citation,
     check_test_citation,
+    check_test_discriminates,
     test_citation_path,
 )
 from .models import IsolationMode, ModelCallError, Session, call_session, make_session
@@ -95,6 +98,11 @@ class CriterionResult:
     test_evidence: str | None = None
     impl_check: EvidenceCheck | None = None
     test_check: EvidenceCheck | None = None
+    # Did this test fail against the base revision? A test that passes both
+    # sides proves nothing about the change — vacuous tests and pre-existing
+    # regression guards look identical from outside, so this reports rather
+    # than punishes unless --require-discriminating-tests is set.
+    baseline_check: EvidenceCheck | None = None
     # Where the test citation came from. Execution and outcome are mechanical;
     # semantic relevance is model-assessed or human-asserted by plan selection.
     evidence_source: str = "model_assessed"
@@ -109,6 +117,7 @@ class CriterionResult:
         d = asdict(self)
         d["impl_check"] = self.impl_check.as_dict() if self.impl_check else None
         d["test_check"] = self.test_check.as_dict() if self.test_check else None
+        d["baseline_check"] = self.baseline_check.as_dict() if self.baseline_check else None
         return d
 
 
@@ -228,6 +237,33 @@ def build_manifest(diff: str, root: Path | None = None) -> list[str]:
             if p not in paths and (root / p).exists():
                 paths.append(p)
     return paths
+
+
+_ADDED_FILE_RE = re.compile(
+    r"^diff --git a/(?P<a>\S+) b/(?P<b>\S+)\n(?:(?!^diff --git ).*\n)*?new file mode",
+    re.MULTILINE,
+)
+
+
+def added_paths(diff: str) -> set[str]:
+    """Paths this diff creates. A test that did not exist before cannot be a
+    weakened version of one the plan author approved."""
+    return {m.group("b").removeprefix("./") for m in _ADDED_FILE_RE.finditer(diff)}
+
+
+def resolve_base_ref(diff_spec: str) -> str | None:
+    """The revision a diff is measured against, when that is knowable.
+
+    A diff read from a file or stdin has no base we can check out, and guessing
+    one would silently compare against the wrong tree.
+    """
+    for sep in ("...", ".."):
+        if sep in diff_spec:
+            left = diff_spec.split(sep, 1)[0].strip()
+            return left or None
+    if diff_spec in ("staged", "working"):
+        return "HEAD"
+    return None
 
 
 def changed_paths(diff: str) -> set[str]:
@@ -449,6 +485,9 @@ def apply_evidence_checks(
     run_tests: bool = True,
     scrub_env: bool = True,
     require_pinned_evidence: bool = False,
+    base_ref: str | None = None,
+    base_dir: Path | None = None,
+    require_discriminating_tests: bool = False,
 ) -> CriterionResult:
     """Check the cited evidence and let facts override the reviewer.
 
@@ -469,6 +508,12 @@ def apply_evidence_checks(
     if result.test_evidence:
         result.test_check = check_test_citation(
             result.test_evidence, root, test_command, run=run_tests, scrub_env=scrub_env
+        )
+
+    # Does the cited test actually distinguish this change from the base?
+    if result.test_evidence and base_ref and result.test_check and result.test_check.verified:
+        result.baseline_check = check_test_discriminates(
+            result.test_evidence, root or Path.cwd(), base_ref, test_command, scrub_env, base_dir
         )
 
     def downgrade(to: str, why: str) -> None:
@@ -499,6 +544,15 @@ def apply_evidence_checks(
                 "untested",
                 "plan-selected test changed in this diff; strict evidence must be unchanged "
                 "from the trusted baseline",
+            )
+        elif (
+            require_discriminating_tests
+            and result.baseline_check is not None
+            and (result.baseline_check.verified is False)
+        ):
+            downgrade(
+                "untested",
+                f"cited test {result.baseline_check.detail}",
             )
         elif require_pinned_evidence and not result.is_unchanged_plan_selection:
             # The test passes, but nothing establishes that it covers THIS
@@ -551,6 +605,7 @@ def _merge(
     consolidated: dict[str, dict],
     per_reviewer: list[dict[str, dict]],
     diff_paths: set[str] | None = None,
+    new_paths: set[str] | None = None,
 ) -> list[CriterionResult]:
     """One row per criterion. A criterion nobody assessed is `unverifiable`,
     never a silent pass."""
@@ -575,10 +630,16 @@ def _merge(
         # must require renewed approval instead of calling the old selection proof.
         plan_selected = bool(c.test_evidence)
         selected_path = test_citation_path(c.test_evidence or "")
+        rel = selected_path.removeprefix("./") if selected_path else None
+        # Only a MODIFIED test invalidates the plan author's approval — they
+        # approved a version that this diff then rewrote. A test the diff merely
+        # *adds* was named in the contract before the code existed, which is the
+        # normal workflow; its vacuity is caught by the baseline check instead.
         selected_changed = bool(
             plan_selected
-            and selected_path
-            and selected_path.removeprefix("./") in (diff_paths or set())
+            and rel
+            and rel in (diff_paths or set())
+            and rel not in (new_paths or set())
         )
         results.append(
             CriterionResult(
@@ -618,9 +679,12 @@ async def run_verify(
     require_tests: bool = False,
     require_pinned_evidence: bool = False,
     scrub_env: bool = True,
+    base_ref: str | None = None,
+    require_discriminating_tests: bool = False,
 ) -> VerifyResult:
     manifest = manifest if manifest is not None else build_manifest(diff, root)
     diff_paths = changed_paths(diff)
+    new_paths = added_paths(diff)
 
     with schema_writer() as write_schema:
         display.print_section("independent review")
@@ -681,14 +745,33 @@ async def run_verify(
             # costs precision and must not cost the whole run.
             display.print_error(f"consolidation failed, using reviewer verdicts: {e}")
 
-        results = _merge(criteria, consolidated, per_reviewer, diff_paths)
+        results = _merge(criteria, consolidated, per_reviewer, diff_paths, new_paths)
 
     display.print_section("evidence check")
     display.print_note(
         "Reading cited lines" + (" and running cited tests..." if run_tests else " (tests not run)")
     )
-    for r in results:
-        apply_evidence_checks(r, root, test_command, run_tests, scrub_env, require_pinned_evidence)
+    want_baseline = bool(base_ref) and run_tests
+    if want_baseline:
+        display.print_note(f"Re-running cited tests against {base_ref} to see what they prove...")
+
+    with (
+        base_worktree(root or Path.cwd(), base_ref)
+        if want_baseline
+        else nullcontext(None) as base_dir
+    ):
+        for r in results:
+            apply_evidence_checks(
+                r,
+                root,
+                test_command,
+                run_tests,
+                scrub_env,
+                require_pinned_evidence,
+                base_ref if want_baseline else None,
+                base_dir,
+                require_discriminating_tests,
+            )
 
     results.sort(key=lambda r: (STATUSES.index(r.status), r.id))
 
@@ -705,7 +788,7 @@ async def run_verify(
             results,
             require_tests,
             quorum_met=not failed,
-            require_pinned_evidence=require_pinned_evidence,
+            require_pinned_evidence=require_pinned_evidence or require_discriminating_tests,
         ),
         criteria=results,
         findings=sorted(deduped, key=lambda f: SEVERITIES.index(f.severity)),

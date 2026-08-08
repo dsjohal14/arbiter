@@ -133,6 +133,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Require plan-selected, unchanged test evidence (implies --require-tests)",
     )
     v.add_argument(
+        "--require-discriminating-tests",
+        action="store_true",
+        help="Re-run cited tests against the base revision; reject ones that pass there too",
+    )
+    v.add_argument(
+        "--base",
+        metavar="REF",
+        help="Base revision for discrimination (default: inferred from --diff)",
+    )
+    v.add_argument(
         "--no-scrub-test-env",
         action="store_true",
         help="Let tests inherit the full environment (scrubbing is not a sandbox)",
@@ -336,6 +346,8 @@ async def cmd_verify(args: argparse.Namespace) -> int:
         require_tests=args.require_tests or args.require_pinned_evidence,
         require_pinned_evidence=args.require_pinned_evidence,
         scrub_env=not args.no_scrub_test_env,
+        base_ref=args.base or verify.resolve_base_ref(args.diff),
+        require_discriminating_tests=args.require_discriminating_tests,
     )
 
     if args.as_json:
