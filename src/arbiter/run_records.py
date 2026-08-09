@@ -51,6 +51,8 @@ def _utc_now() -> str:
 
 
 def _git(args: list[str], root: Path) -> str | None:
+    """Best-effort git, for provenance only. A `None` here means "unknown"; do
+    not use it to decide the scope, which `_inside_work_tree` settles instead."""
     try:
         proc = subprocess.run(
             ["git", *args], cwd=root, capture_output=True, text=True, check=False, timeout=10
@@ -60,9 +62,56 @@ def _git(args: list[str], root: Path) -> str | None:
     return proc.stdout.strip() if proc.returncode == 0 else None
 
 
+def _has_git_directory(root: Path) -> bool:
+    """Whether anything up the ancestry claims to be a repository.
+
+    `.git` is a directory in a normal checkout and a file in a linked worktree
+    or submodule, so existence is the test. This is only consulted when git
+    itself cannot answer.
+    """
+    return any((parent / ".git").exists() for parent in (root, *root.parents))
+
+
+def _inside_work_tree(root: Path) -> bool:
+    """Whether root is inside a Git worktree — or an error if git cannot say.
+
+    A failed invocation is not the same answer as `false`. Treating "git is
+    missing" as "not a repository" would silently enumerate the whole directory
+    instead of the tracked tree: an identity that ignores `.gitignore`, sweeps
+    in `venv/` and `node_modules/`, and can never be scored against a record
+    made where git did work. So the only fallback is the one case that needs no
+    git to decide — nothing up the ancestry claims to be a repository at all.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except FileNotFoundError as e:
+        if _has_git_directory(root):
+            raise WorkspaceIdentityError(
+                f"{root} is inside a Git repository but git is not installed or not on "
+                "PATH, so its tracked tree cannot be enumerated"
+            ) from e
+        return False
+    except (OSError, subprocess.SubprocessError) as e:
+        raise WorkspaceIdentityError(f"could not ask git about {root}: {e}") from e
+
+    if proc.returncode == 0:
+        return proc.stdout.strip() == "true"
+    detail = proc.stderr.strip()
+    if "not a git repository" in detail.lower():
+        return False
+    raise WorkspaceIdentityError(f"could not ask git about {root}{f': {detail}' if detail else ''}")
+
+
 def _git_workspace_paths(root: Path) -> list[str] | None:
     """Git-visible files below root, relative to root; None outside a worktree."""
-    if _git(["rev-parse", "--is-inside-work-tree"], root) != "true":
+    if not _inside_work_tree(root):
         return None
     try:
         proc = subprocess.run(

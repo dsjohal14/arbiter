@@ -232,6 +232,62 @@ def test_workspace_identity_hashes_raw_bytes_without_replacement_collisions(tmp_
     assert first["files"]["binary.dat"] != second["files"]["binary.dat"]
 
 
+def _fake_git(tmp_path, monkeypatch, body: str):
+    """Put a `git` on PATH that answers however this test needs it to."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    script = bindir / "git"
+    script.write_text(f"#!/bin/sh\n{body}\n")
+    script.chmod(script.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("PATH", str(bindir))
+
+
+def test_a_worktree_git_cannot_read_is_refused_rather_than_walked(tmp_path, monkeypatch):
+    """Silently downgrading to a directory walk would record an identity that
+    ignores .gitignore — sweeping in venv/ and node_modules/ — and could never
+    be scored against a record made where git worked."""
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "app.py").write_text("x = 1\n")
+    monkeypatch.setenv("PATH", str(tmp_path / "nowhere"))
+
+    with pytest.raises(run_records.WorkspaceIdentityError, match="git is not installed"):
+        run_records.workspace_identity(root=tmp_path)
+
+
+def test_a_plain_directory_still_snapshots_when_git_is_missing(tmp_path, monkeypatch):
+    """Nothing up the ancestry claims to be a repository, so no git is needed
+    to know this is a plain tree."""
+    (tmp_path / "app.py").write_text("x = 1\n")
+    monkeypatch.setenv("PATH", str(tmp_path / "nowhere"))
+
+    identity = run_records.workspace_identity(root=tmp_path)
+
+    assert identity["scope"] == "tree"
+    assert set(identity["files"]) == {"app.py"}
+
+
+def test_a_git_failure_that_is_not_an_answer_is_refused(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "app.py").write_text("x = 1\n")
+    _fake_git(tmp_path, monkeypatch, 'echo "fatal: detected dubious ownership" >&2\nexit 128')
+
+    with pytest.raises(run_records.WorkspaceIdentityError, match="dubious ownership"):
+        run_records.workspace_identity(root=root)
+
+
+def test_git_saying_it_is_not_a_repository_is_an_answer_not_a_failure(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "app.py").write_text("x = 1\n")
+    _fake_git(tmp_path, monkeypatch, 'echo "fatal: not a git repository" >&2\nexit 128')
+
+    identity = run_records.workspace_identity(root=root)
+
+    assert identity["scope"] == "tree"
+    assert set(identity["files"]) == {"app.py"}
+
+
 def test_the_record_output_can_be_excluded_from_a_complete_snapshot(tmp_path):
     output = tmp_path / "run.json"
     output.write_text("an older record")
