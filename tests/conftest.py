@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import stat
 import sys
 from pathlib import Path
@@ -11,22 +12,36 @@ import pytest
 FAKE_CLI = Path(__file__).parent / "fake_cli.py"
 
 
+PROVIDER_CLIS = ("claude", "codex", "gemini", "agy")
+
+
 @pytest.fixture
 def shim_path(tmp_path, monkeypatch):
-    """Put fake `claude`/`codex`/`gemini`/`agy` executables at the front of PATH.
+    """Put fake provider executables on PATH, and nothing else that answers to
+    those names.
+
+    PATH is *replaced*, not prepended. Prepending leaves the developer's own
+    `claude` and `gemini` reachable, so anything that asks "is this installed?"
+    finds a real one — and the suite starts making paid calls, or blocks on an
+    unauthenticated CLI's login prompt. Only the directories the rest of the
+    suite genuinely needs (git, and the system utilities the shims run) survive.
 
     Returns a callable that configures the fake's behaviour for a test.
     """
     bindir = tmp_path / "bin"
     bindir.mkdir()
-    for name in ("claude", "codex", "gemini", "agy"):
+    for name in PROVIDER_CLIS:
         shim = bindir / name
         shim.write_text(
             f'#!/bin/sh\nFAKE_CLI_NAME={name} exec "{sys.executable}" "{FAKE_CLI}" "$@"\n'
         )
         shim.chmod(shim.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
-    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+    kept = [str(bindir)]
+    if git := shutil.which("git"):
+        kept.append(os.path.dirname(git))
+    kept += ["/usr/bin", "/bin"]
+    monkeypatch.setenv("PATH", os.pathsep.join(dict.fromkeys(kept)))
 
     def _write(events, suffix):
         stream = tmp_path / f"stream{suffix}.jsonl"
@@ -42,7 +57,20 @@ def shim_path(tmp_path, monkeypatch):
         garbage=False,
         stderr=None,
         prose=None,
+        installed=None,
     ):
+        if installed is not None:
+            # Model a machine that simply does not have the other CLIs, which is
+            # what decides the default panel.
+            for shim in bindir.iterdir():
+                if shim.name not in installed:
+                    shim.unlink()
+            for name in PROVIDER_CLIS:
+                if name not in installed and shutil.which(name):
+                    raise AssertionError(
+                        f"{name} is still resolvable at {shutil.which(name)} after being "
+                        "removed from the shim directory; the test would call it for real."
+                    )
         if events is not None:
             monkeypatch.setenv("FAKE_CLI_STREAM", _write(events, ""))
         for name, evs in (per_provider or {}).items():
