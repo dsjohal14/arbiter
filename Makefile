@@ -76,7 +76,7 @@ typecheck: ## Run mypy (not enforced in CI yet)
 		|| { printf "mypy is not installed. Run: $(PY) -m pip install mypy\n"; exit 1; }
 	$(PY) -m mypy --strict src/$(PKG)
 
-check: lint fmt-check test ## Everything CI runs, in CI's order
+check: lint fmt-check test evals ## Everything CI runs, in CI's order
 
 # ── Running it ───────────────────────────────────────────────────────────────
 
