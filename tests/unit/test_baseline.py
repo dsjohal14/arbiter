@@ -29,6 +29,7 @@ from arbiter.verify import (
     apply_evidence_checks,
     changed_paths,
     derive_verdict,
+    read_diff,
     refresh_plan_selected_evidence,
     resolve_base_ref,
 )
@@ -209,3 +210,15 @@ def test_base_ref_is_inferred_only_when_knowable(spec, expected):
     """A diff from a file or stdin has no checkout-able base; guessing one would
     silently compare against the wrong tree."""
     assert resolve_base_ref(spec) == expected
+
+
+def test_a_relative_diff_path_is_read_as_a_file_not_as_a_revision_range(tmp_path, monkeypatch):
+    """`--diff ../change.diff` contains `..`, but it names a file that exists —
+    and handing it to `git diff` would compare the wrong thing."""
+    diff = "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-a\n+b\n"
+    (tmp_path / "change.diff").write_text(diff)
+    work = tmp_path / "repo"
+    work.mkdir()
+    monkeypatch.chdir(work)
+
+    assert read_diff("../change.diff") == diff

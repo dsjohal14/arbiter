@@ -188,10 +188,12 @@ def read_plan(spec: str) -> str:
 def read_diff(spec: str) -> str:
     """`staged` (default), `working`, `-` for stdin, a git revision range, or a
     path to a diff file. Ranges are detected by `..` and handed to git, so
-    `--diff origin/main...HEAD` works rather than being read as a filename."""
+    `--diff origin/main...HEAD` works rather than being read as a filename — but
+    a path that exists wins, so `--diff ../change.diff` reads the file it names
+    instead of being mistaken for a revision range."""
     if spec == "-":
         text = sys.stdin.read()
-    elif spec in ("staged", "working") or ".." in spec:
+    elif spec in ("staged", "working") or (".." in spec and not Path(spec).is_file()):
         if spec == "staged":
             args = ["git", "diff", "--cached"]
         elif spec == "working":
