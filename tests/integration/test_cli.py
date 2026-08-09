@@ -297,6 +297,12 @@ def test_plan_pin_is_idempotent_without_force(repo, shim_path, capsys):
 
 
 # ── Usage errors ─────────────────────────────────────────────────────────────
+#
+# Every usage error exits 2, so asserting only the code cannot tell one apart
+# from another. These take `shim_path` for its PATH, not its stream: without a
+# provider installed the default panel fails first, and each test would be
+# quietly asserting *that* error instead of the one it names — which is how
+# they passed here and failed in CI, where nothing is installed.
 
 
 def test_unknown_provider_is_a_usage_error_not_a_silent_drop(repo, capsys):
@@ -306,15 +312,17 @@ def test_unknown_provider_is_a_usage_error_not_a_silent_drop(repo, capsys):
     assert "gpt4" in capsys.readouterr().err
 
 
-def test_unknown_judge_is_a_usage_error(repo):
+def test_unknown_judge_is_a_usage_error(repo, shim_path, capsys):
     assert main(["verify", "--plan", "plan.md", "--judge", "bogus"]) == EXIT_USAGE
+    assert "bogus" in capsys.readouterr().err
 
 
-def test_missing_plan_file_is_a_usage_error(repo):
+def test_missing_plan_file_is_a_usage_error(repo, shim_path, capsys):
     assert main(["verify", "--plan", "nope.md"]) == EXIT_USAGE
+    assert "nope.md" in capsys.readouterr().err
 
 
-def test_a_diff_spec_that_is_neither_file_nor_range_explains_itself(repo, capsys):
+def test_a_diff_spec_that_is_neither_file_nor_range_explains_itself(repo, shim_path, capsys):
     assert main(["verify", "--plan", "plan.md", "--diff", "not-a-thing"]) == EXIT_USAGE
     assert "revision range" in capsys.readouterr().err
 
