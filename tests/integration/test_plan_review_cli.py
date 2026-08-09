@@ -143,6 +143,49 @@ def test_an_unpinned_plan_can_still_be_reviewed(tmp_path, shim_path, monkeypatch
     assert texts == ["total() handles every supplied list", "total([]) returns 0"]
 
 
+def test_plan_review_record_includes_extraction_and_final_result(
+    tmp_path, shim_path, monkeypatch, capsys
+):
+    monkeypatch.chdir(tmp_path)
+    plan = tmp_path / "raw.md"
+    plan.write_text(RAW_PLAN)
+    record_path = tmp_path / "review.json"
+    combined = json.dumps(
+        {
+            "criteria": ["total() handles every supplied list"],
+            "findings": [MISSING],
+        }
+    )
+    shim_path(claude_events(combined))
+
+    code = main(
+        [
+            "plan",
+            "review",
+            "raw.md",
+            "--models",
+            "claude",
+            "--json",
+            "--record",
+            str(record_path),
+        ]
+    )
+    captured = capsys.readouterr()
+    output = json.loads(captured.out)
+    record = json.loads(record_path.read_text())
+
+    assert code == 0
+    assert record["command"] == "plan review"
+    assert record["inputs"]["plan"]["content"] == RAW_PLAN
+    assert record["result"] == output
+    assert [call["phase"] for call in record["provider_calls"]] == [
+        "extractor",
+        "reviewer",
+        "consolidator",
+    ]
+    assert all(call["content"] == combined for call in record["provider_calls"])
+
+
 def test_unparseable_reviewer_output_cannot_report_a_plan_ready(tmp_path, shim_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "plan.md").write_text(PINNED)
@@ -231,8 +274,26 @@ def test_a_failed_reviewer_prevents_a_ready_verdict(tmp_path, shim_path, monkeyp
     monkeypatch.chdir(tmp_path)
     (tmp_path / "plan.md").write_text(PINNED)
     shim_path(per_provider={"claude": claude_events(_report())})
-    code = main(["plan", "review", "plan.md", "--models", "claude,codex", "--json"])
+    record_path = tmp_path / "failed-reviewer.json"
+    code = main(
+        [
+            "plan",
+            "review",
+            "plan.md",
+            "--models",
+            "claude,codex",
+            "--json",
+            "--record",
+            str(record_path),
+        ]
+    )
     payload = json.loads(capsys.readouterr().out)
     assert code == 1
     assert payload["ready"] is False
     assert payload["failed_reviewers"] == ["codex"]
+    record = json.loads(record_path.read_text())
+    failed = [call for call in record["provider_calls"] if call["status"] == "failed"]
+    assert len(failed) == 1
+    assert failed[0]["phase"] == "reviewer"
+    assert failed[0]["role"] == "codex"
+    assert failed[0]["error"]["type"] == "ModelCallError"

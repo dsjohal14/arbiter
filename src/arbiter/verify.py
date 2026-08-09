@@ -37,6 +37,7 @@ from .evidence import (
 )
 from .models import IsolationMode, ModelCallError, Session, call_session, make_session
 from .prompts import Blinding, blind
+from .run_records import RunTrace
 from .schema_files import schema_writer
 from .streaming import stream_parallel
 
@@ -798,6 +799,7 @@ async def run_verify(
     scrub_env: bool = True,
     base_ref: str | None = None,
     require_discriminating_tests: bool = False,
+    trace: RunTrace | None = None,
 ) -> VerifyResult:
     manifest = manifest if manifest is not None else build_manifest(diff, root)
     diff_paths = changed_paths(diff)
@@ -813,6 +815,8 @@ async def run_verify(
             names,
             timeout,
             schema_path_writer=write_schema,
+            trace=trace,
+            phase="reviewer",
         )
         if not reports:
             raise ModelCallError("Every reviewer failed; cannot produce a verdict.")
@@ -845,10 +849,14 @@ async def run_verify(
                 timeout=timeout,
                 schema_path_writer=write_schema,
             )
+            if trace is not None:
+                trace.success("consolidator", consolidator, resp)
             if verbose:
                 display.print_timing(consolidator_name, resp.duration)
             consolidated_raw = resp.content
         except ModelCallError as e:
+            if trace is not None:
+                trace.failure("consolidator", consolidator, e)
             # Consolidation reconciles; it is not the source of truth. Losing it
             # costs precision and must not cost the whole run.
             display.print_error(f"consolidation failed, using reviewer verdicts: {e}")

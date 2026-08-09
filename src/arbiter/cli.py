@@ -38,6 +38,7 @@ from .models import (
     make_session,
 )
 from .prompts import JUDGE_SCHEMA
+from .run_records import RunRecorder, RunTrace, recorded_input
 from .schema_files import schema_writer
 from .verify import (
     EXIT_FAIL,
@@ -154,6 +155,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="CMD",
         help="Test runner for cited tests (default: autodetect pytest)",
     )
+    v.add_argument(
+        "--record",
+        metavar="FILE",
+        help="Write a sensitive, versioned JSON record of this run",
+    )
     _add_common(v)
 
     d = sub.add_parser("debate", help="Run a multi-model debate with a blinded judge")
@@ -182,6 +188,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--apply",
         action="store_true",
         help="Write the proposed criteria into the plan (review them first)",
+    )
+    rev.add_argument(
+        "--record",
+        metavar="FILE",
+        help="Write a sensitive, versioned JSON record of this run",
     )
     _add_common(rev)
 
@@ -265,6 +276,7 @@ async def _extract_acceptance_criteria(
     isolation: IsolationMode,
     verbose: bool,
     timeout: float,
+    trace: RunTrace | None = None,
 ) -> list[crit.Criterion]:
     """Extract a complete in-memory contract without modifying the plan."""
     session = make_session(
@@ -275,16 +287,46 @@ async def _extract_acceptance_criteria(
         output_schema=crit.EXTRACTION_SCHEMA,
     )
     display.print_note(f"Extracting baseline acceptance criteria with {session.label()}...")
-    with schema_writer() as write_schema:
-        resp = await call_session(
-            session,
-            crit.build_extraction_prompt(text),
-            on_cmd=(lambda _key, cmd: display.print_verbose_cmd(cmd)) if verbose else None,
-            timeout=timeout,
-            schema_path_writer=write_schema,
-        )
+    try:
+        with schema_writer() as write_schema:
+            resp = await call_session(
+                session,
+                crit.build_extraction_prompt(text),
+                on_cmd=(lambda _key, cmd: display.print_verbose_cmd(cmd)) if verbose else None,
+                timeout=timeout,
+                schema_path_writer=write_schema,
+            )
+        if trace is not None:
+            trace.success("extractor", session, resp)
+    except Exception as e:
+        if trace is not None:
+            trace.failure("extractor", session, e)
+        raise
     obj = verify.extract_json(resp.content) or {}
     return crit.number([str(c) for c in obj.get("criteria") or []])
+
+
+def _finish_record(
+    recorder: RunRecorder | None,
+    *,
+    exit_code: int,
+    result: dict | None,
+    error: Exception | str | None = None,
+) -> None:
+    if recorder is None:
+        return
+    recorder.finish(exit_code=exit_code, result=result, error=error)
+    display.print_note(f"Run record written to {recorder.path}")
+
+
+def _record_error(recorder: RunRecorder | None, error: Exception) -> None:
+    """Preserve the original failure if writing its diagnostic record also fails."""
+    if recorder is None:
+        return
+    try:
+        _finish_record(recorder, exit_code=EXIT_RUNTIME, result=None, error=error)
+    except OSError as record_error:
+        display.print_error(f"Could not write run record {recorder.path}: {record_error}")
 
 
 async def cmd_plan_review(args: argparse.Namespace) -> int:
@@ -303,56 +345,95 @@ async def cmd_plan_review(args: argparse.Namespace) -> int:
         _usage_error("The plan is empty.")
 
     isolation = "open" if args.allow_tools else "readonly"
-    if crit.is_pinned(text):
-        criteria = crit.read_criteria(text)
-        criteria_source = "pinned"
-    else:
-        # Reviewers propose edits, so an unpinned plan first needs a complete
-        # baseline to edit. This stays in memory until --apply is requested.
-        criteria = await _extract_acceptance_criteria(
-            text, judge, isolation, args.verbose, args.timeout
+    recorder = (
+        RunRecorder(
+            path=Path(args.record),
+            command="plan review",
+            inputs={"plan": recorded_input(text, args.file)},
+            configuration={
+                "models": keys,
+                "judge": judge,
+                "timeout_seconds": args.timeout,
+                "seed": args.seed,
+                "isolation": isolation,
+                "apply": args.apply,
+            },
         )
-        if not criteria:
-            display.print_error("No acceptance criteria could be extracted from this plan.")
-            return EXIT_RUNTIME
-        criteria_source = "extracted"
-
-    reviewers, consolidator = plan_review.make_review_sessions(keys, judge, isolation)
-    names = {k: s.label() for k, s in reviewers.items()}
-
-    if not args.as_json:
-        display.print_note(
-            f"Critiquing {args.file} ({len(text.splitlines())} lines, "
-            f"{len(criteria)} {criteria_source} criteria) · reviewers: {', '.join(names.values())}"
-        )
-
-    result = await plan_review.run_plan_review(
-        plan=text,
-        criteria=criteria,
-        reviewers=reviewers,
-        consolidator=consolidator,
-        consolidator_name=consolidator.label(),
-        names=names,
-        verbose=args.verbose,
-        timeout=args.timeout,
-        seed=args.seed,
+        if args.record
+        else None
     )
 
-    if args.as_json:
-        json.dump(result.as_dict(), sys.stdout, indent=2)
-        sys.stdout.write("\n")
-    else:
-        plan_review.render(result, show_criteria=not args.apply)
+    try:
+        if crit.is_pinned(text):
+            criteria = crit.read_criteria(text)
+            criteria_source = "pinned"
+        else:
+            # Reviewers propose edits, so an unpinned plan first needs a complete
+            # baseline to edit. This stays in memory until --apply is requested.
+            criteria = await _extract_acceptance_criteria(
+                text,
+                judge,
+                isolation,
+                args.verbose,
+                args.timeout,
+                trace=recorder.trace if recorder else None,
+            )
+            if not criteria:
+                message = "No acceptance criteria could be extracted from this plan."
+                display.print_error(message)
+                _finish_record(recorder, exit_code=EXIT_RUNTIME, result=None, error=message)
+                return EXIT_RUNTIME
+            criteria_source = "extracted"
+        if recorder is not None:
+            recorder.configuration["criteria_source"] = criteria_source
 
-    if args.apply:
-        if not result.criteria:
-            display.print_error("Nothing to apply: no criteria were produced.")
-            return EXIT_RUNTIME
-        path.write_text(crit.pin_into(text, result.criteria), encoding="utf-8")
-        display.print_note(
-            f"✎  Wrote {len(result.criteria)} criteria into {args.file}. "
-            "Read them before implementing — they are the contract."
+        reviewers, consolidator = plan_review.make_review_sessions(keys, judge, isolation)
+        names = {k: s.label() for k, s in reviewers.items()}
+
+        if not args.as_json:
+            display.print_note(
+                f"Critiquing {args.file} ({len(text.splitlines())} lines, "
+                f"{len(criteria)} {criteria_source} criteria) · "
+                f"reviewers: {', '.join(names.values())}"
+            )
+
+        result = await plan_review.run_plan_review(
+            plan=text,
+            criteria=criteria,
+            reviewers=reviewers,
+            consolidator=consolidator,
+            consolidator_name=consolidator.label(),
+            names=names,
+            verbose=args.verbose,
+            timeout=args.timeout,
+            seed=args.seed,
+            trace=recorder.trace if recorder else None,
         )
+
+        if args.as_json:
+            json.dump(result.as_dict(), sys.stdout, indent=2)
+            sys.stdout.write("\n")
+        else:
+            plan_review.render(result, show_criteria=not args.apply)
+
+        if args.apply:
+            if not result.criteria:
+                message = "Nothing to apply: no criteria were produced."
+                display.print_error(message)
+                _finish_record(
+                    recorder, exit_code=EXIT_RUNTIME, result=result.as_dict(), error=message
+                )
+                return EXIT_RUNTIME
+            path.write_text(crit.pin_into(text, result.criteria), encoding="utf-8")
+            display.print_note(
+                f"✎  Wrote {len(result.criteria)} criteria into {args.file}. "
+                "Read them before implementing — they are the contract."
+            )
+    except Exception as e:
+        _record_error(recorder, e)
+        raise
+
+    _finish_record(recorder, exit_code=result.exit_code, result=result.as_dict())
     return result.exit_code
 
 
@@ -431,6 +512,33 @@ async def cmd_verify(args: argparse.Namespace) -> int:
     diff = verify.read_diff(args.diff)
     manifest = verify.build_manifest(diff)
 
+    recorder = (
+        RunRecorder(
+            path=Path(args.record),
+            command="verify",
+            inputs={
+                "plan": recorded_input(plan, args.plan),
+                "diff": recorded_input(diff, args.diff),
+            },
+            configuration={
+                "models": keys,
+                "judge": judge,
+                "timeout_seconds": args.timeout,
+                "seed": args.seed,
+                "isolation": isolation,
+                "base_ref": base_ref,
+                "run_tests": not args.no_run_tests,
+                "scrub_test_environment": not args.no_scrub_test_env,
+                "require_tests": args.require_tests or args.require_pinned_evidence,
+                "require_pinned_evidence": args.require_pinned_evidence,
+                "require_discriminating_tests": args.require_discriminating_tests,
+                "custom_test_command": args.test_command is not None,
+            },
+        )
+        if args.record
+        else None
+    )
+
     reviewers, consolidator = make_verify_sessions(keys, judge, isolation)
     names = {k: s.label() for k, s in reviewers.items()}
 
@@ -440,32 +548,38 @@ async def cmd_verify(args: argparse.Namespace) -> int:
             f"{len(manifest)} file(s) in scope · reviewers: {', '.join(names.values())}"
         )
 
-    result = await verify.run_verify(
-        plan=plan,
-        diff=diff,
-        criteria=criteria,
-        reviewers=reviewers,
-        consolidator=consolidator,
-        consolidator_name=consolidator.label(),
-        names=names,
-        verbose=args.verbose,
-        timeout=args.timeout,
-        seed=args.seed,
-        manifest=manifest,
-        test_command=args.test_command.split() if args.test_command else None,
-        run_tests=not args.no_run_tests,
-        require_tests=args.require_tests or args.require_pinned_evidence,
-        require_pinned_evidence=args.require_pinned_evidence,
-        scrub_env=not args.no_scrub_test_env,
-        base_ref=base_ref,
-        require_discriminating_tests=args.require_discriminating_tests,
-    )
+    try:
+        result = await verify.run_verify(
+            plan=plan,
+            diff=diff,
+            criteria=criteria,
+            reviewers=reviewers,
+            consolidator=consolidator,
+            consolidator_name=consolidator.label(),
+            names=names,
+            verbose=args.verbose,
+            timeout=args.timeout,
+            seed=args.seed,
+            manifest=manifest,
+            test_command=args.test_command.split() if args.test_command else None,
+            run_tests=not args.no_run_tests,
+            require_tests=args.require_tests or args.require_pinned_evidence,
+            require_pinned_evidence=args.require_pinned_evidence,
+            scrub_env=not args.no_scrub_test_env,
+            base_ref=base_ref,
+            require_discriminating_tests=args.require_discriminating_tests,
+            trace=recorder.trace if recorder else None,
+        )
+    except Exception as e:
+        _record_error(recorder, e)
+        raise
 
     if args.as_json:
         json.dump(result.as_dict(), sys.stdout, indent=2)
         sys.stdout.write("\n")
     else:
         verify.render(result)
+    _finish_record(recorder, exit_code=result.exit_code, result=result.as_dict())
     return result.exit_code
 
 

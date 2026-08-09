@@ -27,6 +27,7 @@ from . import display
 from .criteria import Criterion
 from .models import IsolationMode, ModelCallError, Session, call_session, make_session
 from .prompts import Blinding, blind
+from .run_records import RunTrace
 from .schema_files import schema_writer
 from .streaming import stream_parallel
 
@@ -482,6 +483,7 @@ async def run_plan_review(
     verbose: bool,
     timeout: float,
     seed: int | None = None,
+    trace: RunTrace | None = None,
 ) -> PlanReviewResult:
     with schema_writer() as write_schema:
         display.print_section("plan critique")
@@ -493,6 +495,8 @@ async def run_plan_review(
             names,
             timeout,
             schema_path_writer=write_schema,
+            trace=trace,
+            phase="reviewer",
         )
         if not reports:
             raise ModelCallError("Every reviewer failed; cannot critique this plan.")
@@ -536,6 +540,8 @@ async def run_plan_review(
                 timeout=timeout,
                 schema_path_writer=write_schema,
             )
+            if trace is not None:
+                trace.success("consolidator", consolidator, resp)
             if verbose:
                 display.print_timing(consolidator_name, resp.duration)
             parsed = parse_findings_report(resp.content, criteria)
@@ -547,6 +553,8 @@ async def run_plan_review(
                     + "; ".join(parsed.errors[:3])
                 )
         except ModelCallError as e:
+            if trace is not None:
+                trace.failure("consolidator", consolidator, e)
             display.print_error(f"consolidation failed, using reviewer findings: {e}")
 
     return finalize_plan_review(criteria, intake, consolidated, blinding)

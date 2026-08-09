@@ -212,6 +212,40 @@ def test_json_output_is_machine_readable(gate, capsys):
     assert payload["blinding"]["seed"] is not None
 
 
+def test_verify_can_write_a_replayable_run_record(gate, repo, capsys):
+    report = _review(
+        [
+            _ac("AC-1", "unmet", "app.py:2", assessment="still wrong"),
+            _ac("AC-2", "met", "app.py:2", "tests/test_app.py::test_empty_list"),
+        ]
+    )
+    record_path = repo / "run.json"
+
+    code = gate(report, "--json", "--record", str(record_path))
+    captured = capsys.readouterr()
+    output = json.loads(captured.out)
+    record = json.loads(record_path.read_text())
+
+    assert code == EXIT_FAIL
+    assert record["schema_version"] == 1
+    assert record["command"] == "verify"
+    assert record["inputs"]["plan"]["content"] == PINNED_PLAN
+    assert record["inputs"]["diff"]["content"] == DIFF
+    assert record["configuration"]["custom_test_command"] is True
+    assert record["result"] == output
+    assert record["exit_code"] == code
+    assert {call["phase"] for call in record["provider_calls"]} == {
+        "reviewer",
+        "consolidator",
+    }
+    assert all(call["content"] == report for call in record["provider_calls"])
+    encoded = json.dumps(record)
+    assert '"session_id"' not in encoded
+    assert '"cmd"' not in encoded
+    assert PYTEST not in encoded
+    assert "Run record written" in captured.err
+
+
 def test_seed_makes_a_run_reproducible(gate, capsys):
     report = _review([_ac("AC-1", "met", "app.py:2"), _ac("AC-2", "met", "app.py:2")])
     gate(report, "--json", "--seed", "4242")
