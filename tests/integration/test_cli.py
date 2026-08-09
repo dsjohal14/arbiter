@@ -12,6 +12,7 @@ import sys
 
 import pytest
 
+from arbiter import run_records
 from arbiter.cli import main
 from arbiter.verify import EXIT_FAIL, EXIT_PASS, EXIT_UNCLEAR, EXIT_USAGE
 from conftest import claude_events
@@ -227,7 +228,7 @@ def test_verify_can_write_a_replayable_run_record(gate, repo, capsys):
     record = json.loads(record_path.read_text())
 
     assert code == EXIT_FAIL
-    assert record["schema_version"] == 1
+    assert record["schema_version"] == run_records.SCHEMA_VERSION
     assert record["command"] == "verify"
     assert record["inputs"]["plan"]["content"] == PINNED_PLAN
     assert record["inputs"]["diff"]["content"] == DIFF

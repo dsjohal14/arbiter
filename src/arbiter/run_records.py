@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 import tempfile
 import time
 from contextlib import suppress
@@ -22,11 +23,50 @@ from pathlib import Path
 from . import __version__
 from .models import ModelResponse, Session
 
-SCHEMA_VERSION = 1
+# v2 added `workspace`: which tree the evidence checks actually read. A v1
+# record is still readable, but cannot be bound to an eval case's fixture repo.
+SCHEMA_VERSION = 2
 
 
 def _utc_now() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _git(args: list[str], root: Path) -> str | None:
+    try:
+        proc = subprocess.run(
+            ["git", *args], cwd=root, capture_output=True, text=True, check=False, timeout=10
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return proc.stdout.strip() if proc.returncode == 0 else None
+
+
+def workspace_identity(paths: list[str], root: Path | None = None) -> dict:
+    """Identify the tree an evidence check read, by digesting what it read.
+
+    Digests exactly the files in scope rather than the whole checkout: it is
+    bounded, and those are the files whose content decided the evidence result.
+    Two runs of the same plan and diff against different working trees produce
+    different identities here, which is what stops a result being scored against
+    an eval case whose fixture repo it never ran in.
+
+    The commit and dirty flag are provenance for a human reading the record;
+    only `files` is compared, because a corpus fixture is not a git checkout.
+    """
+    root = (root or Path.cwd()).resolve()
+    files: dict[str, str] = {}
+    for rel in sorted(paths):
+        try:
+            files[rel] = digest((root / rel).read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue  # absent here; a differing key set is itself the mismatch
+    status = _git(["status", "--porcelain"], root)
+    return {
+        "commit": _git(["rev-parse", "HEAD"], root),
+        "dirty": None if status is None else bool(status),
+        "files": files,
+    }
 
 
 def digest(content: str) -> str:
@@ -64,6 +104,13 @@ class RunTrace:
         )
 
     def failure(self, phase: str, session: Session, error: Exception) -> None:
+        # A failed call still spent wall-clock, and a provider commonly reports
+        # usage in the same event that reports the error. Recording null for
+        # both would bias every later cost and latency summary downward by
+        # exactly the runs that went wrong. `getattr` because not every failure
+        # reaching here is a ModelCallError.
+        duration = getattr(error, "duration", None)
+        usage = getattr(error, "usage", None)
         self.calls.append(
             {
                 "phase": phase,
@@ -72,22 +119,24 @@ class RunTrace:
                 "cli": session.cli,
                 "model": session.model,
                 "status": "failed",
-                "duration_ms": None,
+                "duration_ms": round(duration * 1000) if duration is not None else None,
                 "content": None,
                 "error": {"type": type(error).__name__, "message": str(error)},
-                "usage": None,
+                "usage": usage.as_dict() if usage is not None else None,
             }
         )
 
 
 @dataclass
 class RunRecorder:
-    """Build and atomically persist one schema-v1 run document."""
+    """Build and atomically persist one versioned run document."""
 
     path: Path
     command: str
     inputs: dict
     configuration: dict
+    # Which tree the evidence checks read. None for a command that checks none.
+    workspace: dict | None = None
     trace: RunTrace = field(default_factory=RunTrace)
     started_at: str = field(default_factory=_utc_now)
     _started_monotonic: float = field(default_factory=time.monotonic, repr=False)
@@ -118,6 +167,7 @@ class RunRecorder:
             "arbiter_version": __version__,
             "inputs": self.inputs,
             "configuration": self.configuration,
+            "workspace": self.workspace,
             "provider_calls": self.trace.calls,
             "result": result,
             "exit_code": exit_code,

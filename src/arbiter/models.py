@@ -577,7 +577,24 @@ OnCmd = Callable[[str, list[str]], None] | None
 
 
 class ModelCallError(RuntimeError):
-    """A provider CLI failed, produced nothing, or exceeded its timeout."""
+    """A provider CLI failed, produced nothing, or exceeded its timeout.
+
+    Carries what the call cost before it failed. A provider commonly reports
+    usage in the same event that reports the error, and a timeout still consumed
+    wall-clock — dropping either biases a cost or latency summary downward by
+    exactly the runs that went wrong.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        duration: float | None = None,
+        usage: Usage | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.duration = duration
+        self.usage = usage
 
 
 # How many lines of non-JSON stdout to keep for diagnosis.
@@ -696,21 +713,24 @@ async def _consume(
 
     await proc.wait()
     stderr = (await stderr_task).decode(errors="replace").strip()
+    # Whatever this call cost before it went wrong is still a real cost.
+    spent = {"duration": time.monotonic() - start, "usage": usage}
 
     # A provider that told us *why* it failed beats anything we can infer from an
     # exit code or from stderr, which is usually startup noise.
     if provider_error:
-        raise ModelCallError(f"{sess.cli}: {provider_error}")
+        raise ModelCallError(f"{sess.cli}: {provider_error}", **spent)
 
     if proc.returncode not in (0, None):
         raise ModelCallError(
-            f"{sess.cli} exited {proc.returncode}: {stderr[:300] or '(no stderr)'}"
+            f"{sess.cli} exited {proc.returncode}: {stderr[:300] or '(no stderr)'}", **spent
         )
 
     content = (final if final is not None else "".join(buf)).strip()
     if not content:
         raise ModelCallError(
-            f"{sess.cli} returned no content.{_blocked_hint(prose)} {stderr[:200]}".rstrip()
+            f"{sess.cli} returned no content.{_blocked_hint(prose)} {stderr[:200]}".rstrip(),
+            **spent,
         )
 
     if captured_sid and not sess.session_id:
@@ -808,7 +828,8 @@ async def call_session(
     except TimeoutError as e:
         await _collect_partial_line(proc, prose)
         raise ModelCallError(
-            f"{sess.cli} exceeded the {timeout:.0f}s timeout.{_blocked_hint(prose)}"
+            f"{sess.cli} exceeded the {timeout:.0f}s timeout.{_blocked_hint(prose)}",
+            duration=time.monotonic() - start,
         ) from e
     finally:
         # `finally`, so cancellation during the stdin write still reaps the child.
