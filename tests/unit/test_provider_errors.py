@@ -47,6 +47,14 @@ def test_gemini_error_event_is_surfaced():
     assert _errors("gemini", {"type": "error", "message": "quota exceeded"}) == ["quota exceeded"]
 
 
+def test_agy_error_result_is_surfaced():
+    obj = {
+        "event": "result",
+        "result": {"status": "ERROR", "response": "", "error": "Error: empty prompt."},
+    }
+    assert _errors("agy", obj) == ["Error: empty prompt."]
+
+
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [

@@ -13,6 +13,7 @@ Providers differ in what they can be asked to do. Rather than pretend parity, th
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import time
 import uuid
@@ -73,6 +74,14 @@ class Provider:
     # reviewers answer under different, undisclosed system prompts and the
     # comparison is not controlled.
     isolate_flags: tuple[str, ...] = ()
+    # What `isolate_flags` actually covers, when it is less than all of it.
+    # Reported verbatim by `arbiter doctor`: a provider that only silences
+    # skills must not read as one that controls the whole system prompt.
+    isolate_scope: str = "user config"
+    # Can the prompt be written to stdin instead of argv? A plan plus a real
+    # diff exceeds what execve will carry, so a provider that insists on argv
+    # has a size ceiling the others do not.
+    accepts_stdin_prompt: bool = True
 
 
 PROVIDERS: dict[str, Provider] = {
@@ -105,6 +114,23 @@ PROVIDERS: dict[str, Provider] = {
         output_schema_flag=None,  # no structured-output support
         readonly_flags=("--approval-mode", "plan"),
         isolate_flags=(),  # no equivalent
+    ),
+    "antigravity": Provider(
+        key="antigravity",
+        cli="agy",
+        default_model=None,  # `agy models` moves; let the CLI pick its default
+        preassigns_session=False,  # agy mints its own conversation_id
+        output_schema_flag="--json-schema",
+        output_schema_as_file=False,  # takes the schema inline as a JSON string
+        readonly_flags=("--mode", "plan"),
+        # Stops skills and slash commands expanding in print mode. It does NOT
+        # stop project instruction files or settings being read, so the scope
+        # is narrower than claude's and codex's and says so.
+        isolate_flags=("--disable-slash-commands",),
+        isolate_scope="slash commands and skills only",
+        # `--print` requires its value in argv; a bare `--print` swallows the
+        # next flag as the prompt. Verified against agy 1.1.11.
+        accepts_stdin_prompt=False,
     ),
 }
 
@@ -219,6 +245,17 @@ def prompt_goes_on_stdin(prompt: str) -> bool:
     return len(prompt.encode("utf-8", errors="replace")) > ARGV_PROMPT_LIMIT
 
 
+def uses_stdin_prompt(provider: Provider, prompt: str) -> bool:
+    """Where this prompt has to travel for this provider.
+
+    A provider that will not read stdin gets the prompt in argv whatever its
+    size: writing to a pipe it never drains would hang rather than fail, and
+    hanging is the worse failure. The size ceiling that creates is reported when
+    the OS refuses the exec, not guessed at here.
+    """
+    return prompt_goes_on_stdin(prompt) and provider.accepts_stdin_prompt
+
+
 def _build_cmd(
     sess: Session,
     prompt: str,
@@ -280,6 +317,19 @@ def _build_cmd(
             cmd += ["--resume" if sess.started else "--session-id", sess.session_id]
         return cmd + extra
 
+    if p.cli == "agy":
+        # The prompt is always in argv: `--print` takes its value there, and a
+        # bare `--print` swallows the following flag as the prompt. `via_stdin`
+        # can never be true here — call_session consults accepts_stdin_prompt —
+        # but building the command this way keeps it correct either way.
+        cmd = ["agy", "--print", prompt, "--output-format", "stream-json"]
+        if sess.model:
+            cmd += ["--model", sess.model]
+        # agy mints its own conversation id; we capture it and resume by it.
+        if sess.started and sess.session_id:
+            cmd += ["--conversation", sess.session_id]
+        return cmd + extra
+
     raise ValueError(f"Unknown cli: {p.cli}")
 
 
@@ -312,8 +362,8 @@ def _unwrap_provider_error(msg: object) -> str:
     return text or "provider reported an unspecified error"
 
 
-def _parse_event(cli: str, obj: dict) -> list[tuple[str, str | None]]:
-    """Map one JSON event to ('session' | 'delta' | 'done', payload) pairs.
+def _parse_event(cli: str, obj: dict) -> list[tuple[str, object]]:
+    """Map one JSON event to ('session' | 'delta' | 'done' | 'error') pairs.
 
     Shapes confirmed by probing each CLI, and pinned by fixture tests so a
     provider schema change shows up as a red test rather than an empty answer.
@@ -324,8 +374,11 @@ def _parse_event(cli: str, obj: dict) -> list[tuple[str, str | None]]:
               turn.completed -> done
       gemini: init -> session_id; message(role=assistant) -> incremental content;
               result -> done
+      agy   : keyed on `event`, not `type`. init -> conversation_id;
+              step_update/agent_response -> text_delta;
+              result -> final response + conversation_id
     """
-    out: list[tuple[str, str | None]] = []
+    out: list[tuple[str, object]] = []
     t = obj.get("type")
 
     if cli == "claude":
@@ -372,6 +425,33 @@ def _parse_event(cli: str, obj: dict) -> list[tuple[str, str | None]]:
             out.append(("done", None))
         elif t == "error":
             out.append(("error", _unwrap_provider_error(obj.get("message") or obj.get("error"))))
+
+    elif cli == "agy":
+        event = obj.get("event")
+        if event == "init":
+            if obj.get("conversation_id"):
+                out.append(("session", obj["conversation_id"]))
+        elif event == "step_update":
+            step = obj.get("step_update") or {}
+            # Only the agent's own prose is answer text; tool and checkpoint
+            # steps carry deltas of their own that must not land in the reply.
+            if step.get("step_type") == "agent_response" and step.get("text_delta"):
+                out.append(("delta", step["text_delta"]))
+        elif event == "result":
+            result = obj.get("result") or {}
+            if str(result.get("status", "")).upper() == "SUCCESS":
+                out.append(("done", result.get("response")))
+            else:
+                out.append(
+                    (
+                        "error",
+                        _unwrap_provider_error(
+                            result.get("error") or f"agy reported {result.get('status')}"
+                        ),
+                    )
+                )
+            if result.get("conversation_id"):
+                out.append(("session", result["conversation_id"]))
 
     return out
 
@@ -432,15 +512,15 @@ async def _consume(
             continue  # non-JSON noise on stdout is expected from some CLIs
         for kind, payload in _parse_event(sess.cli, obj):
             if kind == "session" and payload:
-                captured_sid = payload
+                captured_sid = str(payload)
             elif kind == "delta" and payload:
-                buf.append(payload)
+                buf.append(str(payload))
                 if on_delta:
-                    await on_delta(sess.key, payload)
+                    await on_delta(sess.key, str(payload))
             elif kind == "done" and payload:
-                final = payload
+                final = str(payload)
             elif kind == "error" and payload:
-                provider_error = payload
+                provider_error = str(payload)
 
     await proc.wait()
     stderr = (await stderr_task).decode(errors="replace").strip()
@@ -490,7 +570,7 @@ async def call_session(
     None of the three CLIs offers a timeout flag, so the deadline is enforced
     here. Marks the session started on success so later calls use the resume form.
     """
-    via_stdin = prompt_goes_on_stdin(prompt)
+    via_stdin = uses_stdin_prompt(sess.provider, prompt)
     cmd = _build_cmd(sess, prompt, schema_path_writer, via_stdin=via_stdin, schema=output_schema)
     if on_cmd:
         on_cmd(sess.key, cmd)
@@ -511,6 +591,13 @@ async def call_session(
             f"{sess.cli} is not installed or not on PATH. Run 'arbiter doctor'."
         ) from e
     except OSError as e:
+        if e.errno == errno.E2BIG and not sess.provider.accepts_stdin_prompt:
+            raise ModelCallError(
+                f"{sess.cli} cannot accept a prompt this large "
+                f"({len(prompt.encode('utf-8', errors='replace')):,} bytes): it only takes "
+                "the prompt as a command-line argument, and this exceeds what the OS "
+                f"will pass. Drop {sess.provider.key} from --models for this change."
+            ) from e
         raise ModelCallError(f"could not launch {sess.cli}: {e}") from e
 
     assert proc.stderr is not None

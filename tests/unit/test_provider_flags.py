@@ -14,6 +14,7 @@ from arbiter.models import (
     make_arbiter_session,
     make_session,
     prompt_goes_on_stdin,
+    uses_stdin_prompt,
 )
 from arbiter.prompts import JUDGE_SCHEMA
 from arbiter.schema_files import schema_writer
@@ -74,9 +75,25 @@ def test_the_limit_is_measured_in_bytes_not_characters():
 
 @pytest.mark.parametrize("key", sorted(PROVIDERS))
 def test_stdin_mode_keeps_the_prompt_out_of_argv(key):
+    """...for every provider that can read one. `agy` cannot: `--print` takes its
+    value in argv and a bare `--print` swallows the next flag as the prompt, so
+    it carries the prompt either way and declares the ceiling instead."""
     big = "x" * (ARGV_PROMPT_LIMIT + 1)
     cmd = _build_cmd(make_session(key, key), big, via_stdin=True)
-    assert all(big not in arg for arg in cmd)
+    if PROVIDERS[key].accepts_stdin_prompt:
+        assert all(big not in arg for arg in cmd)
+    else:
+        assert big in cmd
+
+
+@pytest.mark.parametrize("key", sorted(PROVIDERS))
+def test_a_provider_that_cannot_read_stdin_is_never_asked_to(key):
+    """Writing to a pipe the child never drains hangs rather than fails, and a
+    hang is the worse failure — so an oversized prompt still goes in argv."""
+    provider = PROVIDERS[key]
+    big = "x" * (ARGV_PROMPT_LIMIT + 1)
+    assert uses_stdin_prompt(provider, big) is provider.accepts_stdin_prompt
+    assert uses_stdin_prompt(provider, "short") is False
 
 
 @pytest.mark.parametrize("key", sorted(PROVIDERS))

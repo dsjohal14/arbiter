@@ -23,6 +23,7 @@ INSTALL_HINTS = {
     "claude": "https://code.claude.com",
     "codex": "npm install -g @openai/codex",
     "gemini": "https://developers.google.com/gemini-cli",
+    "antigravity": "https://antigravity.google (installs the `agy` CLI)",
 }
 
 PROBE_TIMEOUT = 60.0
@@ -54,15 +55,23 @@ class ProviderHealth:
 
 
 def describe_capabilities(p: Provider) -> list[str]:
+    """One line per thing this CLI can or cannot be asked to do.
+
+    Read verbatim by users deciding which panel to trust, so each line states
+    the narrowest true thing — a provider that only silences skills must not
+    read like one that controls the whole system prompt.
+    """
     caps: list[str] = []
     caps.append(
         "structured output" if p.output_schema_flag else "no structured output (prose fallback)"
     )
     caps.append("read-only mode" if p.readonly_flags else "no read-only mode")
     caps.append(
-        "isolates user config" if p.isolate_flags else "inherits user config (uncontrolled)"
+        f"isolates {p.isolate_scope}" if p.isolate_flags else "inherits user config (uncontrolled)"
     )
     caps.append("pre-assigned session id" if p.preassigns_session else "provider-minted session id")
+    if not p.accepts_stdin_prompt:
+        caps.append("prompt must fit in argv (no stdin); very large diffs may not fit")
     return caps
 
 

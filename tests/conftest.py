@@ -13,13 +13,13 @@ FAKE_CLI = Path(__file__).parent / "fake_cli.py"
 
 @pytest.fixture
 def shim_path(tmp_path, monkeypatch):
-    """Put fake `claude`/`codex`/`gemini` executables at the front of PATH.
+    """Put fake `claude`/`codex`/`gemini`/`agy` executables at the front of PATH.
 
     Returns a callable that configures the fake's behaviour for a test.
     """
     bindir = tmp_path / "bin"
     bindir.mkdir()
-    for name in ("claude", "codex", "gemini"):
+    for name in ("claude", "codex", "gemini", "agy"):
         shim = bindir / name
         shim.write_text(
             f'#!/bin/sh\nFAKE_CLI_NAME={name} exec "{sys.executable}" "{FAKE_CLI}" "$@"\n'
@@ -34,7 +34,13 @@ def shim_path(tmp_path, monkeypatch):
         return str(stream)
 
     def configure(
-        events=None, *, per_provider=None, exit_code=0, hang=None, garbage=False, stderr=None
+        events=None,
+        *,
+        per_provider=None,
+        exit_code=0,
+        hang=None,
+        garbage=False,
+        stderr=None,
     ):
         if events is not None:
             monkeypatch.setenv("FAKE_CLI_STREAM", _write(events, ""))
@@ -85,4 +91,39 @@ def gemini_events(text: str, session_id: str = "gsess-1"):
         {"type": "init", "session_id": session_id},
         {"type": "message", "role": "assistant", "content": text},
         {"type": "result"},
+    ]
+
+
+def agy_events(text: str, conversation_id: str = "conv-1", usage: dict | None = None):
+    """Antigravity keys its stream on `event`, not `type`, and reports usage."""
+    return [
+        {"event": "init", "conversation_id": conversation_id, "init": {"cwd": "."}},
+        {
+            "event": "step_update",
+            "step_update": {
+                "conversation_id": conversation_id,
+                "step_index": 0,
+                "state": "ACTIVE",
+                "step_type": "agent_response",
+                "text_delta": text,
+            },
+        },
+        {
+            "event": "result",
+            "result": {
+                "conversation_id": conversation_id,
+                "status": "SUCCESS",
+                "response": text,
+                "num_turns": 1,
+                "usage": usage
+                if usage is not None
+                else {
+                    "input_tokens": 1200,
+                    "output_tokens": 42,
+                    "thinking_tokens": 7,
+                    "cache_read_tokens": 0,
+                    "total_tokens": 1242,
+                },
+            },
+        },
     ]
