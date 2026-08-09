@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "command": "verify",
+  "description": "A one-line change that satisfies the plan's headline goal in prose and breaks it in code: sum(items[1:]) drops the first element. AC-1's plan-selected proof test fails against this diff, so no amount of reviewer confidence should reach 'met'. AC-2 is genuinely untouched.",
+  "verdict": "fail",
+  "criteria": {
+    "AC-1": "unmet",
+    "AC-2": "met"
+  }
+}
