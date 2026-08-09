@@ -12,6 +12,7 @@ import sys
 
 import pytest
 
+from arbiter import run_records
 from arbiter.cli import main
 from arbiter.verify import EXIT_FAIL, EXIT_PASS, EXIT_UNCLEAR, EXIT_USAGE
 from conftest import claude_events
@@ -212,6 +213,45 @@ def test_json_output_is_machine_readable(gate, capsys):
     assert payload["blinding"]["seed"] is not None
 
 
+def test_verify_can_write_a_replayable_run_record(gate, repo, capsys):
+    report = _review(
+        [
+            _ac("AC-1", "unmet", "app.py:2", assessment="still wrong"),
+            _ac("AC-2", "met", "app.py:2", "tests/test_app.py::test_empty_list"),
+        ]
+    )
+    record_path = repo / "run.json"
+
+    code = gate(report, "--json", "--record", str(record_path))
+    captured = capsys.readouterr()
+    output = json.loads(captured.out)
+    record = json.loads(record_path.read_text())
+
+    assert code == EXIT_FAIL
+    assert record["schema_version"] == run_records.SCHEMA_VERSION
+    assert record["command"] == "verify"
+    assert record["inputs"]["plan"]["content"] == PINNED_PLAN
+    assert record["inputs"]["diff"]["content"] == DIFF
+    assert record["configuration"]["custom_test_command"] is True
+    assert record["result"] == output
+    observed = {row["id"]: row for row in record["observations"]["criteria_evidence"]}
+    assert observed["AC-2"]["test_check"]["verified"] is True
+    assert record["observations"]["blinding"] == output["blinding"]
+    assert "tests/test_app.py" in record["workspace"]["files"]
+    assert "run.json" not in record["workspace"]["files"]
+    assert record["exit_code"] == code
+    assert {call["phase"] for call in record["provider_calls"]} == {
+        "reviewer",
+        "consolidator",
+    }
+    assert all(call["content"] == report for call in record["provider_calls"])
+    encoded = json.dumps(record)
+    assert '"session_id"' not in encoded
+    assert '"cmd"' not in encoded
+    assert PYTEST not in encoded
+    assert "Run record written" in captured.err
+
+
 def test_seed_makes_a_run_reproducible(gate, capsys):
     report = _review([_ac("AC-1", "met", "app.py:2"), _ac("AC-2", "met", "app.py:2")])
     gate(report, "--json", "--seed", "4242")
@@ -257,6 +297,12 @@ def test_plan_pin_is_idempotent_without_force(repo, shim_path, capsys):
 
 
 # ── Usage errors ─────────────────────────────────────────────────────────────
+#
+# Every usage error exits 2, so asserting only the code cannot tell one apart
+# from another. These take `shim_path` for its PATH, not its stream: without a
+# provider installed the default panel fails first, and each test would be
+# quietly asserting *that* error instead of the one it names — which is how
+# they passed here and failed in CI, where nothing is installed.
 
 
 def test_unknown_provider_is_a_usage_error_not_a_silent_drop(repo, capsys):
@@ -266,15 +312,17 @@ def test_unknown_provider_is_a_usage_error_not_a_silent_drop(repo, capsys):
     assert "gpt4" in capsys.readouterr().err
 
 
-def test_unknown_judge_is_a_usage_error(repo):
+def test_unknown_judge_is_a_usage_error(repo, shim_path, capsys):
     assert main(["verify", "--plan", "plan.md", "--judge", "bogus"]) == EXIT_USAGE
+    assert "bogus" in capsys.readouterr().err
 
 
-def test_missing_plan_file_is_a_usage_error(repo):
+def test_missing_plan_file_is_a_usage_error(repo, shim_path, capsys):
     assert main(["verify", "--plan", "nope.md"]) == EXIT_USAGE
+    assert "nope.md" in capsys.readouterr().err
 
 
-def test_a_diff_spec_that_is_neither_file_nor_range_explains_itself(repo, capsys):
+def test_a_diff_spec_that_is_neither_file_nor_range_explains_itself(repo, shim_path, capsys):
     assert main(["verify", "--plan", "plan.md", "--diff", "not-a-thing"]) == EXIT_USAGE
     assert "revision range" in capsys.readouterr().err
 

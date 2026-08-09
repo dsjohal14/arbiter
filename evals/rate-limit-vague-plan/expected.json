@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "command": "plan review",
+  "description": "A plan with no checkable promise in it. An implementer would have to guess the request limit, how a client is identified, and what happens when the counter store is unavailable. Nothing here contradicts anything else, so a contradiction finding would be a false positive.",
+  "verdict": "blocked",
+  "must_find": [
+    {
+      "label": "the request limit is left for the author to choose",
+      "action": "decide",
+      "match": ["limit"]
+    },
+    {
+      "label": "'efficient' is not something a test could settle",
+      "kind": "untestable",
+      "match": ["efficient"]
+    },
+    {
+      "label": "nothing says what happens when the counter store is unavailable",
+      "kind": "missing",
+      "match": ["store"]
+    }
+  ],
+  "must_not_find": [
+    {
+      "label": "an invented contradiction",
+      "kind": "contradiction"
+    }
+  ]
+}

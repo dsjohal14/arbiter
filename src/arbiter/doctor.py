@@ -17,12 +17,20 @@ import shutil
 from dataclasses import dataclass, field
 
 from . import display
-from .models import PROVIDERS, ModelCallError, Provider, make_session
+from .models import (
+    DEFAULT_PANEL,
+    OPT_IN_PROVIDERS,
+    PROVIDERS,
+    ModelCallError,
+    Provider,
+    make_session,
+)
 
 INSTALL_HINTS = {
     "claude": "https://code.claude.com",
     "codex": "npm install -g @openai/codex",
     "gemini": "https://developers.google.com/gemini-cli",
+    "antigravity": "https://antigravity.google (installs the `agy` CLI)",
 }
 
 PROBE_TIMEOUT = 60.0
@@ -54,15 +62,24 @@ class ProviderHealth:
 
 
 def describe_capabilities(p: Provider) -> list[str]:
+    """One line per thing this CLI can or cannot be asked to do.
+
+    Read verbatim by users deciding which panel to trust, so each line states
+    the narrowest true thing — a provider that only silences skills must not
+    read like one that controls the whole system prompt.
+    """
     caps: list[str] = []
     caps.append(
         "structured output" if p.output_schema_flag else "no structured output (prose fallback)"
     )
     caps.append("read-only mode" if p.readonly_flags else "no read-only mode")
     caps.append(
-        "isolates user config" if p.isolate_flags else "inherits user config (uncontrolled)"
+        f"isolates {p.isolate_scope}" if p.isolate_flags else "inherits user config (uncontrolled)"
     )
     caps.append("pre-assigned session id" if p.preassigns_session else "provider-minted session id")
+    if not p.accepts_stdin_prompt:
+        caps.append("prompt must fit in argv (no stdin); very large diffs may not fit")
+    caps.append("reports token usage" if p.reports_usage else "no token usage reported")
     return caps
 
 
@@ -98,7 +115,13 @@ async def _probe(sess) -> None:
 
 
 async def run_doctor(keys: list[str] | None = None, probe: bool = True) -> list[ProviderHealth]:
-    keys = keys or sorted(PROVIDERS)
+    """Check the default panel, or exactly the providers named.
+
+    Opt-in providers are left out unless asked for: probing one costs a real
+    call, and a provider you have chosen not to use failing its health check
+    should not be what makes `arbiter doctor` exit non-zero.
+    """
+    keys = keys or sorted(DEFAULT_PANEL)
     return list(await asyncio.gather(*[check_provider(k, probe) for k in keys]))
 
 
@@ -132,4 +155,13 @@ def render(results: list[ProviderHealth]) -> None:
         )
     else:
         display.print_note("All providers ready.")
+
+    # Say what was not looked at, so "supported but opt-in" never reads as
+    # "dropped". Only when this run actually skipped them.
+    checked = {h.key for h in results}
+    if skipped := [k for k in OPT_IN_PROVIDERS if k not in checked]:
+        display.print_note(
+            f"Not checked (opt-in): {', '.join(skipped)}. "
+            "Use --all, or name it with --models to use it."
+        )
     display.print()

@@ -13,6 +13,7 @@ import asyncio
 
 from . import display
 from .models import Session, call_session
+from .run_records import RunTrace
 
 
 async def stream_parallel(
@@ -23,6 +24,8 @@ async def stream_parallel(
     timeout: float,
     round_num: int | None = None,
     schema_path_writer=None,
+    trace: RunTrace | None = None,
+    phase: str = "reviewer",
 ) -> list[tuple[str, str]]:
     """Run all sessions concurrently, rendering one live block at a time in
     completion order. Returns [(key, content), ...] for those that succeeded.
@@ -48,9 +51,13 @@ async def stream_parallel(
                 timeout=timeout,
                 schema_path_writer=schema_path_writer,
             )
+            if trace is not None:
+                trace.success(phase, sess, resp)
             await queue.put(("done", sess.key, resp))
             return resp
         except Exception as e:
+            if trace is not None:
+                trace.failure(phase, sess, e)
             await queue.put(("fail", sess.key, str(e)))
             return None
 

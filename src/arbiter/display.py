@@ -359,6 +359,37 @@ def print_plan_verdict(ready: bool, counts: dict[str, int], blocking: int) -> No
         print()
 
 
+def print_case_score(score: dict) -> None:
+    """One evaluation case against its answer key: the label, then every miss.
+
+    Rates are printed even when the case passes — the point of a corpus is the
+    number, not the pass/fail.
+    """
+    passed = bool(score.get("passed"))
+    color = GREEN if passed else RED
+    print()
+    print(
+        f"  {_c('✓' if passed else '✗', BOLD, color)} {_c(str(score.get('case', '?')), BOLD)}  "
+        f"{_c('PASS' if passed else 'FAIL', BOLD, color)}  {_c(str(score.get('command', '')), DIM)}"
+    )
+
+    verdict = score.get("verdict") or {}
+    if verdict.get("expected") is not None:
+        ok = bool(verdict.get("correct"))
+        print(
+            f"       {_c('verdict:  ', DIM)}expected {_c(verdict['expected'], BOLD)}, "
+            f"got {_c(str(verdict.get('actual')), BOLD, GREEN if ok else RED)}"
+        )
+    for label, key in (("criteria: ", "criteria_accuracy"), ("recall:   ", "recall")):
+        rate = score.get(key)
+        if rate is not None:
+            print(f"       {_c(label, DIM)}{rate * 100:.0f}%")
+
+    for line in score.get("failures") or []:
+        print(f"       {_c('✗ ' + line, RED)}")
+    print()
+
+
 def print_plan_finding(n: int, f: dict) -> None:
     """One proposed edit to the contract. The point is that it is actionable —
     a concern with no proposed change would just be commentary."""

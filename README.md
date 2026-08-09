@@ -11,6 +11,7 @@ whether the agent kept every promise.
 arbiter plan review plan.md    # is this plan good enough to build from?
 arbiter plan pin plan.md       # this is the approved contract
 arbiter verify --plan plan.md --diff   # did the implementation keep it?
+arbiter replay run.json        # re-derive that verdict for free
 ```
 
 The failure mode this exists for is familiar: an agent writes a good-looking
@@ -243,15 +244,36 @@ arbiter doctor
 No API keys and no Python dependencies — Arbiter drives CLI tools you already
 have and are already logged into.
 
-| Tool | Install |
-|------|---------|
-| Claude Code | [code.claude.com](https://code.claude.com) |
-| Codex CLI | `npm install -g @openai/codex` |
-| Gemini CLI | [developers.google.com/gemini-cli](https://developers.google.com/gemini-cli) |
+| Tool | Install | |
+|------|---------|---|
+| Claude Code | [code.claude.com](https://code.claude.com) | default |
+| Codex CLI | `npm install -g @openai/codex` | default |
+| Antigravity (`agy`) | [antigravity.google](https://antigravity.google) | default |
+| Gemini CLI | [developers.google.com/gemini-cli](https://developers.google.com/gemini-cli) | opt-in |
+
+You don't need all of them. With no `--models`, the panel is whichever **default**
+providers are installed, and the ones that aren't are named rather than sent off
+to fail one by one. Ask for one by name and it stays strict — a reviewer you
+requested and didn't get is a missing opinion, so the verdict can't be a clean
+pass.
+
+**Gemini is opt-in, not unsupported.** It's the weakest panel member — no
+structured output, no config isolation — and its CLI blocks on an interactive
+login that a headless run can't answer, which turns a default run into a timeout
+instead of a verdict. It's still fully wired up; name it and it works:
+
+```bash
+arbiter verify --plan plan.md --diff --models claude,codex,gemini
+arbiter doctor --all          # include opt-in providers in the health check
+```
 
 `arbiter doctor` checks each is installed **and authenticated**, and reports what
 it can actually do. Presence isn't enough: a CLI can sit on `PATH` and still
-refuse to serve you.
+refuse to serve you — and one that needs a login will sit there asking a
+question no headless run can answer. Doctor quotes the question back at you.
+Opt-in providers aren't probed unless you pass `--all`: probing costs a real
+call, and a provider you've chosen not to use shouldn't be what makes the health
+check fail.
 
 ---
 
@@ -270,6 +292,111 @@ arbiter verify --plan plan.md --diff working              # unstaged
 arbiter verify --plan plan.md --diff origin/main...HEAD   # a revision range
 git diff | arbiter verify --plan plan.md --diff -         # stdin
 ```
+
+Keep a versioned run record when you want an audit trail, a way to re-derive a
+verdict for free, or an input for an eval corpus:
+
+```bash
+mkdir -p .arbiter/runs
+arbiter plan review plan.md --record .arbiter/runs/plan-review.json
+arbiter verify --plan plan.md --diff origin/main...HEAD \
+  --record .arbiter/runs/verify.json
+```
+
+The record embeds the exact plan and diff with SHA-256 digests, normalized
+configuration, every extractor/reviewer/consolidator final response or failure,
+per-call token counts and cost where the provider reports them, evidence and
+blinding observations, the final result, timing, and exit code. Verify records
+also hash every Git-visible file in the working tree (or every file in a
+non-Git tree except standard test/cache artifacts) so eval scoring can bind the
+result to unchanged tests, fixtures, helpers, and imports as well as files named
+by the diff. Files are hashed as raw bytes with bounded, streaming reads; file
+contents are not copied into the record. `schema_version` makes the format an
+explicit compatibility boundary.
+Provider command lines, session IDs, environment variables, and the value of a
+custom test command are not serialized.
+
+Token counts are normalized across providers (`input_tokens`, `output_tokens`,
+`cached_input_tokens`, `cache_write_tokens`, `reasoning_tokens`, `total_tokens`,
+`cost_usd`) and every field is nullable, because no two CLIs report the same set.
+A total is only ever the provider's own figure — summing the parts would invent
+a number whose billing meaning is unknown, since cache reads and writes are
+priced differently. A provider Arbiter can't read counts from records `null`,
+which stays distinguishable from a call that consumed nothing.
+
+Run records are opt-in because they are **sensitive**: plans, diffs, provider
+responses, and error text can contain proprietary code or secrets. The files are
+created with owner-only permissions and `.arbiter/runs/` is ignored in this repo;
+add the same path to the target project's `.gitignore` before using it there.
+
+A record is not signed and is not an authenticity proof. `replay --check`
+means current deterministic logic reproduced the expected output from the
+recorded inputs; someone who rewrites the inputs and expected output together
+can forge that claim. Runtime provenance is also not yet bound: the record keeps
+whether a custom runner and scrubbed environment were used, but not the runner
+command, interpreter, installed dependencies, or operating-system state. Run
+eval corpora in a controlled environment when comparing measurements.
+
+### `arbiter replay` — the same verdict, for nothing
+
+Everything downstream of a provider's response is deterministic: parsing,
+merging, the evidence downgrade rules, the roll-up. Replay re-runs that half from
+a record, so a change to how Arbiter reads a response can be checked against runs
+that already happened — no providers installed, no tokens spent.
+
+```bash
+arbiter replay .arbiter/runs/verify.json           # exits with the replayed verdict
+arbiter replay .arbiter/runs/verify.json --check   # exits 0 only if it still reproduces
+```
+
+`replay` takes one record. A corpus of them is a regression test for Arbiter's
+own logic:
+
+```bash
+for r in .arbiter/runs/*.json; do
+  arbiter replay "$r" --check >/dev/null || echo "drift: $r"
+done
+```
+
+The comparison is **exhaustive**, not a summary: every field of the result is
+compared, so a changed finding severity, a rewritten proposed criterion, or a
+dropped citation is drift even when the verdict and every criterion status hold.
+Evidence checks and the blinding map are stored separately as replay inputs, so
+their corresponding result fields are covered by that comparison too.
+
+What replay does **not** do is re-check evidence. Whether a cited line exists or
+a cited test passes is a fact about a working tree. Those observations are
+restored from the record and the downgrade rules applied to them again. The
+workspace digest can bind eval scoring to the same tree, but it cannot recreate
+the tree or re-run the test. Replay answers "does today's logic reach the
+recorded verdict from the recorded responses?", not "is that verdict still true
+of this repo today".
+
+Record schemas v1 and v2 stored those replay inputs inside the result itself.
+They remain readable for zero-cost replay, but cannot pass `--check`: only v3+
+can certify that the independently restored inputs reproduce the expected
+output exactly.
+
+### `arbiter eval` — how often is it right?
+
+An eval case is one run whose right answer a human wrote down: the plan, the
+diff, and an `expected.json` naming the status each criterion should get and the
+findings that must (or must not) appear. Scoring replays a record, so labelling a
+case costs one paid run and every scoring after it is free.
+
+```bash
+arbiter eval validate evals/*/                        # is the corpus well formed?
+arbiter eval score evals/<case> --record run.json     # exits 0 when the run matches
+```
+
+```
+  ✗ totals-drops-first-element  FAIL  verify
+       verdict:  expected fail, got pass
+       criteria: 50%
+       ✗ AC-1: expected unmet, got met
+```
+
+Format, workflow, and the starter cases: [`evals/README.md`](evals/README.md).
 
 In CI:
 
@@ -311,8 +438,11 @@ The extracted list is a starting point. Read it and edit it — it's your contra
 | `--no-run-tests` | off | Check cited tests exist, don't execute them |
 | `--no-scrub-test-env` | off | Run cited tests with the full environment |
 | `--test-command` | autodetect | Test runner (only pytest is autodetected) |
-| `--models` | all | Comma-separated reviewers |
-| `--judge` | `claude` | Who consolidates |
+| `--record` | off | (`plan review`, `verify`) Write a sensitive, versioned JSON run record |
+| `--check` | off | (`replay`) Exit 0 only if the replay reproduces the record |
+| `--models` | installed defaults | Comma-separated reviewers; naming one requires it |
+| `--judge` | `claude` if installed | Who consolidates |
+| `--all` | off | (`doctor`) Also check opt-in providers |
 | `--seed` | random | Reproduces an earlier run's blinding exactly |
 | `--json` | off | Result on stdout, progress on stderr |
 | `--allow-tools` | off | Let providers use their full toolset |
@@ -347,6 +477,12 @@ network. Arbiter scrubs directly inherited environment variables by default (onl
 `PATH`, `HOME`, `LANG` and similar survive; disable with `--no-scrub-test-env`),
 but **that is accidental-exposure reduction, not a sandbox or malicious-code
 defense.**
+
+**3. Run-record disclosure.** `--record` intentionally copies the plan, diff,
+model responses, and errors into one JSON file. Owner-only file permissions
+reduce accidental local exposure, but do not make the contents safe to commit,
+upload, or share. A model response or error can repeat sensitive input even when
+Arbiter does not serialize credentials or environment variables directly.
 
 ### Running it on code you don't trust
 
@@ -383,18 +519,31 @@ the repo can't verify code.
 **Providers are not equivalent, and the code says so.** Each declares its
 capabilities and `arbiter doctor` reports them:
 
-| | Read-only | Ignores user config | Structured output | Session pinning |
-|---|---|---|---|---|
-| `claude` | ✓ | ✓ `--safe-mode` | ✓ | pre-assigned UUID |
-| `codex` | ✓ | ✓ partial | ✓ | provider-minted |
-| `gemini` | ✓ | ✗ none | ✗ prose fallback | pre-assigned UUID |
+| | Read-only | Ignores user config | Structured output | Session pinning | Token usage |
+|---|---|---|---|---|---|
+| `claude` | ✓ | ✓ `--safe-mode` | ✓ | pre-assigned UUID | ✓ + cost |
+| `codex` | ✓ | ✓ partial | ✓ | provider-minted | ✓ |
+| `antigravity` | ✓ | ~ skills only | ✓ | provider-minted | ✓ |
+| `gemini` *(opt-in)* | ✓ | ✗ none | ✗ prose fallback | pre-assigned UUID | ✗ |
+
+That bottom row is why gemini is off the default panel: two of the four
+properties this tool leans on are simply absent there. It stays supported
+because "we can't control it" is a reason to disclose, not to delete.
 
 Codex is isolated with `--ignore-user-config` but deliberately *not*
 `--ephemeral`, which would stop it persisting sessions and break resume.
+Antigravity's `--disable-slash-commands` silences skills and slash commands but
+leaves project instruction files in place, so `doctor` says "isolates slash
+commands and skills only" rather than claiming parity.
 
 **Codex does not stream.** It emits its whole message in one event; Claude and
 Gemini stream incrementally. Arbiter renders one block at a time either way, so
 output never interleaves.
+
+**Antigravity can't take a prompt on stdin.** Its `--print` requires the value in
+argv, and a bare `--print` swallows the next flag as the prompt. So its prompt
+always goes in argv, and a plan plus a very large diff can exceed what `execve`
+will carry — which is reported as exactly that rather than as a launch failure.
 
 **Large prompts go on stdin.** A plan plus a real diff exceeds OS argument
 limits — `ARG_MAX` is 1 MiB on macOS, and Linux caps any single argument at
@@ -413,6 +562,9 @@ src/arbiter/
 ├── evidence.py      # mechanical checking — read lines, run tests
 ├── debate.py        # debate rounds, judge parsing, follow-up loop
 ├── streaming.py     # parallel block-streamed display coordinator
+├── run_records.py   # versioned, atomic audit/eval records
+├── replay.py        # re-derive a recorded run's result, calling nothing
+├── evals.py         # eval-case schema, loading, and scoring
 ├── models.py        # provider capabilities, sessions, subprocess transport
 ├── prompts.py       # prompt construction and blinding
 ├── schema_files.py  # scoped temp schema files for file-based providers
@@ -461,14 +613,17 @@ provider — `make check` costs nothing and needs no login.
 
 ## Roadmap
 
-- [ ] Validate the loop on 15–20 real agent implementations: does plan review
-      catch the requirements verify later flags? Measure missed requirements,
-      false positives, latency, and cost
+- [x] Versioned records of inputs, provider outcomes, results, and timing
+- [x] Replay recorded provider outcomes for deterministic, zero-cost reruns
+- [x] An eval-case format, and scoring a run against a hand-labelled answer key
+- [ ] Grow the corpus to 15–20 labelled cases from real agent implementations,
+      and publish the numbers: missed requirements, false clean passes,
+      actionable-vs-wrong plan findings, latency, cost
 - [ ] An Arbiter agent skill, so you can say "review this plan before
       implementing" and "don't declare it done until the gate passes"
 - [ ] Test-runner support beyond pytest (jest, cargo, go test)
-- [ ] Record/replay of provider streams for deterministic, zero-cost reruns
-- [ ] Per-run cost and token accounting (the data is already in the stream)
+- [x] Per-call token counts, and cost where the provider reports it
+- [ ] Roll those up into a per-run cost summary and a corpus-wide one
 - [ ] Pre-commit hook and GitHub Action packaging
 
 ---

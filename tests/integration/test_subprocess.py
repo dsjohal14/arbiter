@@ -13,8 +13,8 @@ import time
 
 import pytest
 
-from arbiter.models import ModelCallError, call_session, make_session
-from conftest import claude_events, codex_events, gemini_events
+from arbiter.models import ARGV_PROMPT_LIMIT, ModelCallError, call_session, make_session
+from conftest import agy_events, claude_events, codex_events, gemini_events
 
 
 async def test_reads_a_complete_claude_stream(shim_path):
@@ -39,6 +39,56 @@ async def test_gemini_stream_is_parsed(shim_path):
     shim_path(gemini_events("gemini says hi"))
     resp = await call_session(make_session("gemini", "gemini"), "q")
     assert resp.content == "gemini says hi"
+
+
+async def test_agy_stream_is_parsed_and_its_conversation_id_captured(shim_path):
+    shim_path(agy_events("antigravity says hi"))
+    sess = make_session("antigravity", "antigravity")
+    assert sess.session_id is None  # agy mints its own
+
+    resp = await call_session(sess, "q")
+
+    assert resp.content == "antigravity says hi"
+    assert sess.session_id == "conv-1"
+    assert sess.started is True
+
+
+async def test_agy_resumes_by_conversation_id(shim_path):
+    argv_log = shim_path(agy_events("hi"))
+    sess = make_session("antigravity", "antigravity")
+    await call_session(sess, "q1")
+    await call_session(sess, "q2")
+
+    calls = [json.loads(line) for line in argv_log.read_text().splitlines()]
+    assert "--conversation" not in calls[0]
+    assert calls[1][calls[1].index("--conversation") + 1] == "conv-1"
+
+
+async def test_an_oversized_prompt_still_goes_in_agy_argv(shim_path):
+    """`--print` takes its value in argv, and a bare `--print` swallows the next
+    flag as the prompt — so the run would review the string '--output-format'
+    and report on nothing. Size cannot be allowed to change the shape."""
+    argv_log = shim_path(agy_events("ok"))
+    big = "PROMPT-MARKER " + "x" * (ARGV_PROMPT_LIMIT + 1)
+
+    await call_session(make_session("antigravity", "antigravity"), big)
+
+    cmd = json.loads(argv_log.read_text().splitlines()[0])
+    assert cmd[1] == "--print"
+    assert cmd[2] == big
+
+
+async def test_usage_is_read_off_the_stream(shim_path):
+    shim_path(agy_events("ok", usage={"input_tokens": 10, "output_tokens": 2}))
+    resp = await call_session(make_session("antigravity", "antigravity"), "q")
+    assert resp.usage.input_tokens == 10
+    assert resp.usage.output_tokens == 2
+
+
+async def test_a_provider_reporting_nothing_leaves_usage_unset(shim_path):
+    shim_path(gemini_events("hi"))
+    resp = await call_session(make_session("gemini", "gemini"), "q")
+    assert resp.usage is None
 
 
 async def test_answer_larger_than_the_64kib_line_limit(shim_path):

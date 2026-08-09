@@ -150,6 +150,21 @@ class EvidenceCheck:
             "detail": self.detail,
         }
 
+    @classmethod
+    def from_dict(cls, data: dict) -> EvidenceCheck:
+        """Rebuild a check recorded by an earlier run.
+
+        `verified` is tri-state, so anything that is not exactly True or False
+        restores as None — "we could not check" — rather than a coerced boolean.
+        """
+        verified = data.get("verified")
+        return cls(
+            kind=str(data.get("kind") or ""),
+            citation=str(data.get("citation") or ""),
+            verified=verified if isinstance(verified, bool) else None,
+            detail=str(data.get("detail") or ""),
+        )
+
 
 def _safe_path(raw: str, root: Path) -> Path | None:
     """Resolve a cited path inside the repo, refusing anything that escapes it."""

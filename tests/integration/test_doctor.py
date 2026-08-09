@@ -6,8 +6,8 @@ import pytest
 
 from arbiter.cli import main
 from arbiter.doctor import check_provider, describe_capabilities, run_doctor
-from arbiter.models import PROVIDERS
-from conftest import claude_events, codex_events, gemini_events
+from arbiter.models import DEFAULT_PANEL, OPT_IN_PROVIDERS, PROVIDERS
+from conftest import agy_events, claude_events, codex_events, gemini_events
 
 
 async def test_missing_binary_is_reported_with_an_install_hint(monkeypatch, tmp_path):
@@ -52,17 +52,41 @@ def test_capabilities_are_reported_honestly_per_provider(key):
     if key == "gemini":
         assert "no structured output" in caps
         assert "inherits user config" in caps
+        assert "no token usage" in caps
     else:
         assert "structured output" in caps
+        assert "reports token usage" in caps
 
 
-ALL_OK = {"claude": claude_events("ok"), "codex": codex_events("ok"), "gemini": gemini_events("ok")}
+def test_partial_isolation_does_not_read_as_full_isolation():
+    """`--disable-slash-commands` silences skills and slash commands. It leaves
+    project instruction files and settings in place, and a user picking a panel
+    on the strength of this line has to be told which one they are getting."""
+    agy = " ".join(describe_capabilities(PROVIDERS["antigravity"]))
+    claude = " ".join(describe_capabilities(PROVIDERS["claude"]))
+    assert "isolates slash commands and skills only" in agy
+    assert "isolates user config" in claude
+    assert "isolates user config" not in agy
 
 
-async def test_run_doctor_covers_every_provider(shim_path):
+def test_a_provider_that_cannot_take_a_stdin_prompt_says_so():
+    caps = describe_capabilities(PROVIDERS["antigravity"])
+    assert any("must fit in argv" in c for c in caps)
+    assert not any("argv" in c for c in describe_capabilities(PROVIDERS["claude"]))
+
+
+ALL_OK = {
+    "claude": claude_events("ok"),
+    "codex": codex_events("ok"),
+    "gemini": gemini_events("ok"),
+    "agy": agy_events("ok"),
+}
+
+
+async def test_run_doctor_covers_the_default_panel(shim_path):
     shim_path(per_provider=ALL_OK)
     results = await run_doctor()
-    assert {h.key for h in results} == set(PROVIDERS)
+    assert {h.key for h in results} == set(DEFAULT_PANEL)
 
 
 def test_doctor_json_output_and_exit_code(shim_path, capsys):
@@ -70,10 +94,52 @@ def test_doctor_json_output_and_exit_code(shim_path, capsys):
     code = main(["doctor", "--json"])
     payload = json.loads(capsys.readouterr().out)
     assert code == 0
-    assert {p["provider"] for p in payload} == set(PROVIDERS)
+    assert {p["provider"] for p in payload} == set(DEFAULT_PANEL)
     assert all(p["authenticated"] for p in payload)
 
 
 def test_doctor_exits_nonzero_when_a_provider_is_unusable(monkeypatch, tmp_path, capsys):
     monkeypatch.setenv("PATH", str(tmp_path))
     assert main(["doctor", "--no-probe", "--json"]) != 0
+
+
+# ── Opt-in providers ─────────────────────────────────────────────────────────
+
+
+def test_an_opt_in_provider_is_not_probed_but_is_named_as_available(shim_path, capsys):
+    """Probing costs a real call, and a provider you have chosen not to use must
+    not be what makes doctor exit non-zero. Silence would read as 'dropped', so
+    it is listed as skipped instead."""
+    shim_path(per_provider=ALL_OK)
+
+    code = main(["doctor"])
+    out = capsys.readouterr().out
+
+    assert code == 0
+    for key in OPT_IN_PROVIDERS:
+        assert f"  ✓  {key}" not in out
+        assert key in out  # named in the skipped line
+    assert "Not checked (opt-in)" in out
+    assert "--models" in out
+
+
+def test_all_includes_the_opt_in_providers(shim_path, capsys):
+    shim_path(per_provider=ALL_OK)
+
+    code = main(["doctor", "--all", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert {p["provider"] for p in payload} == set(PROVIDERS)
+
+
+def test_a_broken_opt_in_provider_does_not_fail_the_default_check(shim_path, capsys):
+    """The whole reason gemini is opt-in: its CLI blocks on a login prompt, and
+    that used to be the only thing standing between a healthy machine and a
+    non-zero `arbiter doctor`."""
+    shim_path(
+        per_provider={k: v for k, v in ALL_OK.items() if k != "gemini"},
+        installed=("claude", "codex", "agy"),
+    )
+
+    assert main(["doctor", "--json"]) == 0

@@ -27,6 +27,7 @@ from . import display
 from .criteria import Criterion
 from .models import IsolationMode, ModelCallError, Session, call_session, make_session
 from .prompts import Blinding, blind
+from .run_records import RunTrace
 from .schema_files import schema_writer
 from .streaming import stream_parallel
 
@@ -380,6 +381,81 @@ def proposed_criteria(existing: list[Criterion], findings: list[PlanFinding]) ->
 # ── Orchestration ─────────────────────────────────────────────────────────────
 
 
+@dataclass
+class ReviewIntake:
+    """What the reviewers actually returned, sorted into usable and not.
+
+    Kept separate from the display so `replay` can rebuild a critique from
+    recorded output using exactly the code the live run used.
+    """
+
+    usable_reports: list[tuple[str, str]] = field(default_factory=list)
+    per_reviewer: list[list[PlanFinding]] = field(default_factory=list)
+    completed: list[str] = field(default_factory=list)
+    failed: list[str] = field(default_factory=list)
+    # Never produced a report at all, as opposed to one that would not parse.
+    transport_failed: list[str] = field(default_factory=list)
+    incomplete: list[str] = field(default_factory=list)
+    parse_errors: dict[str, list[str]] = field(default_factory=dict)
+
+
+def intake_reports(
+    reports: list[tuple[str, str]], reviewer_keys: list[str], criteria: list[Criterion]
+) -> ReviewIntake:
+    """Parse every reviewer's critique, keeping partial output usable.
+
+    An unparseable report still blocks READY, but one hallucinated target must
+    not erase the other findings that reviewer did get right.
+    """
+    parsed = [
+        (key, text, parse_findings_report(text, criteria, source=key)) for key, text in reports
+    ]
+    completed = [key for key, _, p in parsed if p.valid]
+    returned = {key for key, _ in reports}
+    return ReviewIntake(
+        usable_reports=[
+            (key, text if p.valid else _findings_json(p.findings))
+            for key, text, p in parsed
+            if p.valid or p.findings
+        ],
+        per_reviewer=[p.findings for _, _, p in parsed],
+        completed=completed,
+        failed=[key for key in reviewer_keys if key not in completed],
+        transport_failed=[key for key in reviewer_keys if key not in returned],
+        incomplete=[key for key, _, p in parsed if not p.valid],
+        parse_errors={key: p.errors for key, _, p in parsed if not p.valid},
+    )
+
+
+def finalize_plan_review(
+    criteria: list[Criterion],
+    intake: ReviewIntake,
+    consolidated: list[PlanFinding] | None,
+    blinding: Blinding | None = None,
+) -> PlanReviewResult:
+    """Assemble the critique. `consolidated` is None when consolidation failed or
+    was unusable; a valid empty list means the consolidator deliberately rejected
+    every finding, and only the former falls back to the reviewers."""
+    findings = list(consolidated) if consolidated is not None else []
+    if consolidated is None:
+        seen: set[tuple] = set()
+        for group in intake.per_reviewer:
+            for f in group:
+                key = (f.kind, f.action, f.problem)
+                if key not in seen:
+                    seen.add(key)
+                    findings.append(f)
+
+    findings.sort(key=lambda f: (KINDS.index(f.kind), f.target or ""))
+    return PlanReviewResult(
+        findings=findings,
+        criteria=proposed_criteria(criteria, findings),
+        reviewers=intake.completed,
+        failed_reviewers=intake.failed,
+        blinding=blinding,
+    )
+
+
 def make_review_sessions(
     reviewer_keys: list[str], consolidator_key: str, isolation: IsolationMode = "readonly"
 ) -> tuple[dict[str, Session], Session]:
@@ -407,6 +483,7 @@ async def run_plan_review(
     verbose: bool,
     timeout: float,
     seed: int | None = None,
+    trace: RunTrace | None = None,
 ) -> PlanReviewResult:
     with schema_writer() as write_schema:
         display.print_section("plan critique")
@@ -418,49 +495,34 @@ async def run_plan_review(
             names,
             timeout,
             schema_path_writer=write_schema,
+            trace=trace,
+            phase="reviewer",
         )
         if not reports:
             raise ModelCallError("Every reviewer failed; cannot critique this plan.")
 
-        parsed_reports = [
-            (key, text, parse_findings_report(text, criteria, source=key)) for key, text in reports
-        ]
-        usable_reports = [
-            (key, text if parsed.valid else _findings_json(parsed.findings))
-            for key, text, parsed in parsed_reports
-            if parsed.valid or parsed.findings
-        ]
-        completed = [key for key, _, parsed in parsed_reports if parsed.valid]
-        failed = [key for key in reviewers if key not in completed]
-        transport_failed = [key for key in reviewers if key not in {k for k, _ in reports}]
-        incomplete = [key for key, _, parsed in parsed_reports if not parsed.valid]
-        for key, _, parsed in parsed_reports:
-            if not parsed.valid:
-                display.print_error(
-                    f"{names.get(key, key)} returned an incomplete review: "
-                    + "; ".join(parsed.errors[:3])
-                )
-        if not usable_reports:
-            raise ModelCallError("Every reviewer returned an unusable plan critique.")
-        if transport_failed:
+        intake = intake_reports(reports, list(reviewers), criteria)
+        for key, errors in intake.parse_errors.items():
             display.print_error(
-                f"{len(transport_failed)} of {len(reviewers)} reviewers failed to complete "
-                f"({', '.join(transport_failed)}). The plan cannot be reported as ready."
+                f"{names.get(key, key)} returned an incomplete review: " + "; ".join(errors[:3])
             )
-        if incomplete:
+        if not intake.usable_reports:
+            raise ModelCallError("Every reviewer returned an unusable plan critique.")
+        if intake.transport_failed:
             display.print_error(
-                f"{len(incomplete)} of {len(reviewers)} reviewers returned incomplete reviews "
-                f"({', '.join(incomplete)}). "
+                f"{len(intake.transport_failed)} of {len(reviewers)} reviewers failed to complete "
+                f"({', '.join(intake.transport_failed)}). The plan cannot be reported as ready."
+            )
+        if intake.incomplete:
+            display.print_error(
+                f"{len(intake.incomplete)} of {len(reviewers)} reviewers returned incomplete "
+                f"reviews ({', '.join(intake.incomplete)}). "
                 "The plan cannot be reported as ready."
             )
 
-        # Keep every structurally usable edit. An incomplete report still blocks
-        # READY, but one hallucinated target must not erase its other findings.
-        per_reviewer = [parsed.findings for _, _, parsed in parsed_reports]
-
         # Blinded for the same reason the verify consolidator is: a model should
         # not know which critique is its own.
-        blinded, blinding = blind(usable_reports, seed=seed)
+        blinded, blinding = blind(intake.usable_reports, seed=seed)
 
         display.print_section("consolidation")
         display.print_note(f"{consolidator_name} is merging proposed edits (blinded)...")
@@ -469,8 +531,7 @@ async def run_plan_review(
             if verbose:
                 display.print_verbose_cmd(cmd)
 
-        findings: list[PlanFinding] = []
-        consolidation_valid = False
+        consolidated: list[PlanFinding] | None = None
         try:
             resp = await call_session(
                 consolidator,
@@ -479,39 +540,24 @@ async def run_plan_review(
                 timeout=timeout,
                 schema_path_writer=write_schema,
             )
+            if trace is not None:
+                trace.success("consolidator", consolidator, resp)
             if verbose:
                 display.print_timing(consolidator_name, resp.duration)
             parsed = parse_findings_report(resp.content, criteria)
             if parsed.valid:
-                findings = parsed.findings
-                consolidation_valid = True
+                consolidated = parsed.findings
             else:
                 display.print_error(
                     "consolidation returned an unusable review, using reviewer findings: "
                     + "; ".join(parsed.errors[:3])
                 )
         except ModelCallError as e:
+            if trace is not None:
+                trace.failure("consolidator", consolidator, e)
             display.print_error(f"consolidation failed, using reviewer findings: {e}")
 
-        if not consolidation_valid:
-            # Only an unusable/failed consolidation falls back. A valid empty
-            # list means the consolidator deliberately rejected every finding.
-            seen: set[tuple] = set()
-            for group in per_reviewer:
-                for f in group:
-                    key = (f.kind, f.action, f.problem)
-                    if key not in seen:
-                        seen.add(key)
-                        findings.append(f)
-
-    findings.sort(key=lambda f: (KINDS.index(f.kind), f.target or ""))
-    return PlanReviewResult(
-        findings=findings,
-        criteria=proposed_criteria(criteria, findings),
-        reviewers=completed,
-        failed_reviewers=failed,
-        blinding=blinding,
-    )
+    return finalize_plan_review(criteria, intake, consolidated, blinding)
 
 
 def render(result: PlanReviewResult, show_criteria: bool = True) -> None:
