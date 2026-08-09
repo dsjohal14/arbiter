@@ -15,7 +15,7 @@ COV_MIN ?= 80
 
 .DEFAULT_GOAL := help
 .PHONY: help venv install test test-unit test-int test-live lint fmt fmt-check \
-        typecheck cov cov-html check smoke doctor demo demo-plan clean distclean
+        typecheck cov cov-html check smoke evals doctor demo demo-plan clean distclean
 
 help: ## Show this help
 	@printf "\nArbiter developer tasks\n\n"
@@ -85,6 +85,11 @@ smoke: ## Prove the package imports and the CLI wires up (no provider calls)
 	$(PY) -m $(PKG).cli --help >/dev/null && printf "cli ok\n"
 	$(PY) -m $(PKG).cli plan review --help >/dev/null && printf "plan review ok\n"
 	$(PY) -m $(PKG).cli verify --help >/dev/null && printf "verify ok\n"
+	$(PY) -m $(PKG).cli replay --help >/dev/null && printf "replay ok\n"
+	$(PY) -m $(PKG).cli eval score --help >/dev/null && printf "eval ok\n"
+
+evals: ## Validate the evaluation corpus (no provider calls)
+	$(PY) -m $(PKG).cli eval validate evals/*/
 
 doctor: ## Check provider install, auth, and capabilities (makes real calls)
 	$(PY) -m $(PKG).cli doctor

@@ -28,13 +28,14 @@ def _utc_now() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
+def digest(content: str) -> str:
+    """The digest used to tell whether two runs saw the same input."""
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
 def recorded_input(content: str, source: str | None = None) -> dict:
     """Embed one input with a stable digest for corpus comparisons."""
-    return {
-        "source": source,
-        "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
-        "content": content,
-    }
+    return {"source": source, "sha256": digest(content), "content": content}
 
 
 @dataclass

@@ -6,6 +6,8 @@ Drives locally installed CLI tools; no API keys needed.
     arbiter plan review plan.md                 # is this plan good enough to build?
     arbiter plan pin plan.md                    # extract + pin acceptance criteria
     arbiter verify --plan plan.md --diff        # the gate
+    arbiter replay run.json                     # re-derive a recorded verdict, free
+    arbiter eval score case/ --record run.json  # was that verdict right?
     arbiter debate "question"                   # multi-model debate + blinded judge
     arbiter doctor                              # provider install/auth/capability check
 
@@ -24,7 +26,7 @@ from pathlib import Path
 from typing import NoReturn
 
 from . import criteria as crit
-from . import display, doctor, plan_review, verify
+from . import display, doctor, evals, plan_review, replay, run_records, verify
 from .debate import run_debate, run_followup_loop
 from .models import (
     DEFAULT_TIMEOUT,
@@ -48,6 +50,18 @@ from .verify import (
     VerifyInputError,
     make_verify_sessions,
 )
+
+
+def _add_output_flags(p: argparse.ArgumentParser) -> None:
+    """For commands that call no models: they need the output flags and nothing
+    else `_add_common` provides."""
+    p.add_argument(
+        "--json",
+        dest="as_json",
+        action="store_true",
+        help="Emit a machine-readable JSON result on stdout",
+    )
+    p.add_argument("-v", "--verbose", action="store_true", help="Show more detail")
 
 
 def _add_common(p: argparse.ArgumentParser) -> None:
@@ -201,6 +215,33 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     pin.add_argument("--force", action="store_true", help="Re-extract even if already pinned")
     pin.add_argument("--dry-run", action="store_true", help="Print the criteria, do not write")
     _add_common(pin)
+
+    rp = sub.add_parser(
+        "replay", help="Re-derive a recorded run's result without calling any model"
+    )
+    rp.add_argument("record", help="Run record written by --record")
+    rp.add_argument(
+        "--check",
+        action="store_true",
+        help="Exit 0 only if the replay reproduces the recorded result exactly",
+    )
+    _add_output_flags(rp)
+
+    ev = sub.add_parser("eval", help="Score runs against hand-labelled evaluation cases")
+    evsub = ev.add_subparsers(dest="eval_command")
+    sc = evsub.add_parser("score", help="Score a run record against one case's answer key")
+    sc.add_argument("case", help="Evaluation case directory")
+    sc.add_argument(
+        "--record",
+        required=True,
+        metavar="FILE",
+        help="Run record produced from this case's plan and diff",
+    )
+    _add_output_flags(sc)
+
+    val = evsub.add_parser("validate", help="Check that case directories are well formed")
+    val.add_argument("cases", nargs="+", help="Evaluation case directories")
+    _add_output_flags(val)
 
     doc = sub.add_parser("doctor", help="Check provider install, auth, and capabilities")
     doc.add_argument(
@@ -582,6 +623,132 @@ async def cmd_verify(args: argparse.Namespace) -> int:
     return result.exit_code
 
 
+def cmd_replay(args: argparse.Namespace) -> int:
+    """Re-derive a recorded run's result from the responses it captured.
+
+    Calls nothing and costs nothing, so a change to parsing or verdict logic can
+    be checked against runs that already happened.
+    """
+    path = Path(args.record)
+    try:
+        outcome = replay.replay(replay.load_record(path))
+    except replay.ReplayError as e:
+        _usage_error(str(e))
+
+    if args.as_json:
+        json.dump(outcome.as_dict(), sys.stdout, indent=2)
+        sys.stdout.write("\n")
+    else:
+        replay.render(outcome, path)
+
+    if not args.check:
+        return outcome.exit_code
+    if outcome.matches:
+        return EXIT_PASS
+    if not outcome.comparable:
+        display.print_error("--check: the record has no result to reproduce.")
+    return EXIT_FAIL
+
+
+def cmd_eval_score(args: argparse.Namespace) -> int:
+    """Score one recorded run against a case's hand-labelled answer key."""
+    try:
+        case = evals.load_case(Path(args.case))
+    except evals.EvalCaseError as e:
+        _usage_error(str(e))
+
+    record_path = Path(args.record)
+    try:
+        record = replay.load_record(record_path)
+    except replay.ReplayError as e:
+        _usage_error(str(e))
+
+    if record["command"] != case.command:
+        _usage_error(
+            f"{record_path} records `arbiter {record['command']}`, but "
+            f"{case.id} is a {case.command} case."
+        )
+    _require_same_inputs(case, record, record_path)
+
+    try:
+        outcome = replay.replay(record)
+    except replay.ReplayError as e:
+        _usage_error(str(e))
+
+    result = outcome.result.as_dict()
+    scored = evals.score(case, result)
+
+    if args.as_json:
+        json.dump({**scored.as_dict(), "drift": outcome.drift}, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+    else:
+        display.print_case_score(scored.as_dict())
+        if outcome.drift:
+            display.print_error(
+                f"Scored the replay, which differs from the recorded result in "
+                f"{len(outcome.drift)} place(s); run `arbiter replay {record_path}` to see them."
+            )
+    return EXIT_PASS if scored.passed else EXIT_FAIL
+
+
+def _require_same_inputs(case: evals.EvalCase, record: dict, record_path: Path) -> None:
+    """Refuse to score a record that was produced from different inputs.
+
+    Scoring a run of some other plan against this answer key would silently
+    report an accuracy number that means nothing.
+    """
+    inputs = record.get("inputs") or {}
+    for name, content in (("plan", case.plan), ("diff", case.diff)):
+        if content is None:
+            continue
+        recorded = (inputs.get(name) or {}).get("sha256")
+        if recorded and recorded != run_records.digest(content):
+            _usage_error(
+                f"{record_path} was recorded from a different {name} than "
+                f"{case.path / (evals.PLAN_FILE if name == 'plan' else evals.DIFF_FILE)}. "
+                "Re-record the run from this case's inputs before scoring it."
+            )
+
+
+def cmd_eval_validate(args: argparse.Namespace) -> int:
+    """Check every named case directory before it is used to measure anything."""
+    reports: list[dict] = []
+    for raw in args.cases:
+        path = Path(raw)
+        try:
+            case = evals.load_case(path)
+        except evals.EvalCaseError as e:
+            reports.append({"case": path.name, "path": str(path), "ok": False, "error": str(e)})
+            continue
+        reports.append(
+            {
+                "case": case.id,
+                "path": str(path),
+                "ok": True,
+                "command": case.command,
+                "verdict": case.verdict,
+                "repo": str(case.repo) if case.repo else None,
+                "labelled_criteria": len(case.criteria),
+                "must_find": len(case.must_find),
+                "must_not_find": len(case.must_not_find),
+            }
+        )
+
+    if args.as_json:
+        json.dump(reports, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+    else:
+        for r in reports:
+            if r["ok"]:
+                display.print_note(
+                    f"✓  {r['case']} ({r['command']}) · {r['labelled_criteria']} labelled "
+                    f"criteria · {r['must_find']} must-find · {r['must_not_find']} must-not-find"
+                )
+            else:
+                display.print_error(f"{r['path']}: {r['error']}")
+    return EXIT_PASS if all(r["ok"] for r in reports) else EXIT_FAIL
+
+
 async def cmd_debate(args: argparse.Namespace) -> int:
     keys, judge = _resolve_models(args.models, args.judge)
     if args.rounds < 1:
@@ -668,6 +835,17 @@ async def _dispatch(args: argparse.Namespace) -> int:
         if args.plan_command == "pin":
             return await cmd_plan_pin(args)
         _usage_error("usage: arbiter plan review <plan.md> | arbiter plan pin <plan.md>")
+    if args.command == "replay":
+        return cmd_replay(args)
+    if args.command == "eval":
+        if args.eval_command == "score":
+            return cmd_eval_score(args)
+        if args.eval_command == "validate":
+            return cmd_eval_validate(args)
+        _usage_error(
+            "usage: arbiter eval score <case-dir> --record <run.json> | "
+            "arbiter eval validate <case-dir>..."
+        )
     if args.command == "debate":
         return await cmd_debate(args)
     if args.command == "doctor":
