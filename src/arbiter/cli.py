@@ -605,6 +605,11 @@ async def cmd_verify(args: argparse.Namespace) -> int:
                 "plan": recorded_input(plan, args.plan),
                 "diff": recorded_input(diff, args.diff),
             },
+            # The plan and diff do not identify the tree the evidence checks
+            # read, and two trees with the same diff can produce different
+            # evidence. Without this a result could be scored against an eval
+            # case whose fixture repo it never ran in.
+            workspace=run_records.workspace_identity(manifest),
             configuration={
                 "models": keys,
                 "judge": judge,
@@ -737,22 +742,75 @@ def cmd_eval_score(args: argparse.Namespace) -> int:
 
 
 def _require_same_inputs(case: evals.EvalCase, record: dict, record_path: Path) -> None:
-    """Refuse to score a record that was produced from different inputs.
+    """Refuse to score a record that was not produced from this case.
 
-    Scoring a run of some other plan against this answer key would silently
-    report an accuracy number that means nothing.
+    Every check here fails closed. Scoring a run of some other plan, or of the
+    same plan in some other tree, silently reports an accuracy number that means
+    nothing — and an accuracy number that means nothing is the one output this
+    whole layer exists to prevent.
     """
     inputs = record.get("inputs") or {}
     for name, content in (("plan", case.plan), ("diff", case.diff)):
         if content is None:
             continue
-        recorded = (inputs.get(name) or {}).get("sha256")
-        if recorded and recorded != run_records.digest(content):
+        filename = evals.PLAN_FILE if name == "plan" else evals.DIFF_FILE
+        item = inputs.get(name)
+        if not isinstance(item, dict) or not isinstance(item.get("content"), str):
+            _usage_error(
+                f"{record_path} has no recorded {name}, so it cannot be shown to be a run "
+                f"of {case.path / filename}."
+            )
+
+        # Recompute from the content rather than trusting the stored digest: a
+        # claimed hash proves nothing about the bytes sitting next to it.
+        actual = run_records.digest(item["content"])
+        claimed = item.get("sha256")
+        if claimed is not None and claimed != actual:
+            _usage_error(
+                f"{record_path} is corrupt: its recorded {name} does not match its own "
+                f"sha256. Do not score it."
+            )
+        if actual != run_records.digest(content):
             _usage_error(
                 f"{record_path} was recorded from a different {name} than "
-                f"{case.path / (evals.PLAN_FILE if name == 'plan' else evals.DIFF_FILE)}. "
+                f"{case.path / filename}. "
                 "Re-record the run from this case's inputs before scoring it."
             )
+
+    _require_same_workspace(case, record, record_path)
+
+
+def _require_same_workspace(case: evals.EvalCase, record: dict, record_path: Path) -> None:
+    """Refuse to score a record whose evidence came from another checkout.
+
+    The plan and diff do not identify the tree the evidence checks read, and two
+    trees can hold the same diff and still make a cited test pass in one and
+    fail in the other. A case that ships a fixture repo is asserting which tree
+    the answer key was written against, so the record has to name the same one.
+    """
+    if case.repo is None:
+        return
+
+    recorded = (record.get("workspace") or {}).get("files")
+    if not isinstance(recorded, dict):
+        _usage_error(
+            f"{record_path} carries no workspace identity, so it cannot be shown to have "
+            f"run against {case.path / evals.REPO_DIR}. Re-record it with this arbiter "
+            "from inside that directory."
+        )
+
+    expected = run_records.workspace_identity(
+        verify.build_manifest(case.diff or "", case.repo), case.repo
+    )["files"]
+    if expected != recorded:
+        differing = sorted(set(expected) ^ set(recorded)) or sorted(
+            path for path, d in expected.items() if recorded.get(path) != d
+        )
+        _usage_error(
+            f"{record_path} ran against a different tree than {case.path / evals.REPO_DIR} "
+            f"({', '.join(differing[:5]) or 'contents differ'}). Its evidence checks read "
+            "files this case does not ship, so the result cannot be scored against it."
+        )
 
 
 def cmd_eval_validate(args: argparse.Namespace) -> int:

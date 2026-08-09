@@ -198,3 +198,92 @@ def test_validate_reports_every_case_and_fails_on_a_broken_one(repo, capsys):
     assert code == EXIT_FAIL
     assert [r["ok"] for r in reports] == [True, False]
     assert "AC-7" in reports[1]["error"]
+
+
+# ── Binding a record to its case ─────────────────────────────────────────────
+#
+# Every check here fails closed. An accuracy number computed from a run of
+# something else is the one output this layer exists to prevent.
+
+
+def test_a_record_with_no_recorded_plan_cannot_be_scored(recorded, repo, capsys):
+    path, _ = recorded()
+    record = json.loads(path.read_text())
+    del record["inputs"]["plan"]
+    path.write_text(json.dumps(record))
+    case = write_case(repo, ANSWER_KEY)
+    capsys.readouterr()
+
+    assert main(["eval", "score", str(case), "--record", str(path)]) == EXIT_USAGE
+    assert "no recorded plan" in capsys.readouterr().err
+
+
+def test_a_claimed_digest_is_recomputed_not_trusted(recorded, repo, capsys):
+    """A hash sitting next to the content proves nothing about that content. A
+    record whose plan was swapped while its digest was left alone must not be
+    scored just because the digest still matches the case."""
+    path, _ = recorded()
+    case = write_case(repo, ANSWER_KEY)
+    record = json.loads(path.read_text())
+    record["inputs"]["plan"]["content"] = "# A completely different plan\n"
+    path.write_text(json.dumps(record))
+    capsys.readouterr()
+
+    assert main(["eval", "score", str(case), "--record", str(path)]) == EXIT_USAGE
+    assert "does not match its own sha256" in capsys.readouterr().err
+
+
+def test_a_record_with_no_digest_at_all_is_still_checked(recorded, repo, capsys):
+    """Absence of a hash used to be read as permission to proceed."""
+    path, _ = recorded()
+    case = write_case(repo, ANSWER_KEY)
+    record = json.loads(path.read_text())
+    del record["inputs"]["plan"]["sha256"]
+    record["inputs"]["plan"]["content"] = "# A completely different plan\n"
+    path.write_text(json.dumps(record))
+    capsys.readouterr()
+
+    assert main(["eval", "score", str(case), "--record", str(path)]) == EXIT_USAGE
+    assert "recorded from a different plan" in capsys.readouterr().err
+
+
+# ── Binding a record to the tree its evidence came from ──────────────────────
+
+
+def _case_with_repo(repo, contents: str):
+    case = write_case(repo, ANSWER_KEY)
+    (case / "repo").mkdir(exist_ok=True)
+    (case / "repo" / "app.py").write_text(contents)
+    return case
+
+
+def test_a_case_shipping_a_repo_requires_a_matching_workspace(recorded, repo, capsys):
+    path, _ = recorded()
+    case = _case_with_repo(repo, "def total(items):\n    return sum(items)\n")
+    capsys.readouterr()
+
+    assert main(["eval", "score", str(case), "--record", str(path), "--json"]) == EXIT_PASS
+
+
+def test_a_record_from_another_tree_is_refused(recorded, repo, capsys):
+    """Same plan, same diff, different code — so the cited test could pass in
+    one tree and fail in the other, and the answer key means nothing here."""
+    path, _ = recorded()
+    case = _case_with_repo(repo, "def total(items):\n    return 0  # not the same code\n")
+    capsys.readouterr()
+
+    assert main(["eval", "score", str(case), "--record", str(path)]) == EXIT_USAGE
+    assert "ran against a different tree" in capsys.readouterr().err
+
+
+def test_a_record_without_workspace_identity_cannot_be_bound_to_a_repo(recorded, repo, capsys):
+    path, _ = recorded()
+    record = json.loads(path.read_text())
+    record.pop("workspace", None)
+    record["schema_version"] = 1
+    path.write_text(json.dumps(record))
+    case = _case_with_repo(repo, "def total(items):\n    return sum(items)\n")
+    capsys.readouterr()
+
+    assert main(["eval", "score", str(case), "--record", str(path)]) == EXIT_USAGE
+    assert "no workspace identity" in capsys.readouterr().err
