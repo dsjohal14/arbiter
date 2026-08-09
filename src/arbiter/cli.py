@@ -302,8 +302,7 @@ async def _extract_acceptance_criteria(
         if trace is not None:
             trace.failure("extractor", session, e)
         raise
-    obj = verify.extract_json(resp.content) or {}
-    return crit.number([str(c) for c in obj.get("criteria") or []])
+    return crit.parse_extraction(resp.content)
 
 
 def _finish_record(

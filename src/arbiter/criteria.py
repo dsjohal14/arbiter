@@ -134,6 +134,18 @@ EXTRACTION_SCHEMA = {
 }
 
 
+def parse_extraction(raw: str) -> list[Criterion]:
+    """Read an extractor's reply into a numbered contract.
+
+    Shared by the live extraction step and by `replay`, so a recorded extractor
+    response produces exactly the criteria the original run worked from.
+    """
+    from .verify import extract_json
+
+    obj = extract_json(raw) or {}
+    return number([str(c) for c in obj.get("criteria") or []])
+
+
 def build_extraction_prompt(plan_text: str) -> str:
     return f"""Extract the acceptance criteria from this implementation plan.
 
