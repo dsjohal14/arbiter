@@ -103,7 +103,6 @@ def recorded(repo, shim_path):
     return run
 
 
-
 def write_case(repo, expected, *, plan=PINNED_PLAN, diff=DIFF):
     case = repo / "case"
     case.mkdir(exist_ok=True)
