@@ -305,10 +305,16 @@ arbiter verify --plan plan.md --diff origin/main...HEAD \
 
 The record embeds the exact plan and diff with SHA-256 digests, normalized
 configuration, every extractor/reviewer/consolidator final response or failure,
-per-call token counts and cost where the provider reports them, the final
-result, timing, and exit code. `schema_version` makes the format an explicit
-compatibility boundary. Provider command lines, session IDs, environment
-variables, and the value of a custom test command are not serialized.
+per-call token counts and cost where the provider reports them, evidence and
+blinding observations, the final result, timing, and exit code. Verify records
+also hash every Git-visible file in the working tree (or every file in a
+non-Git tree except standard test/cache artifacts) so eval scoring can bind the
+result to unchanged tests, fixtures, helpers, and imports as well as files named
+by the diff. Files are hashed as raw bytes with bounded, streaming reads; file
+contents are not copied into the record. `schema_version` makes the format an
+explicit compatibility boundary.
+Provider command lines, session IDs, environment variables, and the value of a
+custom test command are not serialized.
 
 Token counts are normalized across providers (`input_tokens`, `output_tokens`,
 `cached_input_tokens`, `cache_write_tokens`, `reasoning_tokens`, `total_tokens`,
@@ -322,6 +328,14 @@ Run records are opt-in because they are **sensitive**: plans, diffs, provider
 responses, and error text can contain proprietary code or secrets. The files are
 created with owner-only permissions and `.arbiter/runs/` is ignored in this repo;
 add the same path to the target project's `.gitignore` before using it there.
+
+A record is not signed and is not an authenticity proof. `replay --check`
+means current deterministic logic reproduced the expected output from the
+recorded inputs; someone who rewrites the inputs and expected output together
+can forge that claim. Runtime provenance is also not yet bound: the record keeps
+whether a custom runner and scrubbed environment were used, but not the runner
+command, interpreter, installed dependencies, or operating-system state. Run
+eval corpora in a controlled environment when comparing measurements.
 
 ### `arbiter replay` — the same verdict, for nothing
 
@@ -347,18 +361,21 @@ done
 The comparison is **exhaustive**, not a summary: every field of the result is
 compared, so a changed finding severity, a rewritten proposed criterion, or a
 dropped citation is drift even when the verdict and every criterion status hold.
+Evidence checks and the blinding map are stored separately as replay inputs, so
+their corresponding result fields are covered by that comparison too.
 
 What replay does **not** do is re-check evidence. Whether a cited line exists or
-a cited test passes is a fact about a working tree, and a record does not pin
-one — those checks are restored from the record and the downgrade rules applied
-to them again. Replay answers "does today's logic reach the recorded verdict from
-the recorded responses?", not "is that verdict still true of this repo today".
+a cited test passes is a fact about a working tree. Those observations are
+restored from the record and the downgrade rules applied to them again. The
+workspace digest can bind eval scoring to the same tree, but it cannot recreate
+the tree or re-run the test. Replay answers "does today's logic reach the
+recorded verdict from the recorded responses?", not "is that verdict still true
+of this repo today".
 
-That has one consequence worth knowing: restored evidence is an *input* to the
-replay, so `--check` cannot compare it directly. Tampering with a check still
-shows up through the status the downgrade rules then produce — except for
-`evidence_source`, which is copied wholesale because the base-revision worktree
-that settled it no longer exists.
+Record schemas v1 and v2 stored those replay inputs inside the result itself.
+They remain readable for zero-cost replay, but cannot pass `--check`: only v3+
+can certify that the independently restored inputs reproduce the expected
+output exactly.
 
 ### `arbiter eval` — how often is it right?
 
