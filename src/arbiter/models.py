@@ -85,6 +85,10 @@ class Provider:
     accepts_stdin_prompt: bool = True
     # Does its stream carry token counts we know how to read?
     reports_usage: bool = False
+    # Is this one of the providers a bare `arbiter verify` reaches for, and that
+    # `arbiter doctor` reports on without being asked? False means supported but
+    # opt-in: still selectable by name, never assumed.
+    default_panel: bool = True
 
 
 PROVIDERS: dict[str, Provider] = {
@@ -123,6 +127,11 @@ PROVIDERS: dict[str, Provider] = {
         # because nothing here has seen one. Claiming otherwise would put a
         # guessed shape into run records.
         reports_usage=False,
+        # Opt-in: it is the weakest panel member (no structured output, no config
+        # isolation), and its CLI blocks on an interactive login that a headless
+        # run cannot answer — which turns a default run into a timeout rather
+        # than a verdict. Still fully supported via `--models gemini`.
+        default_panel=False,
     ),
     "antigravity": Provider(
         key="antigravity",
@@ -145,6 +154,11 @@ PROVIDERS: dict[str, Provider] = {
 }
 
 VALID_MODELS = set(PROVIDERS)
+
+# What `arbiter verify` and `arbiter doctor` reach for when not told otherwise.
+# The rest stay selectable by name; nothing here removes a provider.
+DEFAULT_PANEL = tuple(k for k, p in PROVIDERS.items() if p.default_panel)
+OPT_IN_PROVIDERS = tuple(k for k in PROVIDERS if k not in DEFAULT_PANEL)
 
 
 # ── Session + response envelopes ─────────────────────────────────────────────

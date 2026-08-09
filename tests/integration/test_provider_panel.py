@@ -1,4 +1,9 @@
-"""Which providers run, end to end through `main()`."""
+"""Which providers run, and what a run costs.
+
+Two behaviours that only show up end to end: the default panel adapting to what
+is actually installed, and a CLI that blocks on an interactive question being
+diagnosed as that rather than as a slow model.
+"""
 
 from __future__ import annotations
 
@@ -8,8 +13,9 @@ import sys
 import pytest
 
 from arbiter.cli import main
-from arbiter.verify import EXIT_PASS, EXIT_RUNTIME
-from conftest import agy_events, claude_events, gemini_events
+from arbiter.models import DEFAULT_PANEL, OPT_IN_PROVIDERS
+from arbiter.verify import EXIT_PASS, EXIT_RUNTIME, EXIT_UNCLEAR, EXIT_USAGE
+from conftest import agy_events, claude_events, codex_events, gemini_events
 
 PYTEST = f"{sys.executable} -m pytest"
 
@@ -120,6 +126,96 @@ def test_a_provider_reporting_no_usage_records_null_not_zero(repo, shim_path):
 
     calls = json.loads(record.read_text())["provider_calls"]
     assert calls and all(call["usage"] is None for call in calls)
+
+
+# ── The default panel ────────────────────────────────────────────────────────
+
+
+ALL_SHIMMED = {
+    "claude": claude_events(REPORT),
+    "codex": codex_events(REPORT),
+    "gemini": gemini_events(REPORT),
+    "agy": agy_events(REPORT),
+}
+
+
+def test_the_default_panel_is_the_default_providers_that_are_installed(repo, shim_path, capsys):
+    shim_path(per_provider=ALL_SHIMMED)
+
+    code = _verify("--json")
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == EXIT_PASS
+    assert sorted(payload["reviewers"]) == sorted(DEFAULT_PANEL)
+
+
+def test_an_opt_in_provider_stays_off_the_panel_even_when_installed(repo, shim_path, capsys):
+    """Installed is not the same as wanted. Gemini answers here and still must
+    not be reviewing anything nobody asked it to review."""
+    shim_path(per_provider=ALL_SHIMMED)
+
+    _verify("--json")
+    payload = json.loads(capsys.readouterr().out)
+
+    for key in OPT_IN_PROVIDERS:
+        assert key not in payload["reviewers"]
+        assert key not in payload["failed_reviewers"]
+
+
+def test_an_opt_in_provider_still_works_when_you_name_it(repo, shim_path, capsys):
+    """Opt-in means not assumed, not unsupported."""
+    shim_path(per_provider=ALL_SHIMMED)
+
+    code = _verify("--models", "gemini", "--judge", "claude", "--json")
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == EXIT_PASS
+    assert payload["reviewers"] == ["gemini"]
+
+
+def test_a_provider_that_is_not_installed_is_named_and_skipped(repo, shim_path, capsys):
+    """Before this, the default panel was every known provider, so the ones you
+    had never installed each failed a call and turned every default run
+    unclear — which is what adding a fourth provider would have done to everyone."""
+    shim_path(
+        per_provider={"claude": claude_events(REPORT), "codex": codex_events(REPORT)},
+        installed=("claude", "codex"),
+    )
+
+    code = _verify("--json")
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert code == EXIT_PASS
+    assert sorted(payload["reviewers"]) == ["claude", "codex"]
+    assert payload["failed_reviewers"] == []
+    assert "not on this panel" in captured.err
+    assert "antigravity" in captured.err
+    # An opt-in provider is absent by choice, not by accident; nagging about it
+    # on every run would train the user to ignore the line.
+    assert "gemini" not in captured.err
+
+
+def test_naming_a_provider_you_do_not_have_still_fails_loudly(repo, shim_path, capsys):
+    """A reviewer you asked for and did not get is a missing opinion, so the
+    verdict must not be a clean pass."""
+    shim_path(per_provider={"claude": claude_events(REPORT)}, installed=("claude",))
+
+    code = _verify("--models", "claude,antigravity", "--judge", "claude", "--json")
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == EXIT_UNCLEAR
+    assert payload["failed_reviewers"] == ["antigravity"]
+
+
+def test_no_provider_at_all_is_a_usage_error(repo, monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+
+    assert _verify() == EXIT_USAGE
+    err = capsys.readouterr().err
+    assert "No default provider CLI found" in err
+    # Name what to install, not every provider that exists.
+    assert all(k in err for k in DEFAULT_PANEL)
 
 
 # ── Diagnosing a CLI that is waiting for a human ─────────────────────────────

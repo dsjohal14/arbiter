@@ -17,7 +17,14 @@ import shutil
 from dataclasses import dataclass, field
 
 from . import display
-from .models import PROVIDERS, ModelCallError, Provider, make_session
+from .models import (
+    DEFAULT_PANEL,
+    OPT_IN_PROVIDERS,
+    PROVIDERS,
+    ModelCallError,
+    Provider,
+    make_session,
+)
 
 INSTALL_HINTS = {
     "claude": "https://code.claude.com",
@@ -108,7 +115,13 @@ async def _probe(sess) -> None:
 
 
 async def run_doctor(keys: list[str] | None = None, probe: bool = True) -> list[ProviderHealth]:
-    keys = keys or sorted(PROVIDERS)
+    """Check the default panel, or exactly the providers named.
+
+    Opt-in providers are left out unless asked for: probing one costs a real
+    call, and a provider you have chosen not to use failing its health check
+    should not be what makes `arbiter doctor` exit non-zero.
+    """
+    keys = keys or sorted(DEFAULT_PANEL)
     return list(await asyncio.gather(*[check_provider(k, probe) for k in keys]))
 
 
@@ -142,4 +155,13 @@ def render(results: list[ProviderHealth]) -> None:
         )
     else:
         display.print_note("All providers ready.")
+
+    # Say what was not looked at, so "supported but opt-in" never reads as
+    # "dropped". Only when this run actually skipped them.
+    checked = {h.key for h in results}
+    if skipped := [k for k in OPT_IN_PROVIDERS if k not in checked]:
+        display.print_note(
+            f"Not checked (opt-in): {', '.join(skipped)}. "
+            "Use --all, or name it with --models to use it."
+        )
     display.print()

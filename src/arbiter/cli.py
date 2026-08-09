@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import shutil
 import sys
 from pathlib import Path
 from typing import NoReturn
@@ -29,7 +30,9 @@ from . import criteria as crit
 from . import display, doctor, evals, plan_review, replay, run_records, verify
 from .debate import run_debate, run_followup_loop
 from .models import (
+    DEFAULT_PANEL,
     DEFAULT_TIMEOUT,
+    OPT_IN_PROVIDERS,
     PROVIDERS,
     VALID_MODELS,
     IsolationMode,
@@ -51,6 +54,10 @@ from .verify import (
     make_verify_sessions,
 )
 
+# Preferred consolidator when it is installed: it is the one provider with both
+# structured output and full config isolation.
+DEFAULT_JUDGE = "claude"
+
 
 def _add_output_flags(p: argparse.ArgumentParser) -> None:
     """For commands that call no models: they need the output flags and nothing
@@ -68,16 +75,18 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "-m",
         "--models",
-        default=",".join(sorted(VALID_MODELS)),
+        default=None,
         metavar="LIST",
-        help="Comma-separated providers (default: all installed)",
+        help=f"Comma-separated providers (default: whichever of "
+        f"{', '.join(sorted(DEFAULT_PANEL))} are installed; "
+        f"{', '.join(sorted(OPT_IN_PROVIDERS))} must be named)",
     )
     p.add_argument(
         "-j",
         "--judge",
-        default="claude",
+        default=None,
         metavar="MODEL",
-        help="Arbiter/consolidator provider (default: claude)",
+        help=f"Arbiter/consolidator provider (default: {DEFAULT_JUDGE} if installed)",
     )
     p.add_argument(
         "--timeout",
@@ -248,6 +257,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--no-probe", action="store_true", help="Check PATH only; skip the live authentication call"
     )
     doc.add_argument(
+        "--all",
+        dest="check_all",
+        action="store_true",
+        help=f"Also check opt-in providers ({', '.join(sorted(OPT_IN_PROVIDERS))})",
+    )
+    doc.add_argument(
         "--json", dest="as_json", action="store_true", help="Emit a machine-readable JSON report"
     )
 
@@ -265,22 +280,52 @@ def _usage_error(msg: str) -> NoReturn:
     raise SystemExit(EXIT_USAGE)
 
 
-def _resolve_models(spec: str, judge: str) -> tuple[list[str], str]:
+def _installed_providers(panel_only: bool = False) -> list[str]:
+    candidates = sorted(DEFAULT_PANEL) if panel_only else sorted(VALID_MODELS)
+    return [k for k in candidates if shutil.which(PROVIDERS[k].cli)]
+
+
+def _resolve_models(spec: str | None, judge: str | None) -> tuple[list[str], str]:
     """Validate provider names. Unknown names are a usage error, not silently
-    dropped — `--models claude,gpt4` used to run a one-model 'debate'."""
-    keys, unknown = [], []
-    for raw in spec.split(","):
-        name = raw.strip().lower()
-        if not name:
-            continue
-        (keys if name in VALID_MODELS else unknown).append(name)
+    dropped — `--models claude,gpt4` used to run a one-model 'debate'.
 
+    With no `--models`, the panel is the default providers that are actually on
+    PATH, and the ones that are not are named rather than sent to fail one by
+    one. Ask for a provider explicitly and it stays strict: a reviewer you
+    requested and did not get is a missing opinion, and the verdict has to know
+    that. An opt-in provider is only ever on the panel because you named it.
+    """
     valid = ", ".join(sorted(VALID_MODELS))
-    if unknown:
-        _usage_error(f"unknown provider(s): {', '.join(unknown)}. Choose from: {valid}")
-    if not keys:
-        _usage_error(f"no providers selected. Choose from: {valid}")
 
+    if spec is None:
+        keys = _installed_providers(panel_only=True)
+        if not keys:
+            _usage_error(
+                f"No default provider CLI found on PATH. Install one of: "
+                f"{', '.join(sorted(DEFAULT_PANEL))}. Run 'arbiter doctor' for install hints."
+            )
+        if missing := [k for k in sorted(DEFAULT_PANEL) if k not in keys]:
+            display.print_note(
+                f"Not installed, so not on this panel: {', '.join(missing)}. "
+                "Name them with --models to require them."
+            )
+    else:
+        keys, unknown = [], []
+        for raw in spec.split(","):
+            name = raw.strip().lower()
+            if not name:
+                continue
+            (keys if name in VALID_MODELS else unknown).append(name)
+        if unknown:
+            _usage_error(f"unknown provider(s): {', '.join(unknown)}. Choose from: {valid}")
+        if not keys:
+            _usage_error(f"no providers selected. Choose from: {valid}")
+
+    if judge is None:
+        # The consolidator is degradable — losing it costs precision, not the
+        # run — so an absent default judge picks a peer rather than failing.
+        installed = _installed_providers(panel_only=True)
+        judge = DEFAULT_JUDGE if DEFAULT_JUDGE in installed else (installed or keys)[0]
     judge = judge.strip().lower()
     if judge not in VALID_MODELS:
         _usage_error(f"unknown judge '{judge}'. Choose from: {valid}")
@@ -811,7 +856,8 @@ async def cmd_debate(args: argparse.Namespace) -> int:
 
 
 async def cmd_doctor(args: argparse.Namespace) -> int:
-    results = await doctor.run_doctor(sorted(PROVIDERS), probe=not args.no_probe)
+    keys = sorted(PROVIDERS) if args.check_all else sorted(DEFAULT_PANEL)
+    results = await doctor.run_doctor(keys, probe=not args.no_probe)
     if args.as_json:
         json.dump([h.as_dict() for h in results], sys.stdout, indent=2)
         sys.stdout.write("\n")
