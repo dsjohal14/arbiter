@@ -479,31 +479,20 @@ def parse_review(raw: str, criteria: list[Criterion]) -> tuple[dict[str, dict], 
 # ── Mechanical checking ───────────────────────────────────────────────────────
 
 
-def apply_evidence_checks(
+def gather_evidence(
     result: CriterionResult,
     root: Path | None = None,
     test_command: list[str] | None = None,
     run_tests: bool = True,
     scrub_env: bool = True,
-    require_pinned_evidence: bool = False,
     base_ref: str | None = None,
     base_dir: Path | None = None,
-    require_discriminating_tests: bool = False,
 ) -> CriterionResult:
-    """Check the cited evidence and let facts override the reviewer.
+    """Touch the filesystem: resolve cited lines and run cited tests.
 
-    A status is only ever lowered here, never raised: the reviewer's word is a
-    ceiling and reality brings it down. This is what stops a confident assertion —
-    or an injected one — from producing a pass on its own.
-
-    IMPORTANT LIMIT: running a cited test proves the test passes, not that it
-    exercises this criterion. A reviewer can cite any green test in the repo. So
-    a plan-selected citation records a human assertion, not a mechanical proof.
-    With `require_pinned_evidence`, a model-chosen test cannot reach `met`, and a
-    plan-selected test changed by this diff requires renewed human approval.
+    Split from the downgrade rules below so `replay` can re-derive a verdict from
+    evidence checks that were recorded earlier, without re-running anything.
     """
-    original = result.status
-
     if result.implementation_evidence:
         result.impl_check = check_file_citation(result.implementation_evidence, root)
     if result.test_evidence:
@@ -516,6 +505,25 @@ def apply_evidence_checks(
         result.baseline_check = check_test_discriminates(
             result.test_evidence, root or Path.cwd(), base_ref, test_command, scrub_env, base_dir
         )
+    return result
+
+
+def apply_downgrades(
+    result: CriterionResult,
+    require_pinned_evidence: bool = False,
+    require_discriminating_tests: bool = False,
+) -> CriterionResult:
+    """Let the checked facts override the reviewer.
+
+    A status is only ever lowered here, never raised: the reviewer's word is a
+    ceiling and reality brings it down. This is what stops a confident assertion —
+    or an injected one — from producing a pass on its own.
+
+    Pure in `result`: it reads the evidence checks already attached to it and
+    changes nothing on disk, so replaying a recorded run reaches the same verdict
+    the original did.
+    """
+    original = result.status
 
     def downgrade(to: str, why: str) -> None:
         if STATUSES.index(to) < STATUSES.index(result.status):
@@ -568,6 +576,29 @@ def apply_evidence_checks(
             )
 
     return result
+
+
+def apply_evidence_checks(
+    result: CriterionResult,
+    root: Path | None = None,
+    test_command: list[str] | None = None,
+    run_tests: bool = True,
+    scrub_env: bool = True,
+    require_pinned_evidence: bool = False,
+    base_ref: str | None = None,
+    base_dir: Path | None = None,
+    require_discriminating_tests: bool = False,
+) -> CriterionResult:
+    """Check this criterion's cited evidence, then let the facts override it.
+
+    IMPORTANT LIMIT: running a cited test proves the test passes, not that it
+    exercises this criterion. A reviewer can cite any green test in the repo. So
+    a plan-selected citation records a human assertion, not a mechanical proof.
+    With `require_pinned_evidence`, a model-chosen test cannot reach `met`, and a
+    plan-selected test changed by this diff requires renewed human approval.
+    """
+    gather_evidence(result, root, test_command, run_tests, scrub_env, base_ref, base_dir)
+    return apply_downgrades(result, require_pinned_evidence, require_discriminating_tests)
 
 
 # ── Verdict ───────────────────────────────────────────────────────────────────
@@ -682,6 +713,71 @@ def refresh_plan_selected_evidence(
             result.evidence_source = "plan_selected"
 
 
+def assemble_criteria_results(
+    criteria: list[Criterion],
+    reports: list[tuple[str, str]],
+    consolidated_raw: str | None,
+    diff_paths: set[str] | None = None,
+    new_paths: set[str] | None = None,
+) -> tuple[list[CriterionResult], list[Finding]]:
+    """Turn raw reviewer text into one row per criterion, before any evidence check.
+
+    Pure: no provider calls and no filesystem access, so `replay` reaches exactly
+    the same rows from recorded output that the original run reached live.
+    `consolidated_raw` is None when consolidation failed; the per-reviewer
+    fallback in `_merge` then decides each row.
+    """
+    per_reviewer: list[dict[str, dict]] = []
+    findings: list[Finding] = []
+    for _, text in reports:
+        assessed, found = parse_review(text, criteria)
+        per_reviewer.append(assessed)
+        findings.extend(found)
+
+    consolidated: dict[str, dict] = {}
+    if consolidated_raw is not None:
+        consolidated, merged_findings = parse_review(consolidated_raw, criteria)
+        if merged_findings:
+            findings = merged_findings
+
+    return _merge(criteria, consolidated, per_reviewer, diff_paths, new_paths), findings
+
+
+def finalize_verify(
+    results: list[CriterionResult],
+    findings: list[Finding],
+    completed: list[str],
+    failed: list[str],
+    blinding: Blinding | None,
+    require_tests: bool = False,
+    require_pinned_evidence: bool = False,
+) -> VerifyResult:
+    """Order the rows, drop duplicate findings, and roll up the verdict."""
+    results.sort(key=lambda r: (STATUSES.index(r.status), r.id))
+
+    seen: set[tuple[str, str]] = set()
+    deduped: list[Finding] = []
+    for f in findings:
+        key = (f.claim, f.evidence)
+        if key not in seen:
+            seen.add(key)
+            deduped.append(f)
+
+    return VerifyResult(
+        status=derive_verdict(
+            results,
+            require_tests,
+            quorum_met=not failed,
+            require_pinned_evidence=require_pinned_evidence,
+        ),
+        criteria=results,
+        findings=sorted(deduped, key=lambda f: SEVERITIES.index(f.severity)),
+        blinding=blinding,
+        reviewers=completed,
+        failed_reviewers=failed,
+    )
+
+
 async def run_verify(
     plan: str,
     diff: str,
@@ -729,13 +825,6 @@ async def run_verify(
                 "The verdict cannot be a clean pass."
             )
 
-        per_reviewer: list[dict[str, dict]] = []
-        findings: list[Finding] = []
-        for _, text in reports:
-            assessed, found = parse_review(text, criteria)
-            per_reviewer.append(assessed)
-            findings.extend(found)
-
         # Blind reviewer identity before consolidation, for the same reason the
         # debate judge is blinded: a model should not know it is grading itself.
         blinded, blinding = blind(reports, seed=seed)
@@ -747,7 +836,7 @@ async def run_verify(
             if verbose:
                 display.print_verbose_cmd(cmd)
 
-        consolidated: dict[str, dict] = {}
+        consolidated_raw: str | None = None
         try:
             resp = await call_session(
                 consolidator,
@@ -758,15 +847,15 @@ async def run_verify(
             )
             if verbose:
                 display.print_timing(consolidator_name, resp.duration)
-            consolidated, merged_findings = parse_review(resp.content, criteria)
-            if merged_findings:
-                findings = merged_findings
+            consolidated_raw = resp.content
         except ModelCallError as e:
             # Consolidation reconciles; it is not the source of truth. Losing it
             # costs precision and must not cost the whole run.
             display.print_error(f"consolidation failed, using reviewer verdicts: {e}")
 
-        results = _merge(criteria, consolidated, per_reviewer, diff_paths, new_paths)
+        results, findings = assemble_criteria_results(
+            criteria, reports, consolidated_raw, diff_paths, new_paths
+        )
 
     display.print_section("evidence check")
     display.print_note(
@@ -798,28 +887,14 @@ async def run_verify(
                 require_discriminating_tests,
             )
 
-    results.sort(key=lambda r: (STATUSES.index(r.status), r.id))
-
-    seen: set[tuple[str, str]] = set()
-    deduped: list[Finding] = []
-    for f in findings:
-        key = (f.claim, f.evidence)
-        if key not in seen:
-            seen.add(key)
-            deduped.append(f)
-
-    return VerifyResult(
-        status=derive_verdict(
-            results,
-            require_tests,
-            quorum_met=not failed,
-            require_pinned_evidence=require_pinned_evidence or require_discriminating_tests,
-        ),
-        criteria=results,
-        findings=sorted(deduped, key=lambda f: SEVERITIES.index(f.severity)),
-        blinding=blinding,
-        reviewers=completed,
-        failed_reviewers=failed,
+    return finalize_verify(
+        results,
+        findings,
+        completed,
+        failed,
+        blinding,
+        require_tests=require_tests,
+        require_pinned_evidence=require_pinned_evidence or require_discriminating_tests,
     )
 
 
