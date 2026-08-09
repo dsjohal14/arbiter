@@ -18,7 +18,7 @@ import json
 import time
 import uuid
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Literal
 
 # asyncio.StreamReader defaults to a 64 KiB line limit. Claude emits its entire
@@ -82,6 +82,8 @@ class Provider:
     # diff exceeds what execve will carry, so a provider that insists on argv
     # has a size ceiling the others do not.
     accepts_stdin_prompt: bool = True
+    # Does its stream carry token counts we know how to read?
+    reports_usage: bool = False
 
 
 PROVIDERS: dict[str, Provider] = {
@@ -93,6 +95,7 @@ PROVIDERS: dict[str, Provider] = {
         output_schema_flag="--json-schema",
         readonly_flags=("--permission-mode", "plan"),
         isolate_flags=("--safe-mode", "--strict-mcp-config"),
+        reports_usage=True,
     ),
     "codex": Provider(
         key="codex",
@@ -105,6 +108,7 @@ PROVIDERS: dict[str, Provider] = {
         # NOT --ephemeral: it stops codex persisting session files, which breaks
         # `codex exec resume` and therefore multi-round debate and follow-ups.
         isolate_flags=("--ignore-user-config",),
+        reports_usage=True,
     ),
     "gemini": Provider(
         key="gemini",
@@ -114,6 +118,10 @@ PROVIDERS: dict[str, Provider] = {
         output_schema_flag=None,  # no structured-output support
         readonly_flags=("--approval-mode", "plan"),
         isolate_flags=(),  # no equivalent
+        # Its stream-json result may well carry counts; nothing here parses them
+        # because nothing here has seen one. Claiming otherwise would put a
+        # guessed shape into run records.
+        reports_usage=False,
     ),
     "antigravity": Provider(
         key="antigravity",
@@ -131,6 +139,7 @@ PROVIDERS: dict[str, Provider] = {
         # `--print` requires its value in argv; a bare `--print` swallows the
         # next flag as the prompt. Verified against agy 1.1.11.
         accepts_stdin_prompt=False,
+        reports_usage=True,
     ),
 }
 
@@ -165,12 +174,95 @@ class Session:
 
 
 @dataclass
+class Usage:
+    """What one call consumed, normalized across providers.
+
+    Every field is optional because no two CLIs report the same set, and a
+    missing count must stay distinguishable from a zero one. `total_tokens` and
+    `cost_usd` are only ever the provider's own figures — summing the parts
+    ourselves would invent a number whose billing meaning we do not know.
+    """
+
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cached_input_tokens: int | None = None  # served from cache
+    cache_write_tokens: int | None = None  # written to cache, billed separately
+    reasoning_tokens: int | None = None  # thinking/reasoning, where reported
+    total_tokens: int | None = None
+    cost_usd: float | None = None
+
+    @property
+    def empty(self) -> bool:
+        return all(getattr(self, f.name) is None for f in fields(self))
+
+    def as_dict(self) -> dict:
+        return {f.name: getattr(self, f.name) for f in fields(self)}
+
+
+def _int(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _float(value: object) -> float | None:
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def parse_usage(cli: str, obj: dict) -> Usage | None:
+    """Read one provider's token counts off the event that carries them.
+
+    Shapes confirmed by probing each CLI, and pinned by fixture tests for the
+    same reason `_parse_event` is: a provider that renames a field should show
+    up as a red test, not as a run record full of nulls.
+
+      claude: result.usage{input_tokens, output_tokens,
+              cache_creation_input_tokens, cache_read_input_tokens}
+              plus result.total_cost_usd
+      codex : turn.completed.usage{input_tokens, cached_input_tokens,
+              output_tokens, reasoning_output_tokens}
+      agy   : result.result.usage{input_tokens, output_tokens, thinking_tokens,
+              cache_read_tokens, total_tokens}
+    """
+    usage = obj.get("usage")
+    if not isinstance(usage, dict):
+        return None
+
+    if cli == "claude":
+        out = Usage(
+            input_tokens=_int(usage.get("input_tokens")),
+            output_tokens=_int(usage.get("output_tokens")),
+            cached_input_tokens=_int(usage.get("cache_read_input_tokens")),
+            cache_write_tokens=_int(usage.get("cache_creation_input_tokens")),
+            cost_usd=_float(obj.get("total_cost_usd")),
+        )
+    elif cli == "codex":
+        out = Usage(
+            input_tokens=_int(usage.get("input_tokens")),
+            output_tokens=_int(usage.get("output_tokens")),
+            cached_input_tokens=_int(usage.get("cached_input_tokens")),
+            reasoning_tokens=_int(usage.get("reasoning_output_tokens")),
+        )
+    elif cli == "agy":
+        out = Usage(
+            input_tokens=_int(usage.get("input_tokens")),
+            output_tokens=_int(usage.get("output_tokens")),
+            cached_input_tokens=_int(usage.get("cache_read_tokens")),
+            reasoning_tokens=_int(usage.get("thinking_tokens")),
+            total_tokens=_int(usage.get("total_tokens")),
+        )
+    else:
+        return None
+
+    return None if out.empty else out
+
+
+@dataclass
 class ModelResponse:
     model: str
     content: str
     session_id: str | None = None
     duration: float = 0.0
     cmd: list[str] = field(default_factory=list)
+    usage: Usage | None = None
 
 
 def make_session(
@@ -363,20 +455,21 @@ def _unwrap_provider_error(msg: object) -> str:
 
 
 def _parse_event(cli: str, obj: dict) -> list[tuple[str, object]]:
-    """Map one JSON event to ('session' | 'delta' | 'done' | 'error') pairs.
+    """Map one JSON event to ('session' | 'delta' | 'done' | 'error' | 'usage')
+    pairs.
 
     Shapes confirmed by probing each CLI, and pinned by fixture tests so a
     provider schema change shows up as a red test rather than an empty answer.
 
       claude: system/init -> session_id; stream_event content_block_delta -> text;
-              result -> final text + session_id
+              result -> final text + session_id + usage
       codex : thread.started -> thread_id; item.completed/agent_message -> text;
-              turn.completed -> done
+              turn.completed -> done + usage
       gemini: init -> session_id; message(role=assistant) -> incremental content;
               result -> done
       agy   : keyed on `event`, not `type`. init -> conversation_id;
               step_update/agent_response -> text_delta;
-              result -> final response + conversation_id
+              result -> final response + conversation_id + usage
     """
     out: list[tuple[str, object]] = []
     t = obj.get("type")
@@ -398,6 +491,8 @@ def _parse_event(cli: str, obj: dict) -> list[tuple[str, object]]:
                 out.append(("done", obj.get("result")))
             if obj.get("session_id"):
                 out.append(("session", obj["session_id"]))
+            if (usage := parse_usage(cli, obj)) is not None:
+                out.append(("usage", usage))
 
     elif cli == "codex":
         if t == "thread.started":
@@ -411,6 +506,8 @@ def _parse_event(cli: str, obj: dict) -> list[tuple[str, object]]:
                 out.append(("delta", item.get("text", "")))
         elif t == "turn.completed":
             out.append(("done", None))
+            if (usage := parse_usage(cli, obj)) is not None:
+                out.append(("usage", usage))
         elif t in ("error", "turn.failed"):
             msg = obj.get("message") or (obj.get("error") or {}).get("message")
             out.append(("error", _unwrap_provider_error(msg)))
@@ -452,6 +549,8 @@ def _parse_event(cli: str, obj: dict) -> list[tuple[str, object]]:
                 )
             if result.get("conversation_id"):
                 out.append(("session", result["conversation_id"]))
+            if (usage := parse_usage(cli, result)) is not None:
+                out.append(("usage", usage))
 
     return out
 
@@ -501,6 +600,7 @@ async def _consume(
     final: str | None = None
     captured_sid: str | None = None
     provider_error: str | None = None
+    usage: Usage | None = None
 
     async for raw in proc.stdout:
         line = raw.decode(errors="replace").strip()
@@ -521,6 +621,8 @@ async def _consume(
                 final = str(payload)
             elif kind == "error" and payload:
                 provider_error = str(payload)
+            elif kind == "usage" and isinstance(payload, Usage):
+                usage = payload
 
     await proc.wait()
     stderr = (await stderr_task).decode(errors="replace").strip()
@@ -549,6 +651,7 @@ async def _consume(
         session_id=sess.session_id,
         duration=time.monotonic() - start,
         cmd=cmd,
+        usage=usage,
     )
 
 

@@ -2,8 +2,9 @@
 
 Records are opt-in because they contain the plan, diff, and provider responses.
 They deliberately exclude subprocess commands, environment variables, and
-session identifiers. The format is the future replay API, so every document
-carries an explicit schema version from its first release.
+session identifiers. The format is the replay API — `replay.py` re-derives a
+verdict from nothing but one of these documents — so every record carries an
+explicit schema version, and a reader refuses a version it does not know.
 """
 
 from __future__ import annotations
@@ -56,7 +57,9 @@ class RunTrace:
                 "duration_ms": round(response.duration * 1000),
                 "content": response.content,
                 "error": None,
-                "usage": None,
+                # None where the provider reports nothing we can read, which is
+                # not the same as a call that consumed nothing.
+                "usage": response.usage.as_dict() if response.usage else None,
             }
         )
 

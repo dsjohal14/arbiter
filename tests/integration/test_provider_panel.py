@@ -9,7 +9,7 @@ import pytest
 
 from arbiter.cli import main
 from arbiter.verify import EXIT_PASS
-from conftest import agy_events
+from conftest import agy_events, gemini_events
 
 PYTEST = f"{sys.executable} -m pytest"
 
@@ -85,3 +85,38 @@ def test_antigravity_can_carry_a_whole_verification(repo, shim_path, capsys):
     assert code == EXIT_PASS
     assert payload["reviewers"] == ["antigravity"]
     assert payload["criteria"][0]["status"] == "met"
+
+
+# ── Token usage ──────────────────────────────────────────────────────────────
+
+
+def test_usage_reaches_the_run_record(repo, shim_path):
+    record = repo / "run.json"
+    shim_path(per_provider={"agy": agy_events(REPORT)})
+
+    _verify("--models", "antigravity", "--judge", "antigravity", "--record", str(record))
+
+    calls = json.loads(record.read_text())["provider_calls"]
+    assert calls, "nothing was recorded"
+    for call in calls:
+        assert call["usage"] == {
+            "input_tokens": 1200,
+            "output_tokens": 42,
+            "cached_input_tokens": 0,
+            "cache_write_tokens": None,
+            "reasoning_tokens": 7,
+            "total_tokens": 1242,
+            "cost_usd": None,
+        }
+
+
+def test_a_provider_reporting_no_usage_records_null_not_zero(repo, shim_path):
+    """Nothing measured and nothing consumed have to stay distinguishable, or a
+    cost report quietly averages in runs it knows nothing about."""
+    record = repo / "run.json"
+    shim_path(per_provider={"gemini": gemini_events(REPORT)})
+
+    _verify("--models", "gemini", "--judge", "gemini", "--record", str(record))
+
+    calls = json.loads(record.read_text())["provider_calls"]
+    assert calls and all(call["usage"] is None for call in calls)

@@ -78,6 +78,19 @@ async def test_an_oversized_prompt_still_goes_in_agy_argv(shim_path):
     assert cmd[2] == big
 
 
+async def test_usage_is_read_off_the_stream(shim_path):
+    shim_path(agy_events("ok", usage={"input_tokens": 10, "output_tokens": 2}))
+    resp = await call_session(make_session("antigravity", "antigravity"), "q")
+    assert resp.usage.input_tokens == 10
+    assert resp.usage.output_tokens == 2
+
+
+async def test_a_provider_reporting_nothing_leaves_usage_unset(shim_path):
+    shim_path(gemini_events("hi"))
+    resp = await call_session(make_session("gemini", "gemini"), "q")
+    assert resp.usage is None
+
+
 async def test_answer_larger_than_the_64kib_line_limit(shim_path):
     """asyncio.StreamReader defaults to a 64 KiB line limit, and claude emits
     its whole final answer as ONE JSON line. Any long answer used to raise

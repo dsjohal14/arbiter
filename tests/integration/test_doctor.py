@@ -52,8 +52,10 @@ def test_capabilities_are_reported_honestly_per_provider(key):
     if key == "gemini":
         assert "no structured output" in caps
         assert "inherits user config" in caps
+        assert "no token usage" in caps
     else:
         assert "structured output" in caps
+        assert "reports token usage" in caps
 
 
 def test_partial_isolation_does_not_read_as_full_isolation():

@@ -72,6 +72,7 @@ def describe_capabilities(p: Provider) -> list[str]:
     caps.append("pre-assigned session id" if p.preassigns_session else "provider-minted session id")
     if not p.accepts_stdin_prompt:
         caps.append("prompt must fit in argv (no stdin); very large diffs may not fit")
+    caps.append("reports token usage" if p.reports_usage else "no token usage reported")
     return caps
 
 
