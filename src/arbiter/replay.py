@@ -27,6 +27,10 @@ from .run_records import SCHEMA_VERSION
 
 REPLAYABLE_COMMANDS = ("verify", "plan review")
 
+# Every version this build can actually parse. v1 records lack `workspace`,
+# which only limits what an eval case can be bound to; they replay unchanged.
+SUPPORTED_RECORD_VERSIONS = (1, 2)
+
 
 class ReplayError(RuntimeError):
     """The record is unreadable, unsupported, or too incomplete to replay."""
@@ -49,12 +53,16 @@ def load_record(path: Path) -> dict:
         raise ReplayError(f"{path} is not a run record.")
 
     version = record.get("schema_version")
-    if not isinstance(version, int):
-        raise ReplayError(f"{path} has no schema_version; it is not a run record.")
-    if version > SCHEMA_VERSION:
+    # `True` is an int in Python, and a bool here means the field is not a
+    # version at all. An unknown *older* version is no more replayable than a
+    # newer one: there is no parser for it and no migration to run.
+    if not isinstance(version, int) or isinstance(version, bool):
+        raise ReplayError(f"{path} has no integer schema_version; it is not a run record.")
+    if version not in SUPPORTED_RECORD_VERSIONS:
+        known = ", ".join(f"v{v}" for v in SUPPORTED_RECORD_VERSIONS)
+        hint = " Upgrade arbiter to replay it." if version > SCHEMA_VERSION else ""
         raise ReplayError(
-            f"{path} uses record schema v{version}; this arbiter understands "
-            f"up to v{SCHEMA_VERSION}. Upgrade arbiter to replay it."
+            f"{path} uses record schema v{version}; this arbiter reads {known}.{hint}"
         )
 
     command = record.get("command")
@@ -190,11 +198,10 @@ def replay(record: dict) -> ReplayOutcome:
 
     if record["command"] == "verify":
         result = _replay_verify(record, criteria, reports, recorded, notes)
-        drift = _drift_verify(result, recorded) if recorded else []
     else:
         result = _replay_plan_review(record, criteria, reports, recorded)
-        drift = _drift_plan_review(result, recorded) if recorded else []
 
+    drift = _drift(result.as_dict(), recorded) if recorded else []
     return ReplayOutcome(record["command"], result, recorded, drift, notes)
 
 
@@ -298,47 +305,74 @@ def _replay_plan_review(
 # ── Drift ─────────────────────────────────────────────────────────────────────
 
 
-def _drift_verify(result: verify.VerifyResult, recorded: dict) -> list[str]:
-    drift: list[str] = []
-    if recorded.get("status") != result.status:
-        drift.append(f"verdict: recorded {recorded.get('status')}, replayed {result.status}")
+def _keyed(value: object) -> object:
+    """Make lists of identified objects comparable by identity, not position.
 
-    was = _recorded_rows(recorded)
-    now = {c.id: c for c in result.criteria}
-    for cid in sorted(set(was) | set(now)):
-        if cid not in was:
-            drift.append(f"{cid}: absent from the record, replayed {now[cid].status}")
-        elif cid not in now:
-            drift.append(f"{cid}: recorded {was[cid].get('status')}, absent from the replay")
-        elif was[cid].get("status") != now[cid].status:
-            drift.append(f"{cid}: recorded {was[cid].get('status')}, replayed {now[cid].status}")
-
-    before, after = len(recorded.get("ungrounded_findings") or []), len(result.findings)
-    if before != after:
-        drift.append(f"ungrounded findings: recorded {before}, replayed {after}")
-    return drift
+    A criterion that moves in the sort order because its status changed would
+    otherwise report as a difference in every field of two rows.
+    """
+    if isinstance(value, dict):
+        return {k: _keyed(v) for k, v in value.items()}
+    if isinstance(value, list):
+        if value and all(isinstance(item, dict) and item.get("id") for item in value):
+            return {str(item["id"]): _keyed(item) for item in value}
+        return [_keyed(item) for item in value]
+    return value
 
 
-def _drift_plan_review(result: plan_review.PlanReviewResult, recorded: dict) -> list[str]:
-    drift: list[str] = []
-    if bool(recorded.get("ready")) != result.ready:
-        drift.append(
-            f"readiness: recorded {'ready' if recorded.get('ready') else 'blocked'}, "
-            f"replayed {'ready' if result.ready else 'blocked'}"
-        )
+def _show(value: object) -> str:
+    text = "absent" if value is _MISSING else json.dumps(value, sort_keys=True, default=str)
+    return text if len(text) <= 120 else text[:117] + "..."
 
-    was_counts = recorded.get("counts") or {}
-    for kind, count in result.counts.items():
-        if int(was_counts.get(kind, 0)) != count:
-            drift.append(f"{kind} findings: recorded {was_counts.get(kind, 0)}, replayed {count}")
 
-    before, after = len(recorded.get("criteria") or []), len(result.criteria)
-    if before != after:
-        drift.append(f"proposed criteria: recorded {before}, replayed {after}")
-    return drift
+class _Missing:
+    pass
+
+
+_MISSING = _Missing()
+
+
+def _walk(was: object, now: object, path: str = "") -> list[str]:
+    """Every field where the recorded and replayed results disagree.
+
+    Exhaustive on purpose. Comparing only verdicts and counts let a changed
+    finding severity, a rewritten proposed criterion, or a dropped citation
+    replay as an exact match — which is the one thing `--check` must never say.
+    """
+    if isinstance(was, dict) and isinstance(now, dict):
+        drift: list[str] = []
+        for key in sorted(set(was) | set(now)):
+            drift += _walk(
+                was.get(key, _MISSING), now.get(key, _MISSING), f"{path}.{key}" if path else key
+            )
+        return drift
+    if isinstance(was, list) and isinstance(now, list):
+        drift = []
+        for i in range(max(len(was), len(now))):
+            a = was[i] if i < len(was) else _MISSING
+            b = now[i] if i < len(now) else _MISSING
+            drift += _walk(a, b, f"{path}[{i}]")
+        return drift
+    if was == now and type(was) is type(now):
+        return []
+    return [f"{path or 'result'}: recorded {_show(was)}, replayed {_show(now)}"]
+
+
+# Rendered first, in this order, because they are the answer the run exists to
+# give. Everything else follows in path order.
+_HEADLINE = ("status", "ready", "exit_code")
+
+
+def _drift(result_dict: dict, recorded: dict) -> list[str]:
+    lines = _walk(_keyed(recorded), _keyed(result_dict))
+    head = [ln for ln in lines if ln.split(":", 1)[0] in _HEADLINE]
+    return head + [ln for ln in lines if ln not in head]
 
 
 # ── Output ────────────────────────────────────────────────────────────────────
+
+# Terminal output stays readable; --json always carries the full list.
+_DRIFT_SHOWN = 20
 
 
 def render(outcome: ReplayOutcome, path: Path) -> None:
@@ -361,6 +395,10 @@ def render(outcome: ReplayOutcome, path: Path) -> None:
         display.print_note("✓  The replay reproduces the recorded result exactly.")
         return
     display.print_error(f"{len(outcome.drift)} difference(s) from the recorded result:")
-    for line in outcome.drift:
+    for line in outcome.drift[:_DRIFT_SHOWN]:
         display.print(f"    {line}")
+    if len(outcome.drift) > _DRIFT_SHOWN:
+        display.print_note(
+            f"    ... and {len(outcome.drift) - _DRIFT_SHOWN} more; --json lists every one."
+        )
     display.print()

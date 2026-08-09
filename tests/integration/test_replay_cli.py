@@ -152,7 +152,7 @@ def test_check_exits_zero_only_while_the_replay_still_reproduces_the_record(reco
 
     assert main(["replay", str(path), "--check"]) == EXIT_FAIL
     captured = capsys.readouterr()
-    assert "verdict: recorded pass, replayed fail" in captured.out
+    assert 'status: recorded "pass", replayed "fail"' in captured.out
 
 
 def test_replaying_something_that_is_not_a_record_is_a_usage_error(repo, capsys):

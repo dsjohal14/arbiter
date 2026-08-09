@@ -93,6 +93,10 @@ def recorded_result(*criteria, status="pass", findings=()):
     return {
         "status": status,
         "exit_code": {"pass": 0, "fail": 1, "unclear": 3}[status],
+        "counts": {
+            s: sum(1 for c in criteria if c["status"] == s)
+            for s in ("unmet", "unverifiable", "untested", "met")
+        },
         "criteria": list(criteria),
         "ungrounded_findings": list(findings),
         "reviewers": ["claude"],
@@ -101,10 +105,25 @@ def recorded_result(*criteria, status="pass", findings=()):
     }
 
 
+# What a real record shows for a criterion the reviewer called `met` while
+# citing no test: the downgrade rules lowered it, and said why.
+DOWNGRADED_NO_TEST = {
+    "assessment": "checked",
+    "implementation_evidence": None,
+    "downgraded_from": "met",
+    "downgrade_reason": "no test cited",
+}
+
+CRITERION_TEXT = {
+    "AC-1": "total() sums every item in the list",
+    "AC-2": "total([]) returns 0",
+}
+
+
 def recorded_criterion(cid, status, **extra):
     row = {
         "id": cid,
-        "text": "",
+        "text": CRITERION_TEXT[cid],
         "status": status,
         "assessment": "checked",
         "implementation_evidence": None,
@@ -134,7 +153,7 @@ def test_a_newer_schema_version_is_refused_rather_than_guessed_at(tmp_path):
 @pytest.mark.parametrize(
     ("payload", "message"),
     [
-        ({"command": "verify"}, "no schema_version"),
+        ({"command": "verify"}, "no integer schema_version"),
         ({"schema_version": 1, "command": "debate"}, "Cannot replay"),
         ([], "not a run record"),
     ],
@@ -161,8 +180,14 @@ def test_unparseable_json_names_the_file(tmp_path):
 def test_replaying_a_verify_record_reproduces_its_verdict():
     record = verify_record(
         result=recorded_result(
-            recorded_criterion("AC-1", "met", test_evidence="tests/test_app.py::t"),
-            recorded_criterion("AC-2", "untested"),
+            recorded_criterion(
+                "AC-1",
+                "met",
+                assessment="checked",
+                implementation_evidence="app.py:2",
+                test_evidence="tests/test_app.py::t",
+            ),
+            recorded_criterion("AC-2", "untested", **DOWNGRADED_NO_TEST),
         )
     )
 
@@ -185,6 +210,8 @@ def test_recorded_evidence_is_restored_rather_than_rechecked(tmp_path, monkeypat
             recorded_criterion(
                 "AC-1",
                 "met",
+                assessment="checked",
+                implementation_evidence="app.py:2",
                 test_evidence="tests/test_app.py::t",
                 impl_check={
                     "kind": "file",
@@ -199,7 +226,7 @@ def test_recorded_evidence_is_restored_rather_than_rechecked(tmp_path, monkeypat
                     "detail": "passed",
                 },
             ),
-            recorded_criterion("AC-2", "untested"),
+            recorded_criterion("AC-2", "untested", **DOWNGRADED_NO_TEST),
         )
     )
 
@@ -255,8 +282,8 @@ def test_drift_names_the_verdict_and_every_criterion_that_moved():
     outcome = replay.replay(record)
 
     assert outcome.matches is False
-    assert "verdict: recorded fail, replayed pass" in outcome.drift
-    assert any(line.startswith("AC-1: recorded unmet, replayed") for line in outcome.drift)
+    assert 'status: recorded "fail", replayed "pass"' in outcome.drift
+    assert any(line.startswith("criteria.AC-1.status:") for line in outcome.drift)
 
 
 def test_a_reviewer_that_never_answered_still_blocks_a_clean_pass():
@@ -417,5 +444,163 @@ def test_plan_review_drift_reports_readiness_and_finding_counts():
     outcome = replay.replay(record)
 
     assert outcome.matches is False
-    assert "readiness: recorded ready, replayed blocked" in outcome.drift
-    assert "ambiguous findings: recorded 0, replayed 1" in outcome.drift
+    assert "ready: recorded true, replayed false" in outcome.drift
+    assert "counts.ambiguous: recorded 0, replayed 1" in outcome.drift
+
+
+# ── Drift has to be exhaustive ───────────────────────────────────────────────
+#
+# Comparing verdicts and counts let materially different results replay as an
+# exact match, which is the one thing `--check` must never say. Each case below
+# leaves the verdict, every criterion status, and every count identical.
+
+
+def _matching_record(**result_overrides) -> dict:
+    """A record whose result the replay reproduces exactly, before tampering."""
+    result = recorded_result(
+        recorded_criterion(
+            "AC-1",
+            "met",
+            assessment="checked",
+            implementation_evidence="app.py:2",
+            test_evidence="tests/test_app.py::t",
+        ),
+        recorded_criterion("AC-2", "untested", **DOWNGRADED_NO_TEST),
+    )
+    result.update(result_overrides)
+    return verify_record(result=result)
+
+
+def test_the_baseline_record_really_does_replay_clean():
+    """Otherwise the tampering cases below would pass for the wrong reason."""
+    assert replay.replay(_matching_record()).drift == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("assessment", "something else entirely"),
+        ("implementation_evidence", "other.py:99"),
+        ("test_evidence", "tests/test_other.py::t"),
+        ("downgrade_reason", "a different reason"),
+    ],
+)
+def test_a_changed_criterion_field_is_drift_even_when_the_status_holds(field, value):
+    record = _matching_record()
+    record["result"]["criteria"][0][field] = value
+
+    drift = replay.replay(record).drift
+
+    assert any(line.startswith(f"criteria.AC-1.{field}:") for line in drift), drift
+    assert not any("status" in line for line in drift), "the status was never touched"
+
+
+def test_a_changed_finding_severity_is_drift():
+    record = _matching_record(
+        ungrounded_findings=[{"severity": "blocking", "claim": "c", "evidence": "e"}]
+    )
+    record["provider_calls"][0]["content"] = _review(
+        _ac("AC-1", "met", "app.py:2", "tests/test_app.py::t"),
+        _ac("AC-2", "met"),
+        findings=[{"severity": "minor", "claim": "c", "evidence": "e"}],
+    )
+    record["provider_calls"][1]["content"] = record["provider_calls"][0]["content"]
+
+    drift = replay.replay(record).drift
+
+    assert any("severity" in line for line in drift), drift
+
+
+def test_an_extra_recorded_finding_is_drift():
+    record = _matching_record(
+        ungrounded_findings=[{"severity": "minor", "claim": "invented", "evidence": "e"}]
+    )
+    assert replay.replay(record).drift, "a finding the replay does not produce must show"
+
+
+def test_plan_review_notices_a_rewritten_proposed_criterion():
+    """The edit to the contract is the product; replaying a different one and
+    calling it a match would make the corpus meaningless."""
+    outcome = replay.replay(plan_review_record())
+    faithful = outcome.result.as_dict()
+
+    tampered = json.loads(json.dumps(faithful))
+    tampered["criteria"][0]["text"] = "something the reviewers never proposed"
+    drift = replay.replay(plan_review_record(result=tampered)).drift
+
+    assert replay.replay(plan_review_record(result=faithful)).drift == []
+    assert any("criteria" in line and "text" in line for line in drift), drift
+
+
+def test_a_changed_plan_finding_action_is_drift():
+    outcome = replay.replay(plan_review_record())
+    tampered = json.loads(json.dumps(outcome.result.as_dict()))
+    tampered["findings"][0]["action"] = "remove"
+
+    drift = replay.replay(plan_review_record(result=tampered)).drift
+
+    assert any("action" in line for line in drift), drift
+
+
+def test_tampered_evidence_shows_up_through_the_status_it_produces():
+    """Evidence checks are restored as *input* to the replay, so drift cannot
+    compare them directly — but the downgrade rules run on them again, so a
+    check that says something different produces a different status."""
+    record = _matching_record()
+    row = record["result"]["criteria"][0]
+    row["test_check"] = {
+        "kind": "test",
+        "citation": "tests/test_app.py::t",
+        "verified": False,
+        "detail": "failed\nassert 1 == 2",
+    }
+
+    drift = replay.replay(record).drift
+
+    assert any(line.startswith("criteria.AC-1.status:") for line in drift), drift
+
+
+def test_evidence_source_is_restored_not_derived_and_says_so():
+    """The one field replay adopts wholesale: whether a plan-selected test
+    survived comparison against the base was settled by a worktree that no
+    longer exists. Re-deriving it from the diff alone would be a worse answer,
+    so it is copied — and therefore cannot be checked."""
+    record = _matching_record()
+    record["result"]["criteria"][0]["evidence_source"] = "plan_selected"
+
+    outcome = replay.replay(record)
+
+    assert outcome.drift == []
+    row = next(c for c in outcome.result.criteria if c.id == "AC-1")
+    assert row.evidence_source == "plan_selected"
+
+
+@pytest.mark.parametrize("version", [0, -1, True, "1", 1.5, None])
+def test_only_a_known_record_schema_is_read(tmp_path, version):
+    """Rejecting only *newer* versions accepted schema 0, negatives, and JSON
+    `true` — none of which have a parser or a migration path."""
+    path = tmp_path / "run.json"
+    path.write_text(json.dumps({"schema_version": version, "command": "verify"}))
+
+    with pytest.raises(ReplayError, match=r"schema_version|record schema"):
+        replay.load_record(path)
+
+
+def test_a_v1_record_still_replays():
+    """v1 lacks `workspace`, which limits only what an eval case can bind to."""
+    record = verify_record(
+        result=recorded_result(
+            recorded_criterion(
+                "AC-1",
+                "met",
+                assessment="checked",
+                implementation_evidence="app.py:2",
+                test_evidence="tests/test_app.py::t",
+            ),
+            recorded_criterion("AC-2", "untested", **DOWNGRADED_NO_TEST),
+        )
+    )
+    record["schema_version"] = 1
+    record.pop("workspace", None)
+
+    assert replay.replay(record).drift == []
