@@ -29,8 +29,8 @@ empty, because a user's repo can be in exactly that state.
 
 | | Count | Time | What it covers |
 |---|---|---|---|
-| `tests/unit/` | 182 | ~5s | Pure functions: parsing, verdict logic, prompt construction |
-| `tests/integration/` | 75 | ~30s | Real subprocesses, real git worktrees, the CLI through `main()` |
+| `tests/unit/` | 257 | ~5s | Pure functions: parsing, verdict logic, prompt construction, replay, scoring |
+| `tests/integration/` | 107 | ~60s | Real subprocesses, real git worktrees, the CLI through `main()` |
 
 Iterate with `make test-unit`. Run `make check` before you push.
 
@@ -121,6 +121,9 @@ cli.py            argument parsing, subcommands, exit codes
 │   └── evidence.py    read cited lines, run cited tests, baseline discrimination
 ├── debate.py        rounds, judge parsing, follow-up loop
 ├── streaming.py     one-block-at-a-time display coordinator (shared)
+├── run_records.py   versioned, atomic audit/eval records
+├── replay.py        re-derive a recorded run's result, calling nothing
+├── evals.py         eval-case schema, loading, and scoring
 ├── models.py        provider capabilities, sessions, subprocess transport
 ├── prompts.py       prompt construction and blinding
 ├── schema_files.py  scoped temp schema files for file-based providers
@@ -128,11 +131,19 @@ cli.py            argument parsing, subcommands, exit codes
 └── doctor.py        install / auth / capability checks
 ```
 
-Two invariants worth keeping:
+Three invariants worth keeping:
 
 **`display.py` holds no logic.** It renders dicts. Anything that decides
 something belongs in `verify.py` or `plan_review.py`, where it can be tested
 without capturing stdout.
+
+**The verdict half stays pure.** `assemble_criteria_results`, `apply_downgrades`,
+`finalize_verify`, and their plan-review counterparts (`intake_reports`,
+`finalize_plan_review`) take raw provider text and return a result — no
+subprocesses, no filesystem, no clock. Everything that touches a working tree
+lives in `gather_evidence` and `evidence.py`. That split is what `replay.py`
+stands on: put a file read into the pure half and replaying a record silently
+starts depending on the repository it is replayed in.
 
 **`_build_cmd` is deterministic in its arguments.** Every provider flag decision
 is a pure function of `(Session, prompt, via_stdin, schema)`, which is what makes
@@ -142,16 +153,37 @@ impurity is `schema_path_writer`, and the caller owns that file's lifetime.
 ### Adding a provider
 
 1. Add a `Provider` entry in `models.py` declaring what it can actually do —
-   read-only mode, config isolation, structured output, session pinning. Do not
-   claim a capability it lacks; `arbiter doctor` reports these verbatim and the
-   asymmetry between providers is deliberate documentation.
+   read-only mode, config isolation (and how much of it, via `isolate_scope`),
+   structured output, session pinning, whether it will read a prompt on stdin,
+   whether its stream carries token counts. Do not claim a capability it lacks;
+   `arbiter doctor` reports these verbatim and the asymmetry between providers is
+   deliberate documentation. Set `default_panel=False` if it should be supported
+   but not assumed — a provider that cannot be controlled (no structured output,
+   no config isolation) or that blocks on interactive input does not belong in a
+   panel nobody asked for. It stays selectable by name either way.
 2. Add a branch to `_parse_event` mapping its stream to
-   `session` / `delta` / `done` / `error`.
-3. Add a branch to `_build_cmd` for the argv shape, including its stdin form.
-4. Add it to `tests/conftest.py` as an `<name>_events()` helper.
+   `session` / `delta` / `done` / `error` / `usage`. Note that the discriminator
+   key is not universal — `agy` keys on `event` where the others key on `type`.
+3. Add a branch to `parse_usage` if it reports counts, normalizing to the shared
+   field names. Never synthesize a total the provider did not give.
+4. Add a branch to `_build_cmd` for the argv shape, including its stdin form.
+5. Add it to `PROVIDER_CLIS` and an `<name>_events()` helper in
+   `tests/conftest.py`.
+6. Paste a **real** captured event into `tests/unit/test_provider_streams.py`.
+   Every shape there came off the live CLI; that is what makes a provider
+   renaming a field a red test rather than an empty answer.
 
-The parametrized tests in `test_build_cmd.py` and `test_provider_flags.py` pick
-up new providers automatically from `PROVIDERS`.
+The parametrized tests in `test_build_cmd.py`, `test_provider_flags.py`, and
+`test_doctor.py` pick up new providers automatically from `PROVIDERS`.
+
+### Why the fixture replaces `PATH` instead of prepending to it
+
+`shim_path` sets `PATH` to its own bin directory plus the minimum the suite needs
+(git). Prepending would leave the developer's real `claude` and `gemini`
+reachable, so any code asking "is this installed?" finds one — and the suite
+starts making paid calls, or hangs for three minutes on an unauthenticated CLI's
+login prompt. That is not hypothetical: it happened the moment `_resolve_models`
+learned to consult `PATH`.
 
 ---
 
