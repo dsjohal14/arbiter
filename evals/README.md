@@ -9,7 +9,7 @@ finding is one you would act on.
 evals/<case-id>/
   plan.md        the plan; criteria pinned for a verify case
   change.diff    the implementation under review     (verify cases)
-  repo/          the tree the diff applies to        (verify cases, optional)
+  repo/          the tree the diff applies to        (verify cases; required to score one)
   expected.json  the answer key
 ```
 
@@ -32,8 +32,19 @@ arbiter eval score evals/totals-drops-first-element \
 arbiter eval validate evals/*/
 ```
 
-Scoring refuses a record whose plan or diff digest differs from the case's, so
-an accuracy number can never come from a run of something else.
+Every binding check fails closed, because an accuracy number computed from a run
+of something else is exactly what this format exists to prevent. Scoring refuses
+a record that:
+
+- has no recorded plan (or, for a verify case, no recorded diff)
+- carries a digest that does not match its own embedded content
+- was recorded from a different plan or diff than the case ships
+- ran against a different tree than the case's `repo/`, or carries no workspace
+  identity at all when the case ships one
+
+That last one is why `repo/` matters beyond convenience: the plan and diff do
+not identify the tree the evidence checks read, and the same diff in two
+different trees can make a cited test pass in one and fail in the other.
 
 ## expected.json
 
@@ -84,7 +95,11 @@ write it as the thing you wanted found, not as a restatement of the constraint.
 - **Seed one defect at a time.** A case that fails for three reasons cannot tell
   you which one Arbiter missed.
 - **Include `repo/` for a verify case.** Evidence checking reads cited lines and
-  runs cited tests; without a tree to read, a case only measures the model layer.
+  runs cited tests; without a tree to read, a case only measures the model layer —
+  and a record cannot be bound to it, so scoring refuses to run.
+- **Assert something.** A case with no verdict, criteria, `must_find`, or
+  `must_not_find` has no failures, so it would pass every run. The loader
+  rejects it.
 - **Expect to revise the corpus.** A case Arbiter fails is a claim about
   Arbiter, until you have re-read it and confirmed the key is right.
 

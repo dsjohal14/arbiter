@@ -335,14 +335,30 @@ arbiter replay .arbiter/runs/verify.json           # exits with the replayed ver
 arbiter replay .arbiter/runs/verify.json --check   # exits 0 only if it still reproduces
 ```
 
-`--check` over a directory of records is a regression test for Arbiter's own
-logic: any criterion whose status moved is printed with its before and after.
+`replay` takes one record. A corpus of them is a regression test for Arbiter's
+own logic:
+
+```bash
+for r in .arbiter/runs/*.json; do
+  arbiter replay "$r" --check >/dev/null || echo "drift: $r"
+done
+```
+
+The comparison is **exhaustive**, not a summary: every field of the result is
+compared, so a changed finding severity, a rewritten proposed criterion, or a
+dropped citation is drift even when the verdict and every criterion status hold.
 
 What replay does **not** do is re-check evidence. Whether a cited line exists or
 a cited test passes is a fact about a working tree, and a record does not pin
 one — those checks are restored from the record and the downgrade rules applied
 to them again. Replay answers "does today's logic reach the recorded verdict from
 the recorded responses?", not "is that verdict still true of this repo today".
+
+That has one consequence worth knowing: restored evidence is an *input* to the
+replay, so `--check` cannot compare it directly. Tampering with a check still
+shows up through the status the downgrade rules then produce — except for
+`evidence_source`, which is copied wholesale because the base-revision worktree
+that settled it no longer exists.
 
 ### `arbiter eval` — how often is it right?
 
