@@ -14,6 +14,7 @@ runs phrase it the same way — an exact-text answer key would measure wording.
     evals/<case-id>/
       plan.md        the plan, with its criteria pinned for a verify case
       change.diff    the implementation under review (verify cases only)
+      repo/          the complete fixture tree (required for verify cases)
       expected.json  the answer key described below
 
 Cases are scored against a run record, so labelling a case costs one paid run
@@ -204,6 +205,7 @@ def load_case(path: Path) -> EvalCase:
         raise EvalCaseError(f"{plan_path} is empty.")
 
     diff: str | None = None
+    repo: Path | None = None
     if command == "verify":
         diff_path = path / DIFF_FILE
         if not diff_path.is_file():
@@ -211,6 +213,12 @@ def load_case(path: Path) -> EvalCase:
         diff = diff_path.read_text(encoding="utf-8")
         if not diff.strip():
             raise EvalCaseError(f"{diff_path} is empty.")
+        repo = path / REPO_DIR
+        if not repo.is_dir():
+            raise EvalCaseError(
+                f"{path} has no {REPO_DIR}/; a verify case needs the complete tree its "
+                "evidence checks run against."
+            )
 
     verdict = expected.get("verdict")
     if verdict is not None:
@@ -241,7 +249,7 @@ def load_case(path: Path) -> EvalCase:
         description=str(expected.get("description") or "").strip(),
         plan=plan,
         diff=diff,
-        repo=(path / REPO_DIR) if (path / REPO_DIR).is_dir() else None,
+        repo=repo,
         verdict=verdict,
         criteria=criteria,
         must_find=must_find,

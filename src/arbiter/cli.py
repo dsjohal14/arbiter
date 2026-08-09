@@ -597,6 +597,13 @@ async def cmd_verify(args: argparse.Namespace) -> int:
     diff = verify.read_diff(args.diff)
     manifest = verify.build_manifest(diff)
 
+    workspace = None
+    if args.record:
+        try:
+            workspace = run_records.workspace_identity(exclude=[Path(args.record)])
+        except run_records.WorkspaceIdentityError as e:
+            _usage_error(f"Could not safely record this workspace: {e}")
+
     recorder = (
         RunRecorder(
             path=Path(args.record),
@@ -605,11 +612,10 @@ async def cmd_verify(args: argparse.Namespace) -> int:
                 "plan": recorded_input(plan, args.plan),
                 "diff": recorded_input(diff, args.diff),
             },
-            # The plan and diff do not identify the tree the evidence checks
-            # read, and two trees with the same diff can produce different
-            # evidence. Without this a result could be scored against an eval
-            # case whose fixture repo it never ran in.
-            workspace=run_records.workspace_identity(manifest),
+            # Evidence can read unchanged tests, fixtures, helpers, and imports
+            # outside the diff. The complete Git-visible tree (or complete
+            # non-Git directory) is therefore the binding unit.
+            workspace=workspace,
             configuration={
                 "models": keys,
                 "judge": judge,
@@ -697,6 +703,11 @@ def cmd_replay(args: argparse.Namespace) -> int:
         return EXIT_PASS
     if not outcome.comparable:
         display.print_error("--check: the record has no result to reproduce.")
+    elif not outcome.exact_comparison:
+        display.print_error(
+            "--check: this legacy record does not separate replay observations from "
+            "expected output; record it again with the current schema."
+        )
     return EXIT_FAIL
 
 
@@ -789,27 +800,44 @@ def _require_same_workspace(case: evals.EvalCase, record: dict, record_path: Pat
     the answer key was written against, so the record has to name the same one.
     """
     if case.repo is None:
-        return
-
-    recorded = (record.get("workspace") or {}).get("files")
-    if not isinstance(recorded, dict):
         _usage_error(
-            f"{record_path} carries no workspace identity, so it cannot be shown to have "
+            f"{case.path} is a verify case without {evals.REPO_DIR}/; there is no tree "
+            "to bind its evidence to. Add the fixture directory and validate the case again."
+        )
+
+    workspace = record.get("workspace") or {}
+    recorded = workspace.get("files")
+    if (
+        int(record.get("schema_version", 0)) < 3
+        or workspace.get("scope") not in ("git-visible", "tree")
+        or not isinstance(recorded, dict)
+    ):
+        _usage_error(
+            f"{record_path} carries no complete workspace identity, so it cannot be shown to have "
             f"run against {case.path / evals.REPO_DIR}. Re-record it with this arbiter "
             "from inside that directory."
         )
 
-    expected = run_records.workspace_identity(
-        verify.build_manifest(case.diff or "", case.repo), case.repo
-    )["files"]
+    try:
+        expected_workspace = run_records.workspace_identity(root=case.repo)
+    except run_records.WorkspaceIdentityError as e:
+        _usage_error(f"Could not safely identify {case.path / evals.REPO_DIR}: {e}")
+    expected_scope = expected_workspace["scope"]
+    if workspace["scope"] != expected_scope:
+        _usage_error(
+            f"{record_path} used workspace scope {workspace['scope']!r}, but "
+            f"{case.path / evals.REPO_DIR} resolves as {expected_scope!r}. Record and "
+            "score the case under the same Git/non-Git scope."
+        )
+    expected = expected_workspace["files"]
     if expected != recorded:
         differing = sorted(set(expected) ^ set(recorded)) or sorted(
             path for path, d in expected.items() if recorded.get(path) != d
         )
         _usage_error(
             f"{record_path} ran against a different tree than {case.path / evals.REPO_DIR} "
-            f"({', '.join(differing[:5]) or 'contents differ'}). Its evidence checks read "
-            "files this case does not ship, so the result cannot be scored against it."
+            f"({', '.join(differing[:5]) or 'contents differ'}). The evidence cannot be "
+            "bound to this fixture, so the result cannot be scored against it."
         )
 
 

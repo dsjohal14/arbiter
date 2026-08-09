@@ -64,14 +64,16 @@ REPORT = _review(
 
 @pytest.fixture
 def repo(tmp_path, monkeypatch):
-    (tmp_path / "app.py").write_text("def total(items):\n    return sum(items)\n")
-    (tmp_path / "tests").mkdir()
-    (tmp_path / "tests" / "test_app.py").write_text(
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    (worktree / "app.py").write_text("def total(items):\n    return sum(items)\n")
+    (worktree / "tests").mkdir()
+    (worktree / "tests" / "test_app.py").write_text(
         "from app import total\n\n\ndef test_sums_all():\n    assert total([1, 2]) == 3\n"
     )
     (tmp_path / "plan.md").write_text(PINNED_PLAN)
     (tmp_path / "change.diff").write_text(DIFF)
-    monkeypatch.chdir(tmp_path)
+    monkeypatch.chdir(worktree)
     return tmp_path
 
 
@@ -86,9 +88,9 @@ def recorded(repo, shim_path):
             [
                 "verify",
                 "--plan",
-                "plan.md",
+                "../plan.md",
                 "--diff",
-                "change.diff",
+                "../change.diff",
                 "--models",
                 "claude",
                 "--test-command",
@@ -109,6 +111,13 @@ def write_case(repo, expected, *, plan=PINNED_PLAN, diff=DIFF):
     (case / "plan.md").write_text(plan)
     (case / "change.diff").write_text(diff)
     (case / "expected.json").write_text(json.dumps(expected))
+    fixture = case / "repo"
+    fixture.mkdir(exist_ok=True)
+    (fixture / "app.py").write_text((repo / "worktree" / "app.py").read_text())
+    (fixture / "tests").mkdir(exist_ok=True)
+    (fixture / "tests" / "test_app.py").write_text(
+        (repo / "worktree" / "tests" / "test_app.py").read_text()
+    )
     return case
 
 
@@ -186,6 +195,7 @@ def test_validate_reports_every_case_and_fails_on_a_broken_one(repo, capsys):
     good = write_case(repo, ANSWER_KEY)
     bad = repo / "broken"
     bad.mkdir()
+    (bad / "repo").mkdir()
     (bad / "plan.md").write_text(PINNED_PLAN)
     (bad / "change.diff").write_text(DIFF)
     (bad / "expected.json").write_text(
@@ -252,7 +262,6 @@ def test_a_record_with_no_digest_at_all_is_still_checked(recorded, repo, capsys)
 
 def _case_with_repo(repo, contents: str):
     case = write_case(repo, ANSWER_KEY)
-    (case / "repo").mkdir(exist_ok=True)
     (case / "repo" / "app.py").write_text(contents)
     return case
 
@@ -276,6 +285,48 @@ def test_a_record_from_another_tree_is_refused(recorded, repo, capsys):
     assert "ran against a different tree" in capsys.readouterr().err
 
 
+def test_an_unchanged_cited_test_is_part_of_the_workspace_binding(recorded, repo, capsys):
+    path, _ = recorded()
+    case = write_case(repo, ANSWER_KEY)
+    test_file = case / "repo" / "tests" / "test_app.py"
+    test_file.write_text(test_file.read_text().replace("== 3", "== 999"))
+    capsys.readouterr()
+
+    assert main(["eval", "score", str(case), "--record", str(path)]) == EXIT_USAGE
+    error = capsys.readouterr().err
+    assert "ran against a different tree" in error
+    assert "tests/test_app.py" in error
+
+
+def test_non_git_pytest_cache_created_after_recording_does_not_break_scoring(
+    recorded, repo, capsys
+):
+    path, _ = recorded()
+    case = write_case(repo, ANSWER_KEY)
+    cache = case / "repo" / ".pytest_cache" / "v" / "cache"
+    cache.mkdir(parents=True)
+    (cache / "nodeids").write_text("[]")
+    (cache / "lastfailed").write_text("{}")
+    capsys.readouterr()
+
+    assert main(["eval", "score", str(case), "--record", str(path)]) == EXIT_PASS
+
+
+def test_workspace_scope_mismatch_is_refused_explicitly(recorded, repo, capsys):
+    path, _ = recorded()
+    case = write_case(repo, ANSWER_KEY)
+    record = json.loads(path.read_text())
+    assert record["workspace"]["scope"] == "tree"
+    record["workspace"]["scope"] = "git-visible"
+    path.write_text(json.dumps(record))
+    capsys.readouterr()
+
+    assert main(["eval", "score", str(case), "--record", str(path)]) == EXIT_USAGE
+    error = capsys.readouterr().err
+    assert "workspace scope 'git-visible'" in error
+    assert "resolves as 'tree'" in error
+
+
 def test_a_record_without_workspace_identity_cannot_be_bound_to_a_repo(recorded, repo, capsys):
     path, _ = recorded()
     record = json.loads(path.read_text())
@@ -286,4 +337,4 @@ def test_a_record_without_workspace_identity_cannot_be_bound_to_a_repo(recorded,
     capsys.readouterr()
 
     assert main(["eval", "score", str(case), "--record", str(path)]) == EXIT_USAGE
-    assert "no workspace identity" in capsys.readouterr().err
+    assert "no complete workspace identity" in capsys.readouterr().err

@@ -234,6 +234,11 @@ def test_verify_can_write_a_replayable_run_record(gate, repo, capsys):
     assert record["inputs"]["diff"]["content"] == DIFF
     assert record["configuration"]["custom_test_command"] is True
     assert record["result"] == output
+    observed = {row["id"]: row for row in record["observations"]["criteria_evidence"]}
+    assert observed["AC-2"]["test_check"]["verified"] is True
+    assert record["observations"]["blinding"] == output["blinding"]
+    assert "tests/test_app.py" in record["workspace"]["files"]
+    assert "run.json" not in record["workspace"]["files"]
     assert record["exit_code"] == code
     assert {call["phase"] for call in record["provider_calls"]} == {
         "reviewer",

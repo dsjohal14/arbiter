@@ -29,11 +29,13 @@ PINNED_PLAN = """# Plan: fix the totals bug
 DIFF = "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-a\n+b\n"
 
 
-def write_case(path, expected, *, plan=PINNED_PLAN, diff=DIFF):
+def write_case(path, expected, *, plan=PINNED_PLAN, diff=DIFF, with_repo=True):
     path.mkdir(parents=True, exist_ok=True)
     (path / "plan.md").write_text(plan)
     if diff is not None:
         (path / "change.diff").write_text(diff)
+    if expected.get("command") == "verify" and with_repo:
+        (path / "repo").mkdir(exist_ok=True)
     (path / "expected.json").write_text(json.dumps(expected))
     return path
 
@@ -94,6 +96,17 @@ def test_a_verify_case_needs_its_diff(tmp_path):
     )
 
     with pytest.raises(EvalCaseError, match=r"change\.diff"):
+        evals.load_case(path)
+
+
+def test_a_verify_case_needs_a_fixture_repo(tmp_path):
+    path = write_case(
+        tmp_path / "no-repo",
+        {"schema_version": 1, "command": "verify", "verdict": "fail"},
+        with_repo=False,
+    )
+
+    with pytest.raises(EvalCaseError, match=r"no repo/"):
         evals.load_case(path)
 
 

@@ -7,10 +7,11 @@ from the record, so a change to how Arbiter reads a response can be evaluated
 against runs that already happened, at zero cost and with no provider installed.
 
 What replay does NOT do is re-check evidence. Reading a cited line or running a
-cited test is a fact about a working tree, and a record does not pin one — the
-checks are restored from the record and the same downgrade rules re-applied to
-them. So replay answers "does today's logic reach the recorded verdict from the
-recorded responses?", not "is that verdict still true of the repository today".
+cited test is a fact about a working tree; its observations are restored from a
+record and the same downgrade rules re-applied. A workspace digest can bind an
+eval score to the same tree, but cannot recreate that tree. Replay therefore
+answers "does today's logic reach the recorded verdict from the recorded
+responses?", not "is that verdict still true of the repository today".
 """
 
 from __future__ import annotations
@@ -27,9 +28,9 @@ from .run_records import SCHEMA_VERSION
 
 REPLAYABLE_COMMANDS = ("verify", "plan review")
 
-# Every version this build can actually parse. v1 records lack `workspace`,
-# which only limits what an eval case can be bound to; they replay unchanged.
-SUPPORTED_RECORD_VERSIONS = (1, 2)
+# Every version this build can actually parse. v1/v2 keep observations inside
+# `result`, so they can be replayed but cannot certify an exact comparison.
+SUPPORTED_RECORD_VERSIONS = (1, 2, 3)
 
 
 class ReplayError(RuntimeError):
@@ -153,6 +154,7 @@ class ReplayOutcome:
     recorded: dict | None
     drift: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    exact_comparison: bool = True
 
     @property
     def comparable(self) -> bool:
@@ -161,7 +163,7 @@ class ReplayOutcome:
     @property
     def matches(self) -> bool:
         """True only when there was a recorded result AND it was reproduced."""
-        return self.comparable and not self.drift
+        return self.comparable and self.exact_comparison and not self.drift
 
     @property
     def exit_code(self) -> int:
@@ -173,6 +175,7 @@ class ReplayOutcome:
             "matches": self.matches,
             "drift": self.drift,
             "notes": self.notes,
+            "exact_comparison": self.exact_comparison,
             "replayed": self.result.as_dict(),
             "recorded": self.recorded,
         }
@@ -183,6 +186,7 @@ def replay(record: dict) -> ReplayOutcome:
     recorded = record.get("result")
     recorded = recorded if isinstance(recorded, dict) else None
     notes: list[str] = []
+    exact_comparison = int(record["schema_version"]) >= 3
     if recorded is None:
         notes.append(
             "The record has no result — the run failed before one existed — so there "
@@ -195,6 +199,11 @@ def replay(record: dict) -> ReplayOutcome:
         raise ReplayError("The record contains no completed reviewer responses to replay.")
     if _consolidated(record) is None:
         notes.append("No consolidator response was recorded; replaying the per-reviewer fallback.")
+    if not exact_comparison:
+        notes.append(
+            "Legacy record: replay observations were stored inside the expected result, "
+            "so this run can be replayed but cannot pass an exact --check."
+        )
 
     if record["command"] == "verify":
         result = _replay_verify(record, criteria, reports, recorded, notes)
@@ -202,7 +211,7 @@ def replay(record: dict) -> ReplayOutcome:
         result = _replay_plan_review(record, criteria, reports, recorded)
 
     drift = _drift(result.as_dict(), recorded) if recorded else []
-    return ReplayOutcome(record["command"], result, recorded, drift, notes)
+    return ReplayOutcome(record["command"], result, recorded, drift, notes, exact_comparison)
 
 
 def _replay_verify(
@@ -229,7 +238,11 @@ def _replay_verify(
             "statuses that the original run downgraded on evidence will differ."
         )
     else:
-        _restore_evidence(results, recorded)
+        _restore_evidence(
+            results,
+            _observations(record, recorded),
+            strict=int(record["schema_version"]) >= 3,
+        )
 
     strict_tests = bool(config.get("require_discriminating_tests"))
     pinned = bool(config.get("require_pinned_evidence"))
@@ -243,7 +256,7 @@ def _replay_verify(
         findings,
         completed,
         failed,
-        _blinding(recorded),
+        _blinding(_observations(record, recorded)) if recorded is not None else None,
         require_tests=bool(config.get("require_tests")),
         require_pinned_evidence=pinned or strict_tests,
     )
@@ -259,24 +272,64 @@ def _recorded_rows(recorded: dict) -> dict[str, dict]:
     }
 
 
-def _restore_evidence(results: list[verify.CriterionResult], recorded: dict) -> None:
+def _observations(record: dict, recorded: dict) -> dict:
+    """Independent replay inputs in v3; legacy result-as-input before that."""
+    if int(record["schema_version"]) < 3:
+        return recorded
+    observations = record.get("observations")
+    if not isinstance(observations, dict):
+        raise ReplayError("The v3 record has a result but no replay observations.")
+    if "blinding" not in observations:
+        raise ReplayError("The v3 record's replay observations have no blinding value.")
+    blinding = observations["blinding"]
+    if blinding is not None:
+        if not isinstance(blinding, dict) or not isinstance(blinding.get("seed"), int):
+            raise ReplayError("The v3 record has malformed blinding observations.")
+        if isinstance(blinding.get("seed"), bool) or not isinstance(
+            blinding.get("label_to_model"), dict
+        ):
+            raise ReplayError("The v3 record has malformed blinding observations.")
+    if record["command"] == "verify":
+        rows = observations.get("criteria_evidence")
+        if not isinstance(rows, list):
+            raise ReplayError("The v3 verify record has no criterion evidence observations.")
+        required = {"id", "impl_check", "test_check", "baseline_check", "evidence_source"}
+        if any(not isinstance(row, dict) or not required.issubset(row) for row in rows):
+            raise ReplayError("The v3 verify record has malformed criterion evidence observations.")
+        ids = [row["id"] for row in rows]
+        if any(not isinstance(cid, str) or not cid for cid in ids) or len(ids) != len(set(ids)):
+            raise ReplayError("The v3 verify record has malformed criterion evidence observations.")
+    return observations
+
+
+def _restore_evidence(
+    results: list[verify.CriterionResult], observations: dict, *, strict: bool
+) -> None:
     """Reattach the checks the original run performed.
 
-    `evidence_source` comes back from the record too: whether a plan-selected
-    test survived comparison against the base revision was settled by a worktree
-    that no longer exists, and re-deriving it from the diff alone would be a
-    strictly worse answer than the one the run already reached.
+    `evidence_source` is an observation too: whether a plan-selected test
+    survived comparison against the base revision was settled by a worktree
+    that may no longer exist. In v3 it is independent of the expected result,
+    so changing that result field is still visible as drift.
     """
-    by_id = _recorded_rows(recorded)
+    rows = observations.get("criteria_evidence")
+    source = {"criteria": rows} if isinstance(rows, list) else observations
+    by_id = _recorded_rows(source)
     for result in results:
         row = by_id.get(result.id)
         if row is None:
+            if strict:
+                raise ReplayError(f"The record has no evidence observations for {result.id}.")
             continue
         for attr in ("impl_check", "test_check", "baseline_check"):
             data = row.get(attr)
             if isinstance(data, dict):
                 setattr(result, attr, EvidenceCheck.from_dict(data))
+            elif strict and data is not None:
+                raise ReplayError(f"The record has malformed {attr} observations for {result.id}.")
         source = row.get("evidence_source")
+        if strict and (not isinstance(source, str) or not source):
+            raise ReplayError(f"The record has no evidence_source observation for {result.id}.")
         if isinstance(source, str) and source:
             result.evidence_source = source
 
@@ -299,7 +352,8 @@ def _replay_plan_review(
         parsed = plan_review.parse_findings_report(consolidated_raw, criteria)
         consolidated = parsed.findings if parsed.valid else None
 
-    return plan_review.finalize_plan_review(criteria, intake, consolidated, _blinding(recorded))
+    blinding = _blinding(_observations(record, recorded)) if recorded is not None else None
+    return plan_review.finalize_plan_review(criteria, intake, consolidated, blinding)
 
 
 # ── Drift ─────────────────────────────────────────────────────────────────────
@@ -393,6 +447,12 @@ def render(outcome: ReplayOutcome, path: Path) -> None:
         return
     if outcome.matches:
         display.print_note("✓  The replay reproduces the recorded result exactly.")
+        return
+    if not outcome.exact_comparison and not outcome.drift:
+        display.print_error(
+            "This legacy record replays without visible drift, but its observations "
+            "were not stored independently, so an exact match cannot be certified."
+        )
         return
     display.print_error(f"{len(outcome.drift)} difference(s) from the recorded result:")
     for line in outcome.drift[:_DRIFT_SHOWN]:

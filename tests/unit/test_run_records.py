@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
 
 import pytest
@@ -73,7 +74,35 @@ def test_finished_record_is_versioned_owner_only_json(tmp_path):
     assert payload["sensitive"] is True
     assert payload["status"] == "completed"
     assert payload["exit_code"] == 1
+    assert payload["observations"] == {"blinding": None, "criteria_evidence": []}
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_replay_observations_are_stored_apart_from_expected_output(tmp_path):
+    result = {
+        "blinding": {"seed": 7, "label_to_model": {"A": "claude"}},
+        "criteria": [
+            {
+                "id": "AC-1",
+                "impl_check": None,
+                "test_check": {
+                    "kind": "test",
+                    "citation": "tests/test_app.py::test_total",
+                    "verified": True,
+                    "detail": "passed",
+                },
+                "baseline_check": None,
+                "evidence_source": "plan_selected",
+            }
+        ],
+    }
+    recorder = RunRecorder(tmp_path / "run.json", "verify", {}, {})
+
+    payload = recorder.finish(exit_code=0, result=result)
+
+    assert payload["observations"]["criteria_evidence"][0]["test_check"]["detail"] == "passed"
+    assert payload["observations"]["blinding"] == result["blinding"]
+    assert payload["observations"] is not payload["result"]
 
 
 def test_failed_atomic_write_preserves_the_previous_record(tmp_path, monkeypatch):
@@ -126,13 +155,16 @@ def test_a_failure_carrying_nothing_still_records_cleanly():
 # ── Workspace identity ───────────────────────────────────────────────────────
 
 
-def test_workspace_identity_digests_only_the_files_in_scope(tmp_path):
+def test_complete_workspace_identity_includes_unchanged_tests_and_helpers(tmp_path):
     (tmp_path / "app.py").write_text("x = 1\n")
-    (tmp_path / "untouched.py").write_text("y = 2\n")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_app.py").write_text("def test_x(): pass\n")
+    (tmp_path / "helper.py").write_text("y = 2\n")
 
-    identity = run_records.workspace_identity(["app.py"], tmp_path)
+    identity = run_records.workspace_identity(root=tmp_path)
 
-    assert list(identity["files"]) == ["app.py"]
+    assert identity["scope"] == "tree"
+    assert set(identity["files"]) == {"app.py", "helper.py", "tests/test_app.py"}
     assert identity["files"]["app.py"] == run_records.digest("x = 1\n")
 
 
@@ -143,8 +175,8 @@ def test_two_trees_holding_different_content_get_different_identities(tmp_path):
         (tmp_path / name).mkdir()
         (tmp_path / name / "app.py").write_text(body)
 
-    first = run_records.workspace_identity(["app.py"], tmp_path / "a")
-    second = run_records.workspace_identity(["app.py"], tmp_path / "b")
+    first = run_records.workspace_identity(root=tmp_path / "a")
+    second = run_records.workspace_identity(root=tmp_path / "b")
 
     assert first["files"] != second["files"]
 
@@ -155,3 +187,56 @@ def test_a_file_absent_from_one_tree_shows_up_as_a_differing_key(tmp_path):
     identity = run_records.workspace_identity(["app.py", "gone.py"], tmp_path)
 
     assert "gone.py" not in identity["files"]
+
+
+def test_workspace_paths_cannot_escape_the_root(tmp_path):
+    with pytest.raises(run_records.WorkspaceIdentityError, match="escapes"):
+        run_records.workspace_identity(["../../../../etc/hosts"], tmp_path)
+
+
+def test_workspace_identity_skips_special_files_without_reading_them(tmp_path):
+    fifo = tmp_path / "pipe"
+    os.mkfifo(fifo)
+
+    identity = run_records.workspace_identity(["pipe"], tmp_path)
+
+    assert "pipe" not in identity["files"]
+
+
+def test_non_git_runner_artifacts_do_not_change_the_fixture_identity(tmp_path):
+    (tmp_path / "app.py").write_text("x = 1\n")
+    before = run_records.workspace_identity(root=tmp_path)
+
+    cache = tmp_path / ".pytest_cache" / "v" / "cache"
+    cache.mkdir(parents=True)
+    (cache / "nodeids").write_text("[]")
+    pycache = tmp_path / "tests" / "__pycache__"
+    pycache.mkdir(parents=True)
+    (pycache / "test_app.cpython-312.pyc").write_bytes(b"generated")
+    (tmp_path / ".coverage").write_bytes(b"generated")
+    (tmp_path / ".coverage.worker-1").write_bytes(b"generated")
+
+    after = run_records.workspace_identity(root=tmp_path)
+
+    assert before["scope"] == after["scope"] == "tree"
+    assert before["files"] == after["files"] == {"app.py": run_records.digest("x = 1\n")}
+
+
+def test_workspace_identity_hashes_raw_bytes_without_replacement_collisions(tmp_path):
+    path = tmp_path / "binary.dat"
+    path.write_bytes(b"\xff")
+    first = run_records.workspace_identity(["binary.dat"], tmp_path)
+    path.write_bytes(b"\xfe")
+    second = run_records.workspace_identity(["binary.dat"], tmp_path)
+
+    assert first["files"]["binary.dat"] != second["files"]["binary.dat"]
+
+
+def test_the_record_output_can_be_excluded_from_a_complete_snapshot(tmp_path):
+    output = tmp_path / "run.json"
+    output.write_text("an older record")
+    (tmp_path / "app.py").write_text("x = 1\n")
+
+    identity = run_records.workspace_identity(root=tmp_path, exclude=[output])
+
+    assert set(identity["files"]) == {"app.py"}

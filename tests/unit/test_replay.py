@@ -7,6 +7,7 @@ responses count, and what has to be restored rather than recomputed.
 
 from __future__ import annotations
 
+import copy
 import json
 
 import pytest
@@ -68,10 +69,33 @@ def _call(phase, role, content, status="completed"):
     }
 
 
+def _observations(result):
+    if result is None:
+        return None
+    return {
+        "blinding": copy.deepcopy(result.get("blinding")),
+        "criteria_evidence": [
+            {
+                "id": row["id"],
+                **{
+                    field: copy.deepcopy(row.get(field))
+                    for field in (
+                        "impl_check",
+                        "test_check",
+                        "baseline_check",
+                        "evidence_source",
+                    )
+                },
+            }
+            for row in result.get("criteria") or []
+        ],
+    }
+
+
 def verify_record(*, calls=None, result=None, configuration=None, plan=PINNED_PLAN) -> dict:
     report = _review(_ac("AC-1", "met", "app.py:2", "tests/test_app.py::t"), _ac("AC-2", "met"))
     return {
-        "schema_version": 1,
+        "schema_version": 3,
         "sensitive": True,
         "command": "verify",
         "status": "completed",
@@ -84,6 +108,7 @@ def verify_record(*, calls=None, result=None, configuration=None, plan=PINNED_PL
         if calls is not None
         else [_call("reviewer", "claude", report), _call("consolidator", "consolidator", report)],
         "result": result,
+        "observations": _observations(result),
         "exit_code": 0,
         "error": None,
     }
@@ -355,7 +380,7 @@ def _finding(kind="ambiguous", action="add", **extra):
 def plan_review_record(*, calls=None, configuration=None, result=None, plan=RAW_PLAN) -> dict:
     critique = json.dumps({"findings": [_finding()]})
     return {
-        "schema_version": 1,
+        "schema_version": 3,
         "sensitive": True,
         "command": "plan review",
         "status": "completed",
@@ -374,6 +399,7 @@ def plan_review_record(*, calls=None, configuration=None, result=None, plan=RAW_
             _call("consolidator", "consolidator", critique),
         ],
         "result": result,
+        "observations": _observations(result),
         "exit_code": 1,
         "error": None,
     }
@@ -464,6 +490,18 @@ def _matching_record(**result_overrides) -> dict:
             assessment="checked",
             implementation_evidence="app.py:2",
             test_evidence="tests/test_app.py::t",
+            impl_check={
+                "kind": "file",
+                "citation": "app.py:2",
+                "verified": True,
+                "detail": "return sum(items)",
+            },
+            test_check={
+                "kind": "test",
+                "citation": "tests/test_app.py::t",
+                "verified": True,
+                "detail": "passed",
+            },
         ),
         recorded_criterion("AC-2", "untested", **DOWNGRADED_NO_TEST),
     )
@@ -474,6 +512,22 @@ def _matching_record(**result_overrides) -> dict:
 def test_the_baseline_record_really_does_replay_clean():
     """Otherwise the tampering cases below would pass for the wrong reason."""
     assert replay.replay(_matching_record()).drift == []
+
+
+def test_a_v3_record_without_independent_observations_is_refused():
+    record = _matching_record()
+    record.pop("observations")
+
+    with pytest.raises(ReplayError, match="no replay observations"):
+        replay.replay(record)
+
+
+def test_a_v3_record_missing_one_criteria_observation_is_refused():
+    record = _matching_record()
+    record["observations"]["criteria_evidence"] = record["observations"]["criteria_evidence"][:1]
+
+    with pytest.raises(ReplayError, match="no evidence observations for AC-2"):
+        replay.replay(record)
 
 
 @pytest.mark.parametrize(
@@ -518,6 +572,15 @@ def test_an_extra_recorded_finding_is_drift():
     assert replay.replay(record).drift, "a finding the replay does not produce must show"
 
 
+def test_a_changed_blinding_map_is_drift_not_an_input_to_itself():
+    record = _matching_record()
+    record["result"]["blinding"]["label_to_model"]["A"] = "forged"
+
+    drift = replay.replay(record).drift
+
+    assert any(line.startswith("blinding.label_to_model.A:") for line in drift), drift
+
+
 def test_plan_review_notices_a_rewritten_proposed_criterion():
     """The edit to the contract is the product; replaying a different one and
     calling it a match would make the corpus meaningless."""
@@ -542,10 +605,7 @@ def test_a_changed_plan_finding_action_is_drift():
     assert any("action" in line for line in drift), drift
 
 
-def test_tampered_evidence_shows_up_through_the_status_it_produces():
-    """Evidence checks are restored as *input* to the replay, so drift cannot
-    compare them directly — but the downgrade rules run on them again, so a
-    check that says something different produces a different status."""
+def test_tampered_expected_evidence_is_compared_to_independent_observations():
     record = _matching_record()
     row = record["result"]["criteria"][0]
     row["test_check"] = {
@@ -557,22 +617,41 @@ def test_tampered_evidence_shows_up_through_the_status_it_produces():
 
     drift = replay.replay(record).drift
 
-    assert any(line.startswith("criteria.AC-1.status:") for line in drift), drift
+    assert any(line.startswith("criteria.AC-1.test_check.verified:") for line in drift), drift
+    assert not any(line.startswith("criteria.AC-1.status:") for line in drift), drift
 
 
-def test_evidence_source_is_restored_not_derived_and_says_so():
-    """The one field replay adopts wholesale: whether a plan-selected test
-    survived comparison against the base was settled by a worktree that no
-    longer exists. Re-deriving it from the diff alone would be a worse answer,
-    so it is copied — and therefore cannot be checked."""
+def test_changed_evidence_detail_is_drift_even_when_the_status_holds():
+    record = _matching_record()
+    observed = record["observations"]["criteria_evidence"][0]
+    observed["test_check"] = {
+        "kind": "test",
+        "citation": "tests/test_app.py::t",
+        "verified": True,
+        "detail": "passed",
+    }
+    record["result"]["criteria"][0]["test_check"] = {
+        **observed["test_check"],
+        "citation": "tests/test_other.py::forged",
+        "detail": "forged detail",
+    }
+
+    drift = replay.replay(record).drift
+
+    assert any(line.startswith("criteria.AC-1.test_check.citation:") for line in drift), drift
+    assert any(line.startswith("criteria.AC-1.test_check.detail:") for line in drift), drift
+    assert not any(line.startswith("criteria.AC-1.status:") for line in drift), drift
+
+
+def test_evidence_source_is_restored_from_an_independent_observation():
     record = _matching_record()
     record["result"]["criteria"][0]["evidence_source"] = "plan_selected"
 
     outcome = replay.replay(record)
 
-    assert outcome.drift == []
+    assert any(line.startswith("criteria.AC-1.evidence_source:") for line in outcome.drift)
     row = next(c for c in outcome.result.criteria if c.id == "AC-1")
-    assert row.evidence_source == "plan_selected"
+    assert row.evidence_source == "model_assessed"
 
 
 @pytest.mark.parametrize("version", [0, -1, True, "1", 1.5, None])
@@ -587,7 +666,7 @@ def test_only_a_known_record_schema_is_read(tmp_path, version):
 
 
 def test_a_v1_record_still_replays():
-    """v1 lacks `workspace`, which limits only what an eval case can bind to."""
+    """Legacy records replay, but result-as-observation cannot prove exactness."""
     record = verify_record(
         result=recorded_result(
             recorded_criterion(
@@ -603,4 +682,9 @@ def test_a_v1_record_still_replays():
     record["schema_version"] = 1
     record.pop("workspace", None)
 
-    assert replay.replay(record).drift == []
+    outcome = replay.replay(record)
+
+    assert outcome.drift == []
+    assert outcome.matches is False
+    assert outcome.exact_comparison is False
+    assert any("Legacy record" in note for note in outcome.notes)
