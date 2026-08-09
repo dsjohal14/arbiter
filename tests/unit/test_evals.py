@@ -312,3 +312,61 @@ def test_a_plan_review_run_is_scored_on_readiness_and_its_edits(tmp_path):
     assert score.verdict_actual == "blocked"
     assert score.passed is True
     assert score.criteria_accuracy is None
+
+
+# ── A case has to assert something ───────────────────────────────────────────
+
+
+def test_a_case_that_asserts_nothing_is_refused(tmp_path):
+    """It has no failures, so it scores `passed` against any result at all —
+    including one that got everything wrong. That is worse than having no case:
+    it inflates both the corpus and the pass rate."""
+    path = write_case(
+        tmp_path / "empty",
+        {"schema_version": 1, "command": "verify", "description": "nothing asserted"},
+    )
+
+    with pytest.raises(EvalCaseError, match="asserts nothing"):
+        evals.load_case(path)
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["verdict", "criteria", "must_find", "must_not_find"],
+)
+def test_any_single_assertion_is_enough(tmp_path, key):
+    payload = {
+        "verdict": "fail",
+        "criteria": {"AC-1": "unmet"},
+        "must_find": [{"severity": "blocking"}],
+        "must_not_find": [{"severity": "question"}],
+    }[key]
+    path = write_case(tmp_path / "one", {"schema_version": 1, "command": "verify", key: payload})
+
+    assert evals.load_case(path) is not None
+
+
+def test_an_empty_match_needle_is_refused(tmp_path):
+    """ "" is a substring of everything, so it quietly turns the expectation into
+    'any finding at all'."""
+    path = verify_case(tmp_path, must_find=[{"severity": "blocking", "match": [""]}])
+
+    with pytest.raises(EvalCaseError, match=r"empty `match`"):
+        evals.load_case(path)
+
+
+def test_a_whitespace_only_needle_is_refused(tmp_path):
+    path = verify_case(tmp_path, must_find=[{"severity": "blocking", "match": ["   "]}])
+
+    with pytest.raises(EvalCaseError, match=r"empty `match`"):
+        evals.load_case(path)
+
+
+@pytest.mark.parametrize("version", [0, -1, True, "1", 1.0, None])
+def test_only_a_known_schema_version_is_read(tmp_path, version):
+    """An unknown *older* version is as unreadable as a newer one: there is no
+    parser for it and no migration to run. `True` is an int in Python."""
+    path = verify_case(tmp_path, schema_version=version)
+
+    with pytest.raises(EvalCaseError, match=r"schema_version|case schema"):
+        evals.load_case(path)

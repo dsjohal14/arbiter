@@ -31,6 +31,9 @@ from . import plan_review, verify
 
 SCHEMA_VERSION = 1
 
+# Every version this build can actually read, not merely "not newer than ours".
+SUPPORTED_CASE_VERSIONS = (1,)
+
 COMMANDS = ("verify", "plan review")
 
 PLAN_FILE = "plan.md"
@@ -143,6 +146,10 @@ def _expected_findings(raw, command: str, where: str) -> tuple[ExpectedFinding, 
         needles = item.get("match") or []
         if not isinstance(needles, list) or not all(isinstance(n, str) for n in needles):
             raise EvalCaseError(f"{at} `match` must be a list of strings.")
+        # "" is a substring of everything, so a blank needle is not a constraint
+        # at all — it silently turns the expectation into "any finding".
+        if any(not n.strip() for n in needles):
+            raise EvalCaseError(f"{at} has an empty `match` entry, which matches every finding.")
         if not constraints and not needles:
             raise EvalCaseError(f"{at} constrains nothing, so every finding would satisfy it.")
 
@@ -172,12 +179,15 @@ def load_case(path: Path) -> EvalCase:
         raise EvalCaseError(f"{expected_path} must contain a JSON object.")
 
     version = expected.get("schema_version")
-    if not isinstance(version, int):
+    # `True` is an int in Python. An unknown older version is as unreadable as a
+    # newer one — there is no parser for it and no migration to run.
+    if not isinstance(version, int) or isinstance(version, bool):
         raise EvalCaseError(f"{expected_path} needs an integer schema_version.")
-    if version > SCHEMA_VERSION:
+    if version not in SUPPORTED_CASE_VERSIONS:
+        known = ", ".join(f"v{v}" for v in SUPPORTED_CASE_VERSIONS)
+        hint = " Upgrade arbiter to read it." if version > SCHEMA_VERSION else ""
         raise EvalCaseError(
-            f"{expected_path} uses case schema v{version}; this arbiter understands "
-            f"up to v{SCHEMA_VERSION}."
+            f"{expected_path} uses case schema v{version}; this arbiter reads {known}.{hint}"
         )
 
     command = expected.get("command")
@@ -212,6 +222,17 @@ def load_case(path: Path) -> EvalCase:
             )
 
     criteria = _expected_criteria(expected, command, plan, expected_path)
+    must_find = _expected_findings(expected.get("must_find"), command, "must_find")
+    must_not_find = _expected_findings(expected.get("must_not_find"), command, "must_not_find")
+
+    # A case that asserts nothing has no failures, so it scores `passed` against
+    # any result whatsoever — including one that got everything wrong. That is
+    # worse than having no case: it inflates the corpus and the pass rate.
+    if not (verdict or criteria or must_find or must_not_find):
+        raise EvalCaseError(
+            f"{expected_path} asserts nothing, so every run would pass it. Give it at "
+            "least one of: verdict, criteria, must_find, must_not_find."
+        )
 
     return EvalCase(
         id=str(expected.get("id") or path.name),
@@ -223,8 +244,8 @@ def load_case(path: Path) -> EvalCase:
         repo=(path / REPO_DIR) if (path / REPO_DIR).is_dir() else None,
         verdict=verdict,
         criteria=criteria,
-        must_find=_expected_findings(expected.get("must_find"), command, "must_find"),
-        must_not_find=_expected_findings(expected.get("must_not_find"), command, "must_not_find"),
+        must_find=must_find,
+        must_not_find=must_not_find,
     )
 
 
