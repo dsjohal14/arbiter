@@ -41,6 +41,7 @@ def shim_path(tmp_path, monkeypatch):
         hang=None,
         garbage=False,
         stderr=None,
+        prose=None,
     ):
         if events is not None:
             monkeypatch.setenv("FAKE_CLI_STREAM", _write(events, ""))
@@ -54,6 +55,8 @@ def shim_path(tmp_path, monkeypatch):
             monkeypatch.setenv("FAKE_CLI_GARBAGE", "1")
         if stderr:
             monkeypatch.setenv("FAKE_CLI_STDERR", stderr)
+        if prose:
+            monkeypatch.setenv("FAKE_CLI_PROSE", prose)
         argv_log = tmp_path / "argv.jsonl"
         monkeypatch.setenv("FAKE_CLI_ARGV_OUT", str(argv_log))
         return argv_log

@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import errno
 import json
+import re
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -565,6 +566,52 @@ class ModelCallError(RuntimeError):
     """A provider CLI failed, produced nothing, or exceeded its timeout."""
 
 
+# How many lines of non-JSON stdout to keep for diagnosis.
+_PROSE_KEPT = 3
+# How much of a still-buffered, unterminated line to pull back on a timeout.
+_PARTIAL_READ = 4096
+_PARTIAL_WAIT = 0.25
+
+# A CLI that needs to log in asks on stdout and then waits on a stdin that is
+# never going to answer. "exceeded the timeout" is true and useless; quoting the
+# question it asked is the actual diagnosis.
+_INTERACTIVE_RE = re.compile(
+    r"\[y/n\]|\(y/n\)|\[yes/no\]|press enter|continue\?|sign in|log ?in|authenticat",
+    re.I,
+)
+
+
+async def _collect_partial_line(proc: asyncio.subprocess.Process, prose: list[str]) -> None:
+    """Pull back whatever is buffered on stdout but never terminated.
+
+    A CLI waiting for a human ends its question with ": ", not a newline, so the
+    line iterator in `_consume` never yields it and the timeout has nothing to
+    report but its own duration. `read(n)` returns as soon as any byte is
+    available, so this costs nothing when there is genuinely nothing there.
+    """
+    if proc.stdout is None or len(prose) >= _PROSE_KEPT:
+        return
+    try:
+        chunk = await asyncio.wait_for(proc.stdout.read(_PARTIAL_READ), _PARTIAL_WAIT)
+    except (TimeoutError, OSError, ValueError):
+        return
+    if text := chunk.decode(errors="replace").strip():
+        prose.append(text[:200])
+
+
+def _blocked_hint(prose: list[str] | None) -> str:
+    """Turn captured stdout prose into a diagnosis, when it looks like a prompt."""
+    if not prose:
+        return ""
+    text = " ".join(prose).strip()
+    if not _INTERACTIVE_RE.search(text):
+        return f" It wrote: {text[:200]!r}."
+    return (
+        f" It wrote: {text[:200]!r} — it is waiting for an answer that headless "
+        "mode cannot give. Run it once interactively to authenticate, then retry."
+    )
+
+
 async def _reap(proc: asyncio.subprocess.Process) -> None:
     """Terminate a child that is still running, escalating to SIGKILL.
 
@@ -594,6 +641,7 @@ async def _consume(
     on_delta: OnDelta,
     start: float,
     cmd: list[str],
+    prose: list[str] | None = None,
 ) -> ModelResponse:
     assert proc.stdout is not None
     buf: list[str] = []
@@ -609,7 +657,15 @@ async def _consume(
         try:
             obj = json.loads(line)
         except json.JSONDecodeError:
-            continue  # non-JSON noise on stdout is expected from some CLIs
+            obj = None
+        # Noise on stdout is expected from some CLIs, but it is also how an
+        # unauthenticated one asks a question it will then block on forever.
+        # Keep a little of it so the caller can say so. A bare JSON string or
+        # list is noise too — `_parse_event` would raise on it.
+        if not isinstance(obj, dict):
+            if prose is not None and len(prose) < _PROSE_KEPT:
+                prose.append(line[:200])
+            continue
         for kind, payload in _parse_event(sess.cli, obj):
             if kind == "session" and payload:
                 captured_sid = str(payload)
@@ -639,7 +695,9 @@ async def _consume(
 
     content = (final if final is not None else "".join(buf)).strip()
     if not content:
-        raise ModelCallError(f"{sess.cli} returned no content. {stderr[:200]}")
+        raise ModelCallError(
+            f"{sess.cli} returned no content.{_blocked_hint(prose)} {stderr[:200]}".rstrip()
+        )
 
     if captured_sid and not sess.session_id:
         sess.session_id = captured_sid
@@ -721,16 +779,23 @@ async def call_session(
         finally:
             proc.stdin.close()
 
+    # Filled by _consume as it reads; survives a timeout, which is exactly the
+    # case where what the CLI printed instead of JSON is the whole diagnosis.
+    prose: list[str] = []
+
     async def _run() -> ModelResponse:
         await _write_prompt()
-        return await _consume(sess, proc, stderr_task, on_delta, start, cmd)
+        return await _consume(sess, proc, stderr_task, on_delta, start, cmd, prose)
 
     try:
         # One scope covers writing the prompt AND reading the response, so a
         # child that stops consuming stdin cannot hang past the deadline.
         return await asyncio.wait_for(_run(), timeout)
     except TimeoutError as e:
-        raise ModelCallError(f"{sess.cli} exceeded the {timeout:.0f}s timeout") from e
+        await _collect_partial_line(proc, prose)
+        raise ModelCallError(
+            f"{sess.cli} exceeded the {timeout:.0f}s timeout.{_blocked_hint(prose)}"
+        ) from e
     finally:
         # `finally`, so cancellation during the stdin write still reaps the child.
         stderr_task.cancel()

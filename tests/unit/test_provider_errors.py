@@ -10,7 +10,13 @@ from __future__ import annotations
 
 import pytest
 
-from arbiter.models import _parse_event, _schema_args, _unwrap_provider_error, make_session
+from arbiter.models import (
+    _blocked_hint,
+    _parse_event,
+    _schema_args,
+    _unwrap_provider_error,
+    make_session,
+)
 
 
 def _errors(cli: str, obj: dict) -> list[str]:
@@ -53,6 +59,31 @@ def test_agy_error_result_is_surfaced():
         "result": {"status": "ERROR", "response": "", "error": "Error: empty prompt."},
     }
     assert _errors("agy", obj) == ["Error: empty prompt."]
+
+
+# ── Prose a CLI printed instead of JSON ──────────────────────────────────────
+
+
+def test_an_interactive_question_is_named_as_one():
+    """The report was `gemini exceeded the 60s timeout`, which sends you looking
+    for a slow model. It was sitting on a login prompt no headless run can
+    answer, and the prompt was on stdout the whole time."""
+    hint = _blocked_hint(["Opening authentication page in your browser. Continue? [Y/n]:"])
+    assert "authentication page" in hint
+    assert "waiting for an answer" in hint
+    assert "interactively" in hint
+
+
+def test_other_prose_is_quoted_without_the_login_advice():
+    """`gemini --resume <uuid>` fails this way — real, and not an auth problem."""
+    hint = _blocked_hint(["Error resuming session: No previous sessions found for this project."])
+    assert "No previous sessions found" in hint
+    assert "interactively" not in hint
+
+
+def test_no_prose_adds_nothing():
+    assert _blocked_hint([]) == ""
+    assert _blocked_hint(None) == ""
 
 
 @pytest.mark.parametrize(

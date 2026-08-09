@@ -8,8 +8,8 @@ import sys
 import pytest
 
 from arbiter.cli import main
-from arbiter.verify import EXIT_PASS
-from conftest import agy_events, gemini_events
+from arbiter.verify import EXIT_PASS, EXIT_RUNTIME
+from conftest import agy_events, claude_events, gemini_events
 
 PYTEST = f"{sys.executable} -m pytest"
 
@@ -120,3 +120,25 @@ def test_a_provider_reporting_no_usage_records_null_not_zero(repo, shim_path):
 
     calls = json.loads(record.read_text())["provider_calls"]
     assert calls and all(call["usage"] is None for call in calls)
+
+
+# ── Diagnosing a CLI that is waiting for a human ─────────────────────────────
+
+
+def test_a_cli_blocked_on_a_login_prompt_says_so_instead_of_timing_out(repo, shim_path, capsys):
+    """The real report was `gemini exceeded the 60s timeout`, which sends you
+    looking for a slow model. It was sitting on an unanswerable auth question."""
+    shim_path(
+        per_provider={"claude": claude_events(REPORT)},
+        prose="Opening authentication page in your browser. Do you want to continue? [Y/n]:",
+        hang=30,
+    )
+
+    code = _verify("--models", "gemini", "--judge", "claude", "--timeout", "2")
+    captured = capsys.readouterr()
+
+    assert code == EXIT_RUNTIME
+    combined = captured.out + captured.err
+    assert "authentication page" in combined
+    assert "waiting for an answer" in combined
+    assert "interactively" in combined
