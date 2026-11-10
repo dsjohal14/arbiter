@@ -731,3 +731,73 @@ def test_a_newly_added_plan_selected_test_is_not_treated_as_stale(repo, shim_pat
     assert code == EXIT_PASS
     assert "changed in this diff" not in out
 
+
+# ── The test command ─────────────────────────────────────────────────────────
+
+
+def _verify(*extra):
+    return main(
+        ["verify", "--plan", "plan.md", "--diff", "change.diff", "--models", "claude", *extra]
+    )
+
+
+ALL_MET = _review(
+    [
+        _ac("AC-1", "met", "app.py:2", "tests/test_app.py::test_sums_all"),
+        _ac("AC-2", "met", "app.py:2", "tests/test_app.py::test_empty_list"),
+    ]
+)
+
+
+def test_a_quoted_argument_in_the_test_command_survives(repo, shim_path):
+    """`str.split` cut `-o "python_functions=check_* test_*"` into three broken
+    arguments, so no cited test could run and every proof went unconfirmed."""
+    shim_path(claude_events(ALL_MET))
+    command = f'{PYTEST} -o "python_functions=check_* test_*"'
+
+    assert _verify("--test-command", command, "--require-tests") == EXIT_PASS
+
+
+def test_a_test_command_that_cannot_start_is_refused_before_any_review(repo, shim_path, capsys):
+    """Found out afterwards, it is a run where nothing could be executed — paid
+    for in full, and reported as untested criteria rather than as a typo."""
+    argv_log = shim_path(claude_events(ALL_MET))
+
+    assert _verify("--test-command", "pytset -q") == EXIT_USAGE
+
+    assert "'pytset' is not an executable on PATH" in capsys.readouterr().err
+    assert not argv_log.exists(), "preflight must happen before any provider call"
+
+
+def test_an_unbalanced_quote_in_the_test_command_is_a_usage_error(repo, shim_path, capsys):
+    shim_path(claude_events(ALL_MET))
+    assert _verify("--test-command", "pytest -k 'oops") == EXIT_USAGE
+    assert "--test-command could not be parsed" in capsys.readouterr().err
+
+
+def test_a_test_command_is_not_validated_when_tests_are_not_run(repo, shim_path):
+    """It is never launched, so a stale value is not worth refusing the run for."""
+    shim_path(claude_events(ALL_MET))
+    assert _verify("--test-command", "pytset -q", "--no-run-tests") == EXIT_PASS
+
+
+def test_a_cited_test_that_outlives_the_test_timeout_is_cut_off(repo, shim_path, capsys):
+    (repo / "tests" / "test_slow.py").write_text(
+        "import time\n\n\ndef test_hangs():\n    time.sleep(60)\n"
+    )
+    report = _review(
+        [
+            _ac("AC-1", "met", "app.py:2", "tests/test_slow.py::test_hangs"),
+            _ac("AC-2", "met", "app.py:2", "tests/test_app.py::test_empty_list"),
+        ]
+    )
+    shim_path(claude_events(report))
+
+    assert _verify("--test-command", PYTEST, "--test-timeout", "1") == EXIT_UNCLEAR
+    assert "timed out after 1s" in capsys.readouterr().out
+
+
+def test_a_test_timeout_must_be_positive(repo, shim_path, capsys):
+    shim_path(claude_events(ALL_MET))
+    assert _verify("--test-timeout", "0") == EXIT_USAGE
+    assert "--test-timeout must be greater than zero" in capsys.readouterr().err

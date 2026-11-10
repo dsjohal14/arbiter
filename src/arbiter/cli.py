@@ -21,6 +21,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
+import shlex
 import shutil
 import sys
 from pathlib import Path
@@ -29,6 +31,7 @@ from typing import NoReturn
 from . import criteria as crit
 from . import display, doctor, evals, plan_review, replay, run_records, verify
 from .debate import run_debate, run_followup_loop
+from .evidence import TEST_TIMEOUT
 from .models import (
     DEFAULT_PANEL,
     DEFAULT_TIMEOUT,
@@ -177,6 +180,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--test-command",
         metavar="CMD",
         help="Test runner for cited tests (default: autodetect pytest)",
+    )
+    v.add_argument(
+        "--test-timeout",
+        type=float,
+        default=TEST_TIMEOUT,
+        metavar="SEC",
+        help=f"Seconds one cited test may run before it is cut off (default: {TEST_TIMEOUT:.0f})",
     )
     v.add_argument(
         "--record",
@@ -330,6 +340,29 @@ def _resolve_models(spec: str | None, judge: str | None) -> tuple[list[str], str
     if judge not in VALID_MODELS:
         _usage_error(f"unknown judge '{judge}'. Choose from: {valid}")
     return keys, judge
+
+
+def _parse_test_command(raw: str | None) -> list[str] | None:
+    """Split --test-command the way a shell would, and check it can start.
+
+    `str.split` broke every argument that contained a space. And a command that
+    could not be launched was only discovered after the reviewers had been paid
+    for — as a run in which no cited test could be executed.
+    """
+    if raw is None:
+        return None
+    try:
+        command = shlex.split(raw, posix=os.name != "nt")
+    except ValueError as e:
+        _usage_error(f"--test-command could not be parsed ({e}): {raw}")
+    if not command:
+        _usage_error("--test-command is empty.")
+    if shutil.which(command[0]) is None:
+        _usage_error(
+            f"--test-command: {command[0]!r} is not an executable on PATH, so no cited "
+            "test could be run."
+        )
+    return command
 
 
 def _read_prompt(arg: str | None) -> str:
@@ -587,6 +620,10 @@ async def cmd_verify(args: argparse.Namespace) -> int:
                 "--require-discriminating-tests needs a base revision; pass --base <ref> "
                 "or use a --diff that names one."
             )
+    if args.test_timeout <= 0:
+        _usage_error("--test-timeout must be greater than zero.")
+    # Unused when tests are not run, so a stale value there is not an error.
+    test_command = None if args.no_run_tests else _parse_test_command(args.test_command)
 
     plan = verify.read_plan(args.plan)
     try:
@@ -629,6 +666,7 @@ async def cmd_verify(args: argparse.Namespace) -> int:
                 "require_pinned_evidence": args.require_pinned_evidence,
                 "require_discriminating_tests": args.require_discriminating_tests,
                 "custom_test_command": args.test_command is not None,
+                "test_timeout_seconds": args.test_timeout,
             },
         )
         if args.record
@@ -657,7 +695,7 @@ async def cmd_verify(args: argparse.Namespace) -> int:
             timeout=args.timeout,
             seed=args.seed,
             manifest=manifest,
-            test_command=args.test_command.split() if args.test_command else None,
+            test_command=test_command,
             run_tests=not args.no_run_tests,
             require_tests=args.require_tests or args.require_pinned_evidence,
             require_pinned_evidence=args.require_pinned_evidence,
@@ -665,6 +703,7 @@ async def cmd_verify(args: argparse.Namespace) -> int:
             base_ref=base_ref,
             require_discriminating_tests=args.require_discriminating_tests,
             trace=recorder.trace if recorder else None,
+            test_timeout=args.test_timeout,
         )
     except Exception as e:
         _record_error(recorder, e)
