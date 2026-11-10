@@ -28,8 +28,8 @@ import sys
 from pathlib import Path
 from typing import NoReturn
 
+from . import __version__, config, display, doctor, evals, plan_review, replay, run_records, verify
 from . import criteria as crit
-from . import display, doctor, evals, plan_review, replay, run_records, verify
 from .debate import run_debate, run_followup_loop
 from .evidence import TEST_TIMEOUT
 from .models import (
@@ -94,7 +94,7 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--timeout",
         type=float,
-        default=DEFAULT_TIMEOUT,
+        default=None,
         metavar="SEC",
         help=f"Per-call timeout in seconds (default: {DEFAULT_TIMEOUT:.0f})",
     )
@@ -109,6 +109,17 @@ def _add_common(p: argparse.ArgumentParser) -> None:
         "--allow-tools",
         action="store_true",
         help="Let providers use their full toolset (default: read-only where supported)",
+    )
+    p.add_argument(
+        "--config",
+        metavar="FILE",
+        help=f"Project settings to use (default: {config.DEDICATED_FILE}, or "
+        f"[tool.arbiter] in {config.PYPROJECT_FILE}, in this directory)",
+    )
+    p.add_argument(
+        "--no-config",
+        action="store_true",
+        help="Ignore the project's settings file; use only flags and built-in defaults",
     )
     p.add_argument(
         "--json",
@@ -128,14 +139,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Exit codes: 0 pass · 1 fail · 2 usage · 3 unclear · 4 runtime error",
     )
+    parser.add_argument("-V", "--version", action="version", version=f"arbiter {__version__}")
     sub = parser.add_subparsers(dest="command")
 
     v = sub.add_parser("verify", help="Gate a diff against an approved plan")
     v.add_argument(
         "--plan",
-        required=True,
         metavar="FILE",
-        help="Approved plan (markdown file, or '-' for stdin)",
+        help="Approved plan (markdown file, or '-' for stdin). Required unless the "
+        "project settings name one.",
     )
     v.add_argument(
         "--diff",
@@ -146,24 +158,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="bare, or 'staged' (default), 'working', a revision range like "
         "origin/main...HEAD, a path, or '-' for stdin",
     )
+    # Each of these can also come from the project settings, so each has a
+    # negative form: a flag has to be able to switch off what a file switched on.
     v.add_argument(
         "--require-tests",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help="Treat an untested criterion as a failure rather than a warning",
     )
     v.add_argument(
-        "--no-run-tests",
-        action="store_true",
-        help="Check that cited tests exist, but do not execute them",
+        "--run-tests",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Execute cited tests (the default); --no-run-tests only checks they exist",
     )
     v.add_argument(
         "--require-pinned-evidence",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help="Require plan-selected, unchanged test evidence (implies --require-tests)",
     )
     v.add_argument(
         "--require-discriminating-tests",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help="Re-run cited tests against the base revision; reject ones that pass there too",
     )
     v.add_argument(
@@ -184,7 +202,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     v.add_argument(
         "--test-timeout",
         type=float,
-        default=TEST_TIMEOUT,
+        default=None,
         metavar="SEC",
         help=f"Seconds one cited test may run before it is cut off (default: {TEST_TIMEOUT:.0f})",
     )
@@ -295,7 +313,7 @@ def _installed_providers(panel_only: bool = False) -> list[str]:
     return [k for k in candidates if shutil.which(PROVIDERS[k].cli)]
 
 
-def _resolve_models(spec: str | None, judge: str | None) -> tuple[list[str], str]:
+def _resolve_models(spec: str | list[str] | None, judge: str | None) -> tuple[list[str], str]:
     """Validate provider names. Unknown names are a usage error, not silently
     dropped — `--models claude,gpt4` used to run a one-model 'debate'.
 
@@ -321,7 +339,7 @@ def _resolve_models(spec: str | None, judge: str | None) -> tuple[list[str], str
             )
     else:
         keys, unknown = [], []
-        for raw in spec.split(","):
+        for raw in spec.split(",") if isinstance(spec, str) else spec:
             name = raw.strip().lower()
             if not name:
                 continue
@@ -342,19 +360,24 @@ def _resolve_models(spec: str | None, judge: str | None) -> tuple[list[str], str
     return keys, judge
 
 
-def _parse_test_command(raw: str | None) -> list[str] | None:
+def _parse_test_command(raw: str | list[str] | None) -> list[str] | None:
     """Split --test-command the way a shell would, and check it can start.
 
     `str.split` broke every argument that contained a space. And a command that
     could not be launched was only discovered after the reviewers had been paid
     for — as a run in which no cited test could be executed.
+
+    A list, which only the settings file can supply, is already split.
     """
     if raw is None:
         return None
-    try:
-        command = shlex.split(raw, posix=os.name != "nt")
-    except ValueError as e:
-        _usage_error(f"--test-command could not be parsed ({e}): {raw}")
+    if isinstance(raw, str):
+        try:
+            command = shlex.split(raw, posix=os.name != "nt")
+        except ValueError as e:
+            _usage_error(f"--test-command could not be parsed ({e}): {raw}")
+    else:
+        command = list(raw)
     if not command:
         _usage_error("--test-command is empty.")
     if shutil.which(command[0]) is None:
@@ -363,6 +386,57 @@ def _parse_test_command(raw: str | None) -> list[str] | None:
             "test could be run."
         )
     return command
+
+
+# What each configurable setting falls back to when neither the command line
+# nor the project file supplies it. argparse leaves an option that was not
+# given at None, which is how "not given" stays distinguishable from a default.
+_BUILT_IN: dict[str, object] = {
+    "models": None,
+    "judge": None,
+    "timeout": DEFAULT_TIMEOUT,
+    "plan": None,
+    "base": None,
+    "require-tests": False,
+    "require-pinned-evidence": False,
+    "require-discriminating-tests": False,
+    "run-tests": True,
+    "test-command": None,
+    "test-timeout": TEST_TIMEOUT,
+}
+
+
+def _apply_settings(args: argparse.Namespace) -> config.Config:
+    """Fill in whatever the command line left unsaid: project file, then default.
+
+    Precedence is flag, then file, then built-in. Only commands that call a
+    model read the project file; the rest have nothing in it to read.
+    """
+    if not hasattr(args, "no_config"):
+        return config.Config()
+    if args.no_config and args.config:
+        _usage_error("--config and --no-config cannot be used together.")
+    try:
+        settings = (
+            config.Config()
+            if args.no_config
+            else config.load(Path(args.config) if args.config else None)
+        )
+    except config.ConfigError as e:
+        _usage_error(f"{e} (Pass --no-config to run without a settings file.)")
+
+    for key, built_in in _BUILT_IN.items():
+        name = key.replace("-", "_")
+        if hasattr(args, name) and getattr(args, name) is None:
+            setattr(args, name, settings.values.get(key, built_in))
+
+    if args.timeout <= 0:
+        _usage_error("--timeout must be greater than zero.")
+    if settings.source is not None:
+        display.print_note(
+            f"Settings from {settings.source} (flags on the command line override it)."
+        )
+    return settings
 
 
 def _read_prompt(arg: str | None) -> str:
@@ -602,6 +676,10 @@ async def cmd_plan_pin(args: argparse.Namespace) -> int:
 
 
 async def cmd_verify(args: argparse.Namespace) -> int:
+    if not args.plan:
+        _usage_error(
+            "verify needs a plan: pass --plan FILE, or set `plan` in the project settings."
+        )
     keys, judge = _resolve_models(args.models, args.judge)
     isolation = "open" if args.allow_tools else "readonly"
     base_ref = args.base or verify.resolve_base_ref(args.diff)
@@ -610,7 +688,7 @@ async def cmd_verify(args: argparse.Namespace) -> int:
     # for any provider calls. Fail-closed evidence semantics remain the backstop
     # for runtime failures after a valid configuration starts.
     if args.require_discriminating_tests:
-        if args.no_run_tests:
+        if not args.run_tests:
             _usage_error(
                 "--require-discriminating-tests cannot be used with --no-run-tests; "
                 "cited tests must run on both revisions."
@@ -623,7 +701,7 @@ async def cmd_verify(args: argparse.Namespace) -> int:
     if args.test_timeout <= 0:
         _usage_error("--test-timeout must be greater than zero.")
     # Unused when tests are not run, so a stale value there is not an error.
-    test_command = None if args.no_run_tests else _parse_test_command(args.test_command)
+    test_command = _parse_test_command(args.test_command) if args.run_tests else None
 
     plan = verify.read_plan(args.plan)
     try:
@@ -660,13 +738,14 @@ async def cmd_verify(args: argparse.Namespace) -> int:
                 "seed": args.seed,
                 "isolation": isolation,
                 "base_ref": base_ref,
-                "run_tests": not args.no_run_tests,
+                "run_tests": args.run_tests,
                 "scrub_test_environment": not args.no_scrub_test_env,
                 "require_tests": args.require_tests or args.require_pinned_evidence,
                 "require_pinned_evidence": args.require_pinned_evidence,
                 "require_discriminating_tests": args.require_discriminating_tests,
                 "custom_test_command": args.test_command is not None,
                 "test_timeout_seconds": args.test_timeout,
+                "settings_file": str(args.settings.source) if args.settings.source else None,
             },
         )
         if args.record
@@ -696,7 +775,7 @@ async def cmd_verify(args: argparse.Namespace) -> int:
             seed=args.seed,
             manifest=manifest,
             test_command=test_command,
-            run_tests=not args.no_run_tests,
+            run_tests=args.run_tests,
             require_tests=args.require_tests or args.require_pinned_evidence,
             require_pinned_evidence=args.require_pinned_evidence,
             scrub_env=not args.no_scrub_test_env,
@@ -998,6 +1077,7 @@ async def _dispatch(args: argparse.Namespace) -> int:
     # In --json mode stdout carries the result and nothing else; progress and
     # live streaming go to stderr, so `arbiter verify --json | jq` just works.
     display.set_json_mode(getattr(args, "as_json", False))
+    args.settings = _apply_settings(args)
     if args.command == "verify":
         return await cmd_verify(args)
     if args.command == "plan":
