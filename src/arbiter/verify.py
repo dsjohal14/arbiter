@@ -20,18 +20,24 @@ import json
 import re
 import subprocess
 import sys
+from collections.abc import Callable
 from contextlib import nullcontext
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 from . import display
 from .criteria import Criterion
 from .evidence import (
+    ERRORED,
+    FAILED,
+    MISSING,
+    TEST_TIMEOUT,
     EvidenceCheck,
     base_worktree,
     check_file_citation,
     check_test_citation,
     check_test_discriminates,
+    node_id,
     test_citation_path,
     test_node_changed,
 )
@@ -482,6 +488,12 @@ def parse_review(raw: str, criteria: list[Criterion]) -> tuple[dict[str, dict], 
 # ── Mechanical checking ───────────────────────────────────────────────────────
 
 
+# One verification's test runs, keyed by what was run. Several criteria commonly
+# rest on the same proof, and each run is a fresh interpreter plus the project's
+# own import time.
+EvidenceCache = dict[tuple[str, str], EvidenceCheck]
+
+
 def gather_evidence(
     result: CriterionResult,
     root: Path | None = None,
@@ -490,25 +502,72 @@ def gather_evidence(
     scrub_env: bool = True,
     base_ref: str | None = None,
     base_dir: Path | None = None,
+    test_timeout: float = TEST_TIMEOUT,
+    cache: EvidenceCache | None = None,
 ) -> CriterionResult:
     """Touch the filesystem: resolve cited lines and run cited tests.
 
     Split from the downgrade rules below so `replay` can re-derive a verdict from
     evidence checks that were recorded earlier, without re-running anything.
     """
+
+    def once(kind: str, citation: str, check: Callable[[], EvidenceCheck]) -> EvidenceCheck:
+        if cache is None:
+            return check()
+        key = (kind, node_id(citation) or citation)
+        if key not in cache:
+            cache[key] = check()
+        # A copy, so two criteria never share one mutable check.
+        return replace(cache[key])
+
     if result.implementation_evidence:
         result.impl_check = check_file_citation(result.implementation_evidence, root)
-    if result.test_evidence:
-        result.test_check = check_test_citation(
-            result.test_evidence, root, test_command, run=run_tests, scrub_env=scrub_env
+    if citation := result.test_evidence:
+        result.test_check = once(
+            "test",
+            citation,
+            lambda: check_test_citation(
+                citation,
+                root,
+                test_command,
+                run=run_tests,
+                scrub_env=scrub_env,
+                timeout=test_timeout,
+            ),
         )
 
-    # Does the cited test actually distinguish this change from the base?
-    if result.test_evidence and base_ref and result.test_check and result.test_check.verified:
-        result.baseline_check = check_test_discriminates(
-            result.test_evidence, root or Path.cwd(), base_ref, test_command, scrub_env, base_dir
-        )
+        # Does the cited test actually distinguish this change from the base?
+        if base_ref and result.test_check.verified:
+            result.baseline_check = once(
+                "baseline",
+                citation,
+                lambda: check_test_discriminates(
+                    citation,
+                    root or Path.cwd(),
+                    base_ref,
+                    test_command,
+                    scrub_env,
+                    base_dir,
+                    test_timeout,
+                ),
+            )
     return result
+
+
+def _test_outcome(check: EvidenceCheck | None) -> str | None:
+    """What running the cited test produced, as the rules below need it.
+
+    A record written before outcomes were stored spelled the same fact in the
+    check's prose. Reading it back the way it was written is what keeps those
+    records replaying to the verdict they recorded.
+    """
+    if check is None:
+        return None
+    if check.outcome is not None:
+        return check.outcome
+    if check.verified is False:
+        return FAILED if check.detail.startswith("failed") else MISSING
+    return None
 
 
 def apply_downgrades(
@@ -534,12 +593,17 @@ def apply_downgrades(
             result.downgraded_from = original
             result.downgrade_reason = why
 
-    # A cited test that actually fails is the strongest signal available.
-    if result.test_check and result.test_check.verified is False:
-        if result.test_check.detail.startswith("failed"):
-            downgrade("unmet", f"cited test fails: {result.test_evidence}")
-        else:
-            downgrade("untested", f"cited test does not exist: {result.test_evidence}")
+    outcome = _test_outcome(result.test_check)
+    if outcome == FAILED:
+        # A cited test that actually fails is the strongest signal available.
+        downgrade("unmet", f"cited test fails: {result.test_evidence}")
+    elif outcome == ERRORED:
+        # It neither passed nor failed, so it settles nothing either way. This
+        # is not the same as a test nobody wrote: the proof was attempted and
+        # broke, and a broken proof must not be able to read as a clean pass.
+        downgrade("unverifiable", f"cited test did not run to a result: {result.test_evidence}")
+    elif outcome == MISSING:
+        downgrade("untested", f"cited test does not exist: {result.test_evidence}")
 
     # A citation that does not resolve means the claim rests on nothing.
     if result.impl_check and result.impl_check.verified is False:
@@ -591,6 +655,8 @@ def apply_evidence_checks(
     base_ref: str | None = None,
     base_dir: Path | None = None,
     require_discriminating_tests: bool = False,
+    test_timeout: float = TEST_TIMEOUT,
+    cache: EvidenceCache | None = None,
 ) -> CriterionResult:
     """Check this criterion's cited evidence, then let the facts override it.
 
@@ -600,7 +666,17 @@ def apply_evidence_checks(
     With `require_pinned_evidence`, a model-chosen test cannot reach `met`, and a
     plan-selected test changed by this diff requires renewed human approval.
     """
-    gather_evidence(result, root, test_command, run_tests, scrub_env, base_ref, base_dir)
+    gather_evidence(
+        result,
+        root,
+        test_command,
+        run_tests,
+        scrub_env,
+        base_ref,
+        base_dir,
+        test_timeout,
+        cache,
+    )
     return apply_downgrades(result, require_pinned_evidence, require_discriminating_tests)
 
 
@@ -802,6 +878,7 @@ async def run_verify(
     base_ref: str | None = None,
     require_discriminating_tests: bool = False,
     trace: RunTrace | None = None,
+    test_timeout: float = TEST_TIMEOUT,
 ) -> VerifyResult:
     manifest = manifest if manifest is not None else build_manifest(diff, root)
     diff_paths = changed_paths(diff)
@@ -884,6 +961,7 @@ async def run_verify(
             # Must happen before check_test_discriminates copies current test
             # files over their base versions in the shared worktree.
             refresh_plan_selected_evidence(results, root or Path.cwd(), base_dir)
+        cache: EvidenceCache = {}
         for r in results:
             apply_evidence_checks(
                 r,
@@ -895,6 +973,8 @@ async def run_verify(
                 base_ref if want_baseline else None,
                 base_dir,
                 require_discriminating_tests,
+                test_timeout,
+                cache,
             )
 
     return finalize_verify(

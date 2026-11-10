@@ -193,6 +193,49 @@ def test_verified_citations_quote_the_real_source_line(gate, capsys):
     assert "return sum(items)" in capsys.readouterr().out
 
 
+def test_a_proof_that_was_skipped_cannot_carry_a_criterion(gate, repo, capsys):
+    """pytest exits 0 for a skipped test. Reading that as a pass let an agent
+    turn a red proof green by marking it `skip`."""
+    (repo / "tests" / "test_skipped.py").write_text(
+        "import pytest\n\n\n"
+        "@pytest.mark.skip(reason='red since the refactor, will fix later')\n"
+        "def test_sums_all():\n    assert False\n"
+    )
+    report = _review(
+        [
+            _ac("AC-1", "met", "app.py:2", "tests/test_skipped.py::test_sums_all"),
+            _ac("AC-2", "met", "app.py:2", "tests/test_app.py::test_empty_list"),
+        ]
+    )
+
+    assert gate(report, "--require-tests") == EXIT_FAIL
+
+    out = capsys.readouterr().out
+    assert "UNTESTED" in out
+    assert "red since the refactor, will fix later" in out
+
+
+def test_a_proof_that_cannot_even_be_imported_is_not_a_clean_pass(gate, repo, capsys):
+    """This used to be reported as a test that does not exist, which is merely
+    `untested` — so a proof broken by the change under review passed the gate."""
+    (repo / "tests" / "test_broken_module.py").write_text(
+        "from app import a_name_this_change_removed\n\n\ndef test_x():\n    assert True\n"
+    )
+    report = _review(
+        [
+            _ac("AC-1", "met", "app.py:2", "tests/test_broken_module.py::test_x"),
+            _ac("AC-2", "met", "app.py:2", "tests/test_app.py::test_empty_list"),
+        ]
+    )
+
+    assert gate(report) == EXIT_UNCLEAR
+
+    out = capsys.readouterr().out
+    assert "UNVERIFIABLE" in out
+    assert "did not run to a result" in out
+    assert "a_name_this_change_removed" in out, "the real cause should be quoted"
+
+
 # ── JSON ─────────────────────────────────────────────────────────────────────
 
 
@@ -236,6 +279,7 @@ def test_verify_can_write_a_replayable_run_record(gate, repo, capsys):
     assert record["result"] == output
     observed = {row["id"]: row for row in record["observations"]["criteria_evidence"]}
     assert observed["AC-2"]["test_check"]["verified"] is True
+    assert observed["AC-2"]["test_check"]["outcome"] == "passed"
     assert record["observations"]["blinding"] == output["blinding"]
     assert "tests/test_app.py" in record["workspace"]["files"]
     assert "run.json" not in record["workspace"]["files"]

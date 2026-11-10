@@ -29,7 +29,13 @@ from .models import ModelResponse, Session
 # tree (or the whole non-Git directory) and separates replay observations from
 # the result they are used to reproduce. Older records remain replayable, but
 # cannot support an exact replay check or be bound to a verify eval case.
-SCHEMA_VERSION = 3
+#
+# v4 states what running each cited test produced (`outcome`) on its evidence
+# check, and the downgrade rules key on that instead of on the check's prose.
+# The document shape is otherwise v3's. The bump exists for older readers: one
+# that applied prose rules to a v4 record would reach a different status for an
+# errored or skipped test, so it has to refuse the record rather than guess.
+SCHEMA_VERSION = 4
 
 MAX_WORKSPACE_FILES = 100_000
 MAX_WORKSPACE_FILE_BYTES = 512 * 1024 * 1024
