@@ -168,6 +168,62 @@ def test_a_missing_test_file_is_reported_not_punished(repo):
     assert check.verified is None
 
 
+# The base run is classified by what happened to the test there, the same way
+# the current run is — not by whether the word "error" turns up early in its
+# output with no "assert" after it.
+
+
+def _add_count(repo):
+    (repo / "app.py").write_text(
+        "def total(items):\n    return sum(items)\n\n\ndef count(items):\n    return len(items)\n"
+    )
+
+
+def test_a_test_that_cannot_be_collected_against_the_base_is_not_evidence(repo):
+    """It imports something this change introduced, so against the old code it
+    never reaches an assertion. That is neither a pass nor a failure."""
+    _add_count(repo)
+    (repo / "tests" / "test_count.py").write_text(
+        "from app import count\n\n\ndef test_count():\n    assert count([1, 2]) == 2\n"
+    )
+
+    check = check_test_discriminates("tests/test_count.py::test_count", repo, "main", PYTEST)
+
+    assert check.verified is None
+    assert "could not run against main" in check.detail
+    assert "cannot import name 'count'" in check.detail, "the reason should be the real one"
+
+
+def test_a_test_that_crashes_against_the_base_still_discriminates(repo):
+    """The old code crashing where the new code works is the change making the
+    test pass, whether or not what it raised was an AssertionError."""
+    _add_count(repo)
+    (repo / "tests" / "test_count.py").write_text(
+        "import app\n\n\ndef test_count():\n    total = app.count([1, 2])\n    assert total == 2\n"
+    )
+
+    check = check_test_discriminates("tests/test_count.py::test_count", repo, "main", PYTEST)
+
+    assert check.verified is True
+    assert "fails against main" in check.detail
+
+
+def test_a_test_skipped_against_the_base_did_not_pass_there(repo):
+    """pytest exits 0 for a skip, which used to read as "passes against the base
+    too" — a statement about a test that never ran."""
+    _add_count(repo)
+    (repo / "tests" / "test_count.py").write_text(
+        "import pytest\n\nimport app\n\n\n"
+        "@pytest.mark.skipif(not hasattr(app, 'count'), reason='needs count()')\n"
+        "def test_count():\n    assert app.count([1, 2]) == 2\n"
+    )
+
+    check = check_test_discriminates("tests/test_count.py::test_count", repo, "main", PYTEST)
+
+    assert check.verified is None
+    assert "skipped" in check.detail and "needs count()" in check.detail
+
+
 # ── Diff analysis ────────────────────────────────────────────────────────────
 
 ADDED = """diff --git a/tests/test_new.py b/tests/test_new.py

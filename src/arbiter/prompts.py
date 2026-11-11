@@ -58,6 +58,34 @@ def blind(
     return blinded, Blinding(seed=seed, label_to_model=mapping)
 
 
+# ── Fencing untrusted text ────────────────────────────────────────────────────
+
+
+def make_fence(*bodies: str) -> str:
+    """A delimiter for untrusted text that the text itself cannot contain.
+
+    The delimiter used to be a constant, and a constant in a public repository
+    is not a secret: a diff could carry the closing delimiter, end its own fence
+    early, and carry on as though it were instructions. A token drawn fresh for
+    each prompt, after the fenced text is already fixed, cannot be anticipated
+    by whoever wrote that text — and it is checked against the text anyway, so
+    a collision is ruled out rather than merely improbable.
+
+    This closes the trivial version of prompt injection. It does not make a
+    model safe against text that is simply persuasive; the mitigations for that
+    are downstream, in what is checked mechanically.
+    """
+    while True:
+        fence = f"{secrets.token_hex(8)}-arbiter"
+        if not any(fence in body for body in bodies):
+            return fence
+
+
+def fenced(fence: str, label: str, body: str) -> str:
+    """Wrap attacker-controllable text so a model can tell it from instructions."""
+    return f"<<<{fence}:{label}\n{body}\n{fence}:{label}>>>"
+
+
 # ── Debate prompts ───────────────────────────────────────────────────────────
 
 

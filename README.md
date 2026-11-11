@@ -8,6 +8,7 @@ Before coding, Arbiter finds the holes in the plan. After coding, it checks
 whether the agent kept every promise.
 
 ```bash
+arbiter init                   # set a project up
 arbiter plan review plan.md    # is this plan good enough to build from?
 arbiter plan pin plan.md       # this is the approved contract
 arbiter verify --plan plan.md --diff   # did the implementation keep it?
@@ -119,11 +120,22 @@ reviewer's verdict is a ceiling, never a floor:
 
 | The reviewer said | Reality | Result |
 |---|---|---|
-| `met`, cites a test | the test fails | **`unmet`** |
+| `met`, cites a test | the test fails — including one marked `xfail` | **`unmet`** |
+| `met`, cites a test | the test errors, cannot be imported, or times out | `unverifiable` |
+| `met`, cites a test | the test was skipped or deselected | `untested` |
 | `met`, cites a test | no such test | `untested` |
 | `met`, no test cited | — | `untested` |
 | `met`, cites `app.py:900` | file has 40 lines | `unverifiable` |
 | `unmet` | test passes | stays `unmet` |
+
+What happened to a test is read from the runner's own structured report, never
+inferred from an exit status or from words in its output. Both of those lie
+about a single test: pytest exits 0 for a test that was skipped and for one
+that failed as an expected failure, exits non-zero for a *passing* test when a
+coverage threshold in the project's config trips, and a failing assertion is
+free to print "not found". A proof that was attempted and broke is
+`unverifiable`, not `untested` — it is not the same thing as a test nobody
+wrote, and it must not be able to read as a clean pass.
 
 ### The honest limit
 
@@ -225,8 +237,9 @@ The verdict is derived mechanically. No model gets a vote:
 | a reviewer failed or returned an incomplete review | `unclear` | `3` |
 | otherwise | `pass` | `0` |
 
-Also `2` usage error and `4` runtime error. `unclear` has its own code so CI can
-tell "the reviewers weren't confident" from "you called it wrong."
+Also `2` usage error and `4` runtime error, and `130` / `143` when interrupted
+by Ctrl-C or SIGTERM. `unclear` has its own code so CI can tell "the reviewers
+weren't confident" from "you called it wrong."
 
 A partial reviewer panel can never produce a clean pass — the reviewers that
 didn't run are exactly the ones that might have found something.
@@ -236,10 +249,18 @@ didn't run are exactly the ones that might have found something.
 ## Install
 
 ```bash
-git clone https://github.com/dsjohal/arbiter && cd arbiter
+git clone https://github.com/dsjohal14/arbiter && cd arbiter
 uv tool install .        # or: pip install -e .
-arbiter doctor
+arbiter doctor           # are the provider CLIs installed and logged in?
 ```
+
+Then, in the project you want to verify:
+
+```bash
+arbiter init             # settings, a plan to fill in, and an ignore rule for run records
+```
+
+`init` never overwrites: a file that exists is left as it is and reported.
 
 No API keys and no Python dependencies — Arbiter drives CLI tools you already
 have and are already logged into.
@@ -293,6 +314,106 @@ arbiter verify --plan plan.md --diff origin/main...HEAD   # a revision range
 git diff | arbiter verify --plan plan.md --diff -         # stdin
 ```
 
+### Project settings
+
+A gate is only as strict as its loosest invocation. With the flags spread over
+a CI workflow, a pre-commit hook, and somebody's shell history, the three
+drift — and the loosest is the one that ships. State them once:
+
+```toml
+# pyproject.toml — or the same keys at the top level of .arbiter.toml
+[tool.arbiter]
+plan = "docs/plan.md"
+models = ["claude", "codex"]
+require-tests = true
+test-command = ["uv", "run", "pytest"]
+```
+
+Then `arbiter verify --diff` is the whole command, everywhere.
+
+| Setting | Flag it stands in for |
+|---|---|
+| `plan` | `--plan` |
+| `models`, `judge` | `--models`, `--judge` |
+| `timeout`, `retries` | `--timeout`, `--retries` |
+| `consolidate` | `--consolidate` |
+| `require-tests`, `require-pinned-evidence`, `require-discriminating-tests` | the flags of the same name |
+| `run-tests` | `--run-tests` / `--no-run-tests` |
+| `test-command`, `test-timeout`, `base` | `--test-command`, `--test-timeout`, `--base` |
+
+A flag on the command line always wins, in both directions: every boolean has a
+negative form (`--no-require-tests`), so a flag can switch off what the file
+switched on. `--config FILE` picks a file; `--no-config` ignores it.
+
+Two rules are deliberate:
+
+- **Everything fails closed.** An unknown key, a value of the wrong type, and
+  two settings files in one directory are all usage errors, raised before any
+  provider is called. `require-test = true` quietly enforcing nothing is the
+  worst thing a gate's configuration can do.
+- **A repository cannot grant itself access.** `--allow-tools` and
+  `--no-scrub-test-env` widen what a run can touch on the machine running it,
+  so they are accepted only on the command line. A file that arrives with the
+  code under review does not get to make that decision.
+
+Only the directory Arbiter runs in is searched, because that is the directory
+citations resolve against.
+
+### What a run shows
+
+Reviewers answer in JSON meant for a parser, so that is not what you watch. On
+a terminal a run is a status board, redrawn in place:
+
+```
+  ✓ claude (sonnet)            38.2s  reviewed · 12.8k in · 612 out · $0.0412
+  ⠹ codex                       0:41  reviewing · 2,104 characters back
+  ○ consolidation                     waiting
+  ○ evidence                          waiting
+```
+
+Into a pipe — a CI log — it is one line per finished step and no escape codes.
+`-v` shows the raw provider streams and the exact commands behind them instead.
+Every run ends by saying what it took:
+
+```
+  2 provider calls in 41.6s · $0.0412 for the 1 of 2 calls that reported a cost
+```
+
+That cost is only ever the sum of what providers themselves reported, and it
+says how many calls it covers. The same roll-up is in `--json` (as `usage`,
+beside the result) and in the run record.
+
+### When consolidation runs
+
+Consolidation reconciles reviewers that disagree. It is a serial call, made
+after every reviewer has finished, usually to the most expensive model on the
+panel — and with one reviewer, or with reviewers that already agree on every
+criterion, it reconciles nothing. So by default it is skipped there, which
+removes a whole model call from the common path:
+
+```
+  · consolidation skipped: all 2 reviewers agree on every criterion
+```
+
+Skipping is the conservative direction. Without a consolidator, each criterion
+takes the worst status any reviewer gave it; a consolidator may overrule a
+reviewer. `--consolidate always` makes the call regardless, and `never` never
+does. A report that does not give a verdict for every criterion always goes to
+consolidation: a provider without structured output answers in prose, and
+reading that is work a consolidator can do.
+
+### Retries
+
+A failed provider call is tried again once (`--retries N`). Without that, one
+overloaded provider turns a whole verification into `unclear`, and rerunning it
+pays again for every call that worked. A failure that cannot end differently is
+not repeated — a missing CLI, a login problem — and neither is a timeout, which
+is not a failure to answer but an answer that took longer than it was given.
+Every attempt is recorded as a call, because a failed one still took time and
+may have been billed.
+
+### Run records
+
 Keep a versioned run record when you want an audit trail, a way to re-derive a
 verdict for free, or an input for an eval corpus:
 
@@ -304,9 +425,10 @@ arbiter verify --plan plan.md --diff origin/main...HEAD \
 ```
 
 The record embeds the exact plan and diff with SHA-256 digests, normalized
-configuration, every extractor/reviewer/consolidator final response or failure,
-per-call token counts and cost where the provider reports them, evidence and
-blinding observations, the final result, timing, and exit code. Verify records
+configuration, every attempt of every extractor/reviewer/consolidator call with
+its final response or failure, per-call token counts and cost where the provider
+reports them and a roll-up of both, evidence and blinding observations, the
+final result, timing, and exit code. Verify records
 also hash every Git-visible file in the working tree (or every file in a
 non-Git tree except standard test/cache artifacts) so eval scoring can bind the
 result to unchanged tests, fixtures, helpers, and imports as well as files named
@@ -375,7 +497,9 @@ of this repo today".
 Record schemas v1 and v2 stored those replay inputs inside the result itself.
 They remain readable for zero-cost replay, but cannot pass `--check`: only v3+
 can certify that the independently restored inputs reproduce the expected
-output exactly.
+output exactly. v4 additionally states what running each cited test produced,
+and the verdict rules key on that; v3 records keep replaying through the rules
+they were written under.
 
 ### `arbiter eval` — how often is it right?
 
@@ -398,17 +522,59 @@ arbiter eval score evals/<case> --record run.json     # exits 0 when the run mat
 
 Format, workflow, and the starter cases: [`evals/README.md`](evals/README.md).
 
-In CI:
+### In CI
 
 ```yaml
-- run: arbiter verify --plan plan.md --diff origin/main...HEAD --json > verdict.json
+jobs:
+  arbiter:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # the pull request's range needs history
+      # Install and authenticate at least one provider CLI here, with your own
+      # credentials. Arbiter drives those CLIs; it does not replace them.
+      - uses: dsjohal14/arbiter@main
+        with:
+          plan: docs/plan.md      # omit if the project settings name it
+          args: --require-tests
 ```
 
-In a pre-commit hook:
+The action verifies the pull request's own changes by default, adds the verdict
+to the job summary as markdown, and fails the job on `fail` or `unclear`
+(`fail-on-unclear: "false"` to only warn). It exposes `verdict`, `exit-code`,
+and the paths to the full `json` and markdown `summary` as outputs.
+
+> Checking test evidence **executes tests from the branch under review**, with
+> whatever the job can reach. For pull requests from forks, or any code you do
+> not trust, pass `args: --no-run-tests`. See [Trust boundary](#trust-boundary).
+
+Anywhere else, `--summary FILE` writes the same markdown and `--json` the full
+result:
 
 ```bash
-arbiter verify --plan plan.md --diff --require-tests || exit 1   # your own code
+arbiter verify --diff origin/main...HEAD --json --summary summary.md > verdict.json
 ```
+
+Everything in that markdown that came from a model or from the diff is made
+inert before it is written: it cannot notify anyone, open a link or a tag, or
+end the code block it sits in. It is going to be rendered next to a merge
+button.
+
+### As a pre-commit hook
+
+```yaml
+repos:
+  - repo: https://github.com/dsjohal14/arbiter
+    rev: main
+    hooks:
+      - id: arbiter-verify      # gates the staged change
+```
+
+With `plan` in the project settings the hook needs no arguments; otherwise add
+`args: [--plan, plan.md]`. It makes real provider calls on every commit — to run
+it on push instead, set `stages: [pre-push]` and
+`args: [--diff, "origin/main...HEAD"]`.
 
 ### Why criteria are pinned
 
@@ -429,7 +595,7 @@ The extracted list is a starting point. Read it and edit it — it's your contra
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--apply` | off | (`plan review`) Write the proposed criteria into the plan |
-| `--plan` | — | Plan file (or `-` for stdin). Required by `verify`. |
+| `--plan` | — | Plan file (or `-` for stdin). Required by `verify` unless the settings name one. |
 | `--diff` | `staged` | Bare, or `working`, a revision range, a path, or `-` |
 | `--require-tests` | off | Treat `untested` as a failure |
 | `--require-pinned-evidence` | off | Require plan-selected tests; implies `--require-tests` |
@@ -437,7 +603,12 @@ The extracted list is a starting point. Read it and edit it — it's your contra
 | `--base` | inferred | Base revision for the discrimination check |
 | `--no-run-tests` | off | Check cited tests exist, don't execute them |
 | `--no-scrub-test-env` | off | Run cited tests with the full environment |
-| `--test-command` | autodetect | Test runner (only pytest is autodetected) |
+| `--test-command` | autodetect | Test runner (only pytest is autodetected), split like a shell would |
+| `--test-timeout` | `120` | Seconds one cited test may run before it is cut off |
+| `--consolidate` | `auto` | `auto`, `always`, or `never` — see [When consolidation runs](#when-consolidation-runs) |
+| `--retries` | `1` | Times a failed provider call is tried again |
+| `--summary` | off | (`plan review`, `verify`) Also write the result as markdown |
+| `--config` / `--no-config` | discovered | Use this settings file, or none |
 | `--record` | off | (`plan review`, `verify`) Write a sensitive, versioned JSON run record |
 | `--check` | off | (`replay`) Exit 0 only if the replay reproduces the record |
 | `--models` | installed defaults | Comma-separated reviewers; naming one requires it |
@@ -445,7 +616,9 @@ The extracted list is a starting point. Read it and edit it — it's your contra
 | `--all` | off | (`doctor`) Also check opt-in providers |
 | `--seed` | random | Reproduces an earlier run's blinding exactly |
 | `--json` | off | Result on stdout, progress on stderr |
+| `-v` | off | Show raw provider streams and the commands behind them |
 | `--allow-tools` | off | Let providers use their full toolset |
+| `--version` | — | Print the version |
 
 ### Also: `arbiter debate`
 
@@ -466,9 +639,10 @@ on untrusted code is dangerous.**
 Two distinct risks:
 
 **1. Prompt injection.** A diff is attacker-controllable text that goes into a
-model's context. Untrusted content is fenced and labelled as data, which removes
-the naive version of the attack, but no prompt-level measure makes this safe
-against someone deliberately trying to talk a reviewer into a pass.
+model's context. Untrusted content is fenced and labelled as data, with a
+delimiter drawn fresh for each prompt so the text cannot close its own fence.
+That removes the naive version of the attack, but no prompt-level measure makes
+this safe against someone deliberately trying to talk a reviewer into a pass.
 
 **2. Code execution.** This is the serious one. Checking test evidence *runs a
 test from the branch under review*. A hostile PR can put arbitrary Python in
@@ -489,6 +663,11 @@ Arbiter does not serialize credentials or environment variables directly.
 ```bash
 arbiter verify --plan plan.md --diff origin/main...HEAD --no-run-tests
 ```
+
+Add `--no-config` when the repository itself is not trusted: its settings file
+arrives with the code under review. (That file can never switch on
+`--allow-tools` or switch off environment scrubbing — those are command-line
+only — but it can name the test command.)
 
 `--no-run-tests` checks that cited tests exist without executing them. Do not use
 `--require-tests` on untrusted input — it pushes reviewers toward citing tests,
@@ -556,12 +735,17 @@ limits — `ARG_MAX` is 1 MiB on macOS, and Linux caps any single argument at
 ```
 src/arbiter/
 ├── cli.py           # subcommands, stdin, exit codes
+├── config.py        # project settings: validated, fail-closed
+├── scaffold.py      # `arbiter init`
 ├── plan_review.py   # critique a plan into proposed contract edits
 ├── criteria.py      # extract, pin, and read acceptance criteria
 ├── verify.py        # the gate: prompts, statuses, verdict derivation
 ├── evidence.py      # mechanical checking — read lines, run tests
 ├── debate.py        # debate rounds, judge parsing, follow-up loop
-├── streaming.py     # parallel block-streamed display coordinator
+├── streaming.py     # running reviewers concurrently; consolidation
+├── progress.py      # the live status board, and plain lines for a pipe
+├── report.py        # the result as markdown, made inert
+├── usage.py         # what a run took, added up without inventing a number
 ├── run_records.py   # versioned, atomic audit/eval records
 ├── replay.py        # re-derive a recorded run's result, calling nothing
 ├── evals.py         # eval-case schema, loading, and scoring
@@ -570,6 +754,9 @@ src/arbiter/
 ├── schema_files.py  # scoped temp schema files for file-based providers
 ├── display.py       # terminal output only — zero logic
 └── doctor.py        # install / auth / capability checks
+
+action.yml, action/run.sh   # the GitHub Action
+.pre-commit-hooks.yaml      # the pre-commit hook
 ```
 
 Adding a provider is one `Provider` entry plus a branch in the event parser.
@@ -623,8 +810,13 @@ provider — `make check` costs nothing and needs no login.
       implementing" and "don't declare it done until the gate passes"
 - [ ] Test-runner support beyond pytest (jest, cargo, go test)
 - [x] Per-call token counts, and cost where the provider reports it
-- [ ] Roll those up into a per-run cost summary and a corpus-wide one
-- [ ] Pre-commit hook and GitHub Action packaging
+- [x] Roll those up into a per-run cost summary
+- [ ] ...and a corpus-wide one (`arbiter eval report` over a directory of records)
+- [x] Pre-commit hook and GitHub Action packaging
+- [x] Project settings file, `arbiter init`, retries, a live status board
+- [ ] Flag a change that edits the gate's own inputs — its settings, or the
+      criteria pinned in its plan — rather than verifying under them silently
+- [ ] Run plan-selected proofs while the reviewers are still thinking
 
 ---
 

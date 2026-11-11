@@ -3,6 +3,7 @@
 
 Drives locally installed CLI tools; no API keys needed.
 
+    arbiter init                                # set a project up
     arbiter plan review plan.md                 # is this plan good enough to build?
     arbiter plan pin plan.md                    # extract + pin acceptance criteria
     arbiter verify --plan plan.md --diff        # the gate
@@ -21,14 +22,33 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
+import shlex
 import shutil
+import signal
 import sys
+import time
 from pathlib import Path
 from typing import NoReturn
 
+from . import (
+    __version__,
+    config,
+    display,
+    doctor,
+    evals,
+    plan_review,
+    progress,
+    replay,
+    report,
+    run_records,
+    scaffold,
+    usage,
+    verify,
+)
 from . import criteria as crit
-from . import display, doctor, evals, plan_review, replay, run_records, verify
 from .debate import run_debate, run_followup_loop
+from .evidence import TEST_TIMEOUT
 from .models import (
     DEFAULT_PANEL,
     DEFAULT_TIMEOUT,
@@ -37,6 +57,7 @@ from .models import (
     VALID_MODELS,
     IsolationMode,
     ModelCallError,
+    Session,
     call_session,
     make_arbiter_session,
     make_debater_sessions,
@@ -71,6 +92,21 @@ def _add_output_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("-v", "--verbose", action="store_true", help="Show more detail")
 
 
+def _add_consolidate(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--summary",
+        metavar="FILE",
+        help="Also write the result as markdown, for a pull request's job summary",
+    )
+    p.add_argument(
+        "--consolidate",
+        choices=config.CONSOLIDATE_MODES,
+        default=None,
+        help="When to make the consolidation call: auto (the default) skips it when "
+        "there is nothing to reconcile — one reviewer, or reviewers that agree",
+    )
+
+
 def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "-m",
@@ -91,9 +127,16 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--timeout",
         type=float,
-        default=DEFAULT_TIMEOUT,
+        default=None,
         metavar="SEC",
         help=f"Per-call timeout in seconds (default: {DEFAULT_TIMEOUT:.0f})",
+    )
+    p.add_argument(
+        "--retries",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Times a failed provider call is tried again (default: 1; a timeout is not retried)",
     )
     p.add_argument(
         "--seed",
@@ -106,6 +149,17 @@ def _add_common(p: argparse.ArgumentParser) -> None:
         "--allow-tools",
         action="store_true",
         help="Let providers use their full toolset (default: read-only where supported)",
+    )
+    p.add_argument(
+        "--config",
+        metavar="FILE",
+        help=f"Project settings to use (default: {config.DEDICATED_FILE}, or "
+        f"[tool.arbiter] in {config.PYPROJECT_FILE}, in this directory)",
+    )
+    p.add_argument(
+        "--no-config",
+        action="store_true",
+        help="Ignore the project's settings file; use only flags and built-in defaults",
     )
     p.add_argument(
         "--json",
@@ -125,14 +179,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Exit codes: 0 pass · 1 fail · 2 usage · 3 unclear · 4 runtime error",
     )
+    parser.add_argument("-V", "--version", action="version", version=f"arbiter {__version__}")
     sub = parser.add_subparsers(dest="command")
 
     v = sub.add_parser("verify", help="Gate a diff against an approved plan")
     v.add_argument(
         "--plan",
-        required=True,
         metavar="FILE",
-        help="Approved plan (markdown file, or '-' for stdin)",
+        help="Approved plan (markdown file, or '-' for stdin). Required unless the "
+        "project settings name one.",
     )
     v.add_argument(
         "--diff",
@@ -143,24 +198,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="bare, or 'staged' (default), 'working', a revision range like "
         "origin/main...HEAD, a path, or '-' for stdin",
     )
+    # Each of these can also come from the project settings, so each has a
+    # negative form: a flag has to be able to switch off what a file switched on.
     v.add_argument(
         "--require-tests",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help="Treat an untested criterion as a failure rather than a warning",
     )
     v.add_argument(
-        "--no-run-tests",
-        action="store_true",
-        help="Check that cited tests exist, but do not execute them",
+        "--run-tests",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Execute cited tests (the default); --no-run-tests only checks they exist",
     )
     v.add_argument(
         "--require-pinned-evidence",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help="Require plan-selected, unchanged test evidence (implies --require-tests)",
     )
     v.add_argument(
         "--require-discriminating-tests",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help="Re-run cited tests against the base revision; reject ones that pass there too",
     )
     v.add_argument(
@@ -179,10 +240,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Test runner for cited tests (default: autodetect pytest)",
     )
     v.add_argument(
+        "--test-timeout",
+        type=float,
+        default=None,
+        metavar="SEC",
+        help=f"Seconds one cited test may run before it is cut off (default: {TEST_TIMEOUT:.0f})",
+    )
+    v.add_argument(
         "--record",
         metavar="FILE",
         help="Write a sensitive, versioned JSON record of this run",
     )
+    _add_consolidate(v)
     _add_common(v)
 
     d = sub.add_parser("debate", help="Run a multi-model debate with a blinded judge")
@@ -217,6 +286,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="FILE",
         help="Write a sensitive, versioned JSON record of this run",
     )
+    _add_consolidate(rev)
     _add_common(rev)
 
     pin = plsub.add_parser("pin", help="Extract acceptance criteria and pin them into the plan")
@@ -252,6 +322,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     val.add_argument("cases", nargs="+", help="Evaluation case directories")
     _add_output_flags(val)
 
+    ini = sub.add_parser("init", help="Set this project up: settings, a plan, an ignore rule")
+    ini.add_argument(
+        "--plan",
+        default="PLAN.md",
+        metavar="FILE",
+        help="Where the plan lives (default: PLAN.md). Created if it does not exist.",
+    )
+
     doc = sub.add_parser("doctor", help="Check provider install, auth, and capabilities")
     doc.add_argument(
         "--no-probe", action="store_true", help="Check PATH only; skip the live authentication call"
@@ -285,7 +363,7 @@ def _installed_providers(panel_only: bool = False) -> list[str]:
     return [k for k in candidates if shutil.which(PROVIDERS[k].cli)]
 
 
-def _resolve_models(spec: str | None, judge: str | None) -> tuple[list[str], str]:
+def _resolve_models(spec: str | list[str] | None, judge: str | None) -> tuple[list[str], str]:
     """Validate provider names. Unknown names are a usage error, not silently
     dropped — `--models claude,gpt4` used to run a one-model 'debate'.
 
@@ -311,7 +389,7 @@ def _resolve_models(spec: str | None, judge: str | None) -> tuple[list[str], str
             )
     else:
         keys, unknown = [], []
-        for raw in spec.split(","):
+        for raw in spec.split(",") if isinstance(spec, str) else spec:
             name = raw.strip().lower()
             if not name:
                 continue
@@ -330,6 +408,118 @@ def _resolve_models(spec: str | None, judge: str | None) -> tuple[list[str], str
     if judge not in VALID_MODELS:
         _usage_error(f"unknown judge '{judge}'. Choose from: {valid}")
     return keys, judge
+
+
+def _parse_test_command(raw: str | list[str] | None) -> list[str] | None:
+    """Split --test-command the way a shell would, and check it can start.
+
+    `str.split` broke every argument that contained a space. And a command that
+    could not be launched was only discovered after the reviewers had been paid
+    for — as a run in which no cited test could be executed.
+
+    A list, which only the settings file can supply, is already split.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        try:
+            command = shlex.split(raw, posix=os.name != "nt")
+        except ValueError as e:
+            _usage_error(f"--test-command could not be parsed ({e}): {raw}")
+    else:
+        command = list(raw)
+    if not command:
+        _usage_error("--test-command is empty.")
+    if shutil.which(command[0]) is None:
+        _usage_error(
+            f"--test-command: {command[0]!r} is not an executable on PATH, so no cited "
+            "test could be run."
+        )
+    return command
+
+
+# What each configurable setting falls back to when neither the command line
+# nor the project file supplies it. argparse leaves an option that was not
+# given at None, which is how "not given" stays distinguishable from a default.
+_BUILT_IN: dict[str, object] = {
+    "models": None,
+    "judge": None,
+    "timeout": DEFAULT_TIMEOUT,
+    "retries": 1,
+    "consolidate": "auto",
+    "plan": None,
+    "base": None,
+    "require-tests": False,
+    "require-pinned-evidence": False,
+    "require-discriminating-tests": False,
+    "run-tests": True,
+    "test-command": None,
+    "test-timeout": TEST_TIMEOUT,
+}
+
+
+def _apply_settings(args: argparse.Namespace) -> config.Config:
+    """Fill in whatever the command line left unsaid: project file, then default.
+
+    Precedence is flag, then file, then built-in. Only commands that call a
+    model read the project file; the rest have nothing in it to read.
+    """
+    if not hasattr(args, "no_config"):
+        return config.Config()
+    if args.no_config and args.config:
+        _usage_error("--config and --no-config cannot be used together.")
+    try:
+        settings = (
+            config.Config()
+            if args.no_config
+            else config.load(Path(args.config) if args.config else None)
+        )
+    except config.ConfigError as e:
+        _usage_error(f"{e} (Pass --no-config to run without a settings file.)")
+
+    for key, built_in in _BUILT_IN.items():
+        name = key.replace("-", "_")
+        if hasattr(args, name) and getattr(args, name) is None:
+            setattr(args, name, settings.values.get(key, built_in))
+
+    if args.timeout <= 0:
+        _usage_error("--timeout must be greater than zero.")
+    if args.retries < 0:
+        _usage_error("--retries cannot be negative.")
+    if settings.source is not None:
+        display.print_note(
+            f"Settings from {settings.source} (flags on the command line override it)."
+        )
+    return settings
+
+
+def _progress(args: argparse.Namespace) -> progress.Progress:
+    """How this run reports what it is doing.
+
+    `-v` keeps the raw provider streams and commands, which are for debugging
+    and would fight a board for the terminal; everything else gets a live board
+    where one can be drawn and one line per step where it cannot.
+    """
+    return progress.PlainProgress() if args.verbose else progress.for_terminal()
+
+
+def _write_summary(path: str | None, markdown: str) -> None:
+    """Write the markdown report. A report that cannot be written is said so,
+    loudly, but does not change the exit code: the verdict is the contract, and
+    it was reached."""
+    if not path:
+        return
+    try:
+        Path(path).write_text(markdown, encoding="utf-8")
+    except OSError as e:
+        display.print_error(f"Could not write the summary to {path}: {e}")
+        return
+    display.print_note(f"Summary written to {path}")
+
+
+def _set_retries(sessions: list[Session], retries: int) -> None:
+    for session in sessions:
+        session.retries = retries
 
 
 def _read_prompt(arg: str | None) -> str:
@@ -363,6 +553,7 @@ async def _extract_acceptance_criteria(
     verbose: bool,
     timeout: float,
     trace: RunTrace | None = None,
+    retries: int = 0,
 ) -> list[crit.Criterion]:
     """Extract a complete in-memory contract without modifying the plan."""
     session = make_session(
@@ -372,6 +563,7 @@ async def _extract_acceptance_criteria(
         isolation=isolation,
         output_schema=crit.EXTRACTION_SCHEMA,
     )
+    session.retries = retries
     display.print_note(f"Extracting baseline acceptance criteria with {session.label()}...")
     try:
         with schema_writer() as write_schema:
@@ -381,6 +573,7 @@ async def _extract_acceptance_criteria(
                 on_cmd=(lambda _key, cmd: display.print_verbose_cmd(cmd)) if verbose else None,
                 timeout=timeout,
                 schema_path_writer=write_schema,
+                on_retry=display.retry_notice(session.label()),
             )
         if trace is not None:
             trace.success("extractor", session, resp)
@@ -430,8 +623,12 @@ async def cmd_plan_review(args: argparse.Namespace) -> int:
         _usage_error("The plan is empty.")
 
     isolation = "open" if args.allow_tools else "readonly"
+    started = time.monotonic()
+    # Kept whether or not a record is written: it is also what the run cost.
+    trace = RunTrace()
     recorder = (
         RunRecorder(
+            trace=trace,
             path=Path(args.record),
             command="plan review",
             inputs={"plan": recorded_input(text, args.file)},
@@ -439,6 +636,8 @@ async def cmd_plan_review(args: argparse.Namespace) -> int:
                 "models": keys,
                 "judge": judge,
                 "timeout_seconds": args.timeout,
+                "retries": args.retries,
+                "consolidate": args.consolidate,
                 "seed": args.seed,
                 "isolation": isolation,
                 "apply": args.apply,
@@ -461,7 +660,8 @@ async def cmd_plan_review(args: argparse.Namespace) -> int:
                 isolation,
                 args.verbose,
                 args.timeout,
-                trace=recorder.trace if recorder else None,
+                trace=trace,
+                retries=args.retries,
             )
             if not criteria:
                 message = "No acceptance criteria could be extracted from this plan."
@@ -473,6 +673,7 @@ async def cmd_plan_review(args: argparse.Namespace) -> int:
             recorder.configuration["criteria_source"] = criteria_source
 
         reviewers, consolidator = plan_review.make_review_sessions(keys, judge, isolation)
+        _set_retries([*reviewers.values(), consolidator], args.retries)
         names = {k: s.label() for k, s in reviewers.items()}
 
         if not args.as_json:
@@ -482,24 +683,31 @@ async def cmd_plan_review(args: argparse.Namespace) -> int:
                 f"reviewers: {', '.join(names.values())}"
             )
 
-        result = await plan_review.run_plan_review(
-            plan=text,
-            criteria=criteria,
-            reviewers=reviewers,
-            consolidator=consolidator,
-            consolidator_name=consolidator.label(),
-            names=names,
-            verbose=args.verbose,
-            timeout=args.timeout,
-            seed=args.seed,
-            trace=recorder.trace if recorder else None,
-        )
+        with _progress(args) as watch:
+            result = await plan_review.run_plan_review(
+                plan=text,
+                criteria=criteria,
+                reviewers=reviewers,
+                consolidator=consolidator,
+                consolidator_name=consolidator.label(),
+                names=names,
+                verbose=args.verbose,
+                timeout=args.timeout,
+                seed=args.seed,
+                trace=trace,
+                consolidate=args.consolidate,
+                progress=watch,
+            )
 
+        spent = usage.summarize(trace.calls)
+        elapsed = time.monotonic() - started
         if args.as_json:
-            json.dump(result.as_dict(), sys.stdout, indent=2)
+            json.dump({**result.as_dict(), "usage": spent}, sys.stdout, indent=2)
             sys.stdout.write("\n")
         else:
             plan_review.render(result, show_criteria=not args.apply)
+            display.print_footer(usage.headline(spent, elapsed))
+        _write_summary(args.summary, report.plan_review_markdown(result.as_dict(), spent, elapsed))
 
         if args.apply:
             if not result.criteria:
@@ -549,6 +757,7 @@ async def cmd_plan_pin(args: argparse.Namespace) -> int:
         "open" if args.allow_tools else "readonly",
         args.verbose,
         args.timeout,
+        retries=args.retries,
     )
     if not criteria:
         display.print_error("No acceptance criteria could be extracted from this plan.")
@@ -569,6 +778,10 @@ async def cmd_plan_pin(args: argparse.Namespace) -> int:
 
 
 async def cmd_verify(args: argparse.Namespace) -> int:
+    if not args.plan:
+        _usage_error(
+            "verify needs a plan: pass --plan FILE, or set `plan` in the project settings."
+        )
     keys, judge = _resolve_models(args.models, args.judge)
     isolation = "open" if args.allow_tools else "readonly"
     base_ref = args.base or verify.resolve_base_ref(args.diff)
@@ -577,7 +790,7 @@ async def cmd_verify(args: argparse.Namespace) -> int:
     # for any provider calls. Fail-closed evidence semantics remain the backstop
     # for runtime failures after a valid configuration starts.
     if args.require_discriminating_tests:
-        if args.no_run_tests:
+        if not args.run_tests:
             _usage_error(
                 "--require-discriminating-tests cannot be used with --no-run-tests; "
                 "cited tests must run on both revisions."
@@ -587,6 +800,10 @@ async def cmd_verify(args: argparse.Namespace) -> int:
                 "--require-discriminating-tests needs a base revision; pass --base <ref> "
                 "or use a --diff that names one."
             )
+    if args.test_timeout <= 0:
+        _usage_error("--test-timeout must be greater than zero.")
+    # Unused when tests are not run, so a stale value there is not an error.
+    test_command = _parse_test_command(args.test_command) if args.run_tests else None
 
     plan = verify.read_plan(args.plan)
     try:
@@ -604,8 +821,12 @@ async def cmd_verify(args: argparse.Namespace) -> int:
         except run_records.WorkspaceIdentityError as e:
             _usage_error(f"Could not safely record this workspace: {e}")
 
+    started = time.monotonic()
+    # Kept whether or not a record is written: it is also what the run cost.
+    trace = RunTrace()
     recorder = (
         RunRecorder(
+            trace=trace,
             path=Path(args.record),
             command="verify",
             inputs={
@@ -620,15 +841,19 @@ async def cmd_verify(args: argparse.Namespace) -> int:
                 "models": keys,
                 "judge": judge,
                 "timeout_seconds": args.timeout,
+                "retries": args.retries,
+                "consolidate": args.consolidate,
                 "seed": args.seed,
                 "isolation": isolation,
                 "base_ref": base_ref,
-                "run_tests": not args.no_run_tests,
+                "run_tests": args.run_tests,
                 "scrub_test_environment": not args.no_scrub_test_env,
                 "require_tests": args.require_tests or args.require_pinned_evidence,
                 "require_pinned_evidence": args.require_pinned_evidence,
                 "require_discriminating_tests": args.require_discriminating_tests,
                 "custom_test_command": args.test_command is not None,
+                "test_timeout_seconds": args.test_timeout,
+                "settings_file": str(args.settings.source) if args.settings.source else None,
             },
         )
         if args.record
@@ -636,6 +861,7 @@ async def cmd_verify(args: argparse.Namespace) -> int:
     )
 
     reviewers, consolidator = make_verify_sessions(keys, judge, isolation)
+    _set_retries([*reviewers.values(), consolidator], args.retries)
     names = {k: s.label() for k, s in reviewers.items()}
 
     if not args.as_json:
@@ -645,36 +871,44 @@ async def cmd_verify(args: argparse.Namespace) -> int:
         )
 
     try:
-        result = await verify.run_verify(
-            plan=plan,
-            diff=diff,
-            criteria=criteria,
-            reviewers=reviewers,
-            consolidator=consolidator,
-            consolidator_name=consolidator.label(),
-            names=names,
-            verbose=args.verbose,
-            timeout=args.timeout,
-            seed=args.seed,
-            manifest=manifest,
-            test_command=args.test_command.split() if args.test_command else None,
-            run_tests=not args.no_run_tests,
-            require_tests=args.require_tests or args.require_pinned_evidence,
-            require_pinned_evidence=args.require_pinned_evidence,
-            scrub_env=not args.no_scrub_test_env,
-            base_ref=base_ref,
-            require_discriminating_tests=args.require_discriminating_tests,
-            trace=recorder.trace if recorder else None,
-        )
+        with _progress(args) as watch:
+            result = await verify.run_verify(
+                plan=plan,
+                diff=diff,
+                criteria=criteria,
+                reviewers=reviewers,
+                consolidator=consolidator,
+                consolidator_name=consolidator.label(),
+                names=names,
+                verbose=args.verbose,
+                timeout=args.timeout,
+                seed=args.seed,
+                manifest=manifest,
+                test_command=test_command,
+                run_tests=args.run_tests,
+                require_tests=args.require_tests or args.require_pinned_evidence,
+                require_pinned_evidence=args.require_pinned_evidence,
+                scrub_env=not args.no_scrub_test_env,
+                base_ref=base_ref,
+                require_discriminating_tests=args.require_discriminating_tests,
+                trace=trace,
+                test_timeout=args.test_timeout,
+                consolidate=args.consolidate,
+                progress=watch,
+            )
     except Exception as e:
         _record_error(recorder, e)
         raise
 
+    spent = usage.summarize(trace.calls)
+    elapsed = time.monotonic() - started
     if args.as_json:
-        json.dump(result.as_dict(), sys.stdout, indent=2)
+        json.dump({**result.as_dict(), "usage": spent}, sys.stdout, indent=2)
         sys.stdout.write("\n")
     else:
         verify.render(result)
+        display.print_footer(usage.headline(spent, elapsed))
+    _write_summary(args.summary, report.verify_markdown(result.as_dict(), spent, elapsed))
     _finish_record(recorder, exit_code=result.exit_code, result=result.as_dict())
     return result.exit_code
 
@@ -892,6 +1126,7 @@ async def cmd_debate(args: argparse.Namespace) -> int:
 
     debaters = make_debater_sessions(keys, isolation=isolation)
     arbiter = make_arbiter_session(judge, isolation=isolation, output_schema=JUDGE_SCHEMA)
+    _set_retries([*debaters.values(), arbiter], args.retries)
     names = {k: s.label() for k, s in debaters.items()}
     arbiter_name = arbiter.label()
     transcript: list[str] = []
@@ -941,6 +1176,45 @@ async def cmd_debate(args: argparse.Namespace) -> int:
             _write_transcript(args.save, transcript)
 
 
+def cmd_init(args: argparse.Namespace) -> int:
+    """Set a project up, say what was done, and say what to run next."""
+    done = scaffold.init(Path.cwd(), args.plan)
+
+    display.print_section("arbiter init")
+    for item in done.created:
+        display.print(f"  {display._c('+', display.BOLD, display.GREEN)} created  {item}")
+    for item in done.kept:
+        display.print(f"  {display._c('·', display.DIM)} kept     {display._c(item, display.DIM)}")
+    for problem in done.problems:
+        display.print_error(problem)
+
+    display.print()
+    found = [key for key, present in done.providers.items() if present]
+    for key, present in done.providers.items():
+        mark = (
+            display._c("✓", display.BOLD, display.GREEN)
+            if present
+            else display._c("✗", display.DIM)
+        )
+        hint = (
+            "" if present else display._c(f"  — {doctor.INSTALL_HINTS.get(key, '')}", display.DIM)
+        )
+        display.print(f"  {mark} {PROVIDERS[key].cli}{hint}")
+    if not found:
+        display.print_error("No provider CLI is on PATH yet. Install at least one of the above.")
+
+    display.print()
+    display.print_note("Next:")
+    review, gate = f"arbiter plan review {args.plan} --apply", "arbiter verify --diff"
+    width = max(len(review), len(gate))
+    display.print(f"    1. Write the change into {args.plan}")
+    display.print(f"    2. {review:<{width}}   # turn it into a contract")
+    display.print(f"    3. {gate:<{width}}   # gate the staged change against it")
+    display.print_note("`arbiter doctor` checks each provider is logged in (it makes a real call).")
+    display.print()
+    return EXIT_RUNTIME if done.problems else EXIT_PASS
+
+
 async def cmd_doctor(args: argparse.Namespace) -> int:
     keys = sorted(PROVIDERS) if args.check_all else sorted(DEFAULT_PANEL)
     results = await doctor.run_doctor(keys, probe=not args.no_probe)
@@ -959,6 +1233,7 @@ async def _dispatch(args: argparse.Namespace) -> int:
     # In --json mode stdout carries the result and nothing else; progress and
     # live streaming go to stderr, so `arbiter verify --json | jq` just works.
     display.set_json_mode(getattr(args, "as_json", False))
+    args.settings = _apply_settings(args)
     if args.command == "verify":
         return await cmd_verify(args)
     if args.command == "plan":
@@ -980,9 +1255,32 @@ async def _dispatch(args: argparse.Namespace) -> int:
         )
     if args.command == "debate":
         return await cmd_debate(args)
+    if args.command == "init":
+        return cmd_init(args)
     if args.command == "doctor":
         return await cmd_doctor(args)
     raise SystemExit(EXIT_USAGE)
+
+
+class _Terminated(KeyboardInterrupt):
+    """SIGTERM, delivered into the same cleanup path as Ctrl-C.
+
+    Python's default for SIGTERM is to die where it stands, running no
+    `finally`. A CI system cancels a job with exactly that signal, so every
+    superseded run would leave its provider CLIs running and its temporary
+    worktree registered. As a KeyboardInterrupt it unwinds instead: children
+    are reaped, the worktree is removed, and a cited test in flight is killed.
+    """
+
+
+EXIT_TERMINATED = 128 + signal.SIGTERM
+
+
+def _on_sigterm(_signum: int, _frame: object) -> None:
+    # One is enough. A second, arriving mid-cleanup, would abort the cleanup
+    # this handler exists to allow; whoever is impatient still has SIGKILL.
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    raise _Terminated
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -991,7 +1289,14 @@ def main(argv: list[str] | None = None) -> int:
     except SystemExit as e:  # argparse errors and --help
         return e.code if isinstance(e.code, int) else EXIT_USAGE
     try:
+        previous = signal.signal(signal.SIGTERM, _on_sigterm)
+    except ValueError:  # not the main thread: the embedding program owns signals
+        previous = None
+    try:
         return asyncio.run(_dispatch(args))
+    except _Terminated:
+        display.print_error("Terminated.")
+        return EXIT_TERMINATED
     except KeyboardInterrupt:
         print()
         display.print_error("Interrupted.")
@@ -1011,6 +1316,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.verbose:
             raise
         return EXIT_RUNTIME
+    finally:
+        if previous is not None:
+            signal.signal(signal.SIGTERM, previous)
 
 
 if __name__ == "__main__":

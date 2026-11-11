@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import errno
 import json
+import random
 import re
 import time
 import uuid
@@ -175,6 +176,8 @@ class Session:
     started: bool = False  # True once the first call has run
     isolation: IsolationMode = "readonly"
     output_schema: dict | None = None
+    # How many times a failed call is tried again before the failure stands.
+    retries: int = 0
 
     @property
     def cli(self) -> str:
@@ -278,6 +281,9 @@ class ModelResponse:
     duration: float = 0.0
     cmd: list[str] = field(default_factory=list)
     usage: Usage | None = None
+    # Attempts that failed before this one succeeded. They cost time, and
+    # sometimes tokens, so a record that dropped them would understate both.
+    failed_attempts: list[ModelCallError] = field(default_factory=list)
 
 
 def make_session(
@@ -574,6 +580,8 @@ def _parse_event(cli: str, obj: dict) -> list[tuple[str, object]]:
 
 OnDelta = Callable[[str, str], Awaitable[None]] | None
 OnCmd = Callable[[str, list[str]], None] | None
+# (session key, number of the attempt that just failed, why it failed)
+OnRetry = Callable[[str, int, "ModelCallError"], None] | None
 
 
 class ModelCallError(RuntimeError):
@@ -591,10 +599,41 @@ class ModelCallError(RuntimeError):
         *,
         duration: float | None = None,
         usage: Usage | None = None,
+        retryable: bool = True,
     ) -> None:
         super().__init__(message)
         self.duration = duration
         self.usage = usage
+        # False where trying again cannot help: the CLI is absent, the prompt
+        # cannot be delivered, or the call already used its whole time budget.
+        self.retryable = retryable
+        # The failed attempts that came before this, final, one.
+        self.earlier: list[ModelCallError] = []
+
+
+# A provider that refuses on principle will refuse again; a retry there only
+# doubles the wait before the same message. Erring toward "permanent" is the
+# safe direction — it is today's behaviour.
+_PERMANENT_RE = re.compile(
+    r"\bsign in\b|\blog ?in\b|\blogged in\b|authenticat|\bauth\b|unauthori[sz]ed|"
+    r"api[ _-]?key|credential|requires a newer version",
+    re.I,
+)
+
+# Seconds before the first retry, doubled for each one after. Jittered, so a
+# panel of reviewers that failed together does not come back together.
+_RETRY_BASE = 1.0
+_RETRY_CAP = 30.0
+
+
+def _retry_delay(attempt: int) -> float:
+    delay = min(_RETRY_BASE * 2 ** (attempt - 1), _RETRY_CAP)
+    return delay * (1 + random.random() / 4)
+
+
+def worth_retrying(error: ModelCallError) -> bool:
+    """Whether a second attempt could plausibly end differently."""
+    return error.retryable and not _PERMANENT_RE.search(str(error))
 
 
 # How many lines of non-JSON stdout to keep for diagnosis.
@@ -755,6 +794,7 @@ async def call_session(
     timeout: float = DEFAULT_TIMEOUT,
     schema_path_writer: Callable[[dict], str] | None = None,
     output_schema: dict | _Unset | None = UNSET,
+    on_retry: OnRetry = None,
 ) -> ModelResponse:
     """Run (or resume) `sess` with `prompt`, streaming deltas via `on_delta`.
 
@@ -762,9 +802,49 @@ async def call_session(
     to force a free-form reply: a session created for structured judging would
     otherwise keep emitting that JSON during follow-ups that expect prose.
 
-    None of the three CLIs offers a timeout flag, so the deadline is enforced
-    here. Marks the session started on success so later calls use the resume form.
+    A failure that could be transient is tried again, up to `sess.retries`
+    times. Without that, one overloaded provider turns a whole verification
+    into `unclear` — and rerunning it pays again for every call that worked.
+    Each attempt gets the full `timeout`. A timeout is never retried: it is not
+    a failure to answer but an answer that took longer than it was given, and
+    the way to allow more time is to ask for more time.
     """
+    earlier: list[ModelCallError] = []
+    while True:
+        try:
+            response = await _call_once(
+                sess, prompt, on_delta, on_cmd, timeout, schema_path_writer, output_schema
+            )
+        except ModelCallError as error:
+            if len(earlier) >= sess.retries or not worth_retrying(error):
+                error.earlier = earlier
+                raise
+            earlier.append(error)
+            if on_retry:
+                on_retry(sess.key, len(earlier), error)
+            # An id handed over for a call that then failed may already be taken
+            # on the provider's side. A session that has not started owes it
+            # nothing, so it gets a fresh one rather than a collision.
+            if sess.provider.preassigns_session and not sess.started:
+                sess.session_id = str(uuid.uuid4())
+            await asyncio.sleep(_retry_delay(len(earlier)))
+            continue
+        response.failed_attempts = earlier
+        return response
+
+
+async def _call_once(
+    sess: Session,
+    prompt: str,
+    on_delta: OnDelta,
+    on_cmd: OnCmd,
+    timeout: float,
+    schema_path_writer: Callable[[dict], str] | None,
+    output_schema: dict | _Unset | None,
+) -> ModelResponse:
+    """One attempt. None of the provider CLIs offers a timeout flag, so the
+    deadline is enforced here. Marks the session started on success so later
+    calls use the resume form."""
     via_stdin = uses_stdin_prompt(sess.provider, prompt)
     cmd = _build_cmd(sess, prompt, schema_path_writer, via_stdin=via_stdin, schema=output_schema)
     if on_cmd:
@@ -783,7 +863,8 @@ async def call_session(
         )
     except FileNotFoundError as e:
         raise ModelCallError(
-            f"{sess.cli} is not installed or not on PATH. Run 'arbiter doctor'."
+            f"{sess.cli} is not installed or not on PATH. Run 'arbiter doctor'.",
+            retryable=False,
         ) from e
     except OSError as e:
         if e.errno == errno.E2BIG and not sess.provider.accepts_stdin_prompt:
@@ -791,9 +872,10 @@ async def call_session(
                 f"{sess.cli} cannot accept a prompt this large "
                 f"({len(prompt.encode('utf-8', errors='replace')):,} bytes): it only takes "
                 "the prompt as a command-line argument, and this exceeds what the OS "
-                f"will pass. Drop {sess.provider.key} from --models for this change."
+                f"will pass. Drop {sess.provider.key} from --models for this change.",
+                retryable=False,
             ) from e
-        raise ModelCallError(f"could not launch {sess.cli}: {e}") from e
+        raise ModelCallError(f"could not launch {sess.cli}: {e}", retryable=False) from e
 
     assert proc.stderr is not None
     # Start draining stderr BEFORE anything else can block. A child that fills
@@ -830,6 +912,7 @@ async def call_session(
         raise ModelCallError(
             f"{sess.cli} exceeded the {timeout:.0f}s timeout.{_blocked_hint(prose)}",
             duration=time.monotonic() - start,
+            retryable=False,
         ) from e
     finally:
         # `finally`, so cancellation during the stdin write still reaps the child.

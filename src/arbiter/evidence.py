@@ -9,6 +9,12 @@ is what separates this from a tool that reports opinions:
   - the test either exists and passes, or it does not
 
 Everything here is deliberately dumb and deterministic. No model is consulted.
+
+What happened to a test is read from the runner's own structured report, never
+inferred from an exit status or from words in its output. Both of those lie:
+pytest exits 0 for a test that was skipped or that failed as an expected
+failure, exits non-zero for a passing test when a coverage threshold trips, and
+a failing assertion is free to print "not found".
 """
 
 from __future__ import annotations
@@ -22,9 +28,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from xml.etree import ElementTree
 
 # "src/app.py:84", "src/app.py:84-91", "./app.py line 84"
 _FILE_CITATION_RE = re.compile(
@@ -34,6 +42,28 @@ _FILE_CITATION_RE = re.compile(
 _TEST_CITATION_RE = re.compile(r"(?P<path>[\w./\-]+\.py)::(?P<node>[\w:\[\]\-.]+)")
 
 TEST_TIMEOUT = 120.0
+
+# What running a cited test produced. The downgrade rules key on these rather
+# than on the prose in `detail`, so "it failed", "it never ran", and "there is
+# no such test" cannot be mistaken for one another by a substring.
+PASSED = "passed"  # the test ran and held
+FAILED = "failed"  # the test ran and did not hold — including an expected failure
+ERRORED = "errored"  # no pass/fail result: setup, collection, timeout, launch
+SKIPPED = "skipped"  # the test exists and was not run: a skip marker, deselection
+MISSING = "missing"  # no such test
+NOT_RUN = "not_run"  # Arbiter did not execute it: --no-run-tests, no runner
+TEST_OUTCOMES = (PASSED, FAILED, ERRORED, SKIPPED, MISSING, NOT_RUN)
+
+# `verified` stays tri-state. An error or a skip is "could not confirm", which
+# is a different fact from "confirmed false".
+_VERIFIED: dict[str, bool | None] = {
+    PASSED: True,
+    FAILED: False,
+    MISSING: False,
+    ERRORED: None,
+    SKIPPED: None,
+    NOT_RUN: None,
+}
 
 # Running a cited test executes code from the branch under review. Only these
 # variables are inherited directly by the child. This reduces accidental secret
@@ -75,6 +105,12 @@ def test_citation_path(citation: str) -> str | None:
     """Return the repository-relative path from a pytest node citation."""
     m = _TEST_CITATION_RE.search(citation or "")
     return m.group("path") if m else None
+
+
+def node_id(citation: str) -> str | None:
+    """The pytest node id inside a citation, without any prose around it."""
+    m = _TEST_CITATION_RE.search(citation or "")
+    return m.group(0) if m else None
 
 
 def _test_ast_node(citation: str, root: Path) -> tuple[bool, ast.AST | None]:
@@ -137,18 +173,28 @@ class EvidenceCheck:
     """The result of checking one citation. `verified is None` means we could not
     check it at all, which is different from checking it and finding it false."""
 
-    kind: str  # "file" | "test"
+    kind: str  # "file" | "test" | "baseline"
     citation: str
     verified: bool | None
     detail: str
+    # For a test check, one of TEST_OUTCOMES: what running it produced. None on
+    # a file or baseline check, and on a test check restored from a record
+    # written before outcomes were stored.
+    outcome: str | None = None
 
     def as_dict(self) -> dict:
-        return {
+        data = {
             "kind": self.kind,
             "citation": self.citation,
             "verified": self.verified,
             "detail": self.detail,
         }
+        # Present only where it means something. A record that predates the
+        # field replays to exactly the dict it stored, so an exhaustive
+        # comparison needs no special case for it.
+        if self.outcome is not None:
+            data["outcome"] = self.outcome
+        return data
 
     @classmethod
     def from_dict(cls, data: dict) -> EvidenceCheck:
@@ -158,11 +204,13 @@ class EvidenceCheck:
         restores as None — "we could not check" — rather than a coerced boolean.
         """
         verified = data.get("verified")
+        outcome = data.get("outcome")
         return cls(
             kind=str(data.get("kind") or ""),
             citation=str(data.get("citation") or ""),
             verified=verified if isinstance(verified, bool) else None,
             detail=str(data.get("detail") or ""),
+            outcome=outcome if isinstance(outcome, str) and outcome in TEST_OUTCOMES else None,
         )
 
 
@@ -229,12 +277,282 @@ def detect_test_command(root: Path | None = None) -> list[str] | None:
     return None
 
 
+# Evidence checks block on the test they run, so the orchestration keeps them
+# off its event loop. A thread cannot be cancelled, only asked: these let a run
+# that is being interrupted kill the test in flight and refuse to start the
+# next, so Ctrl-C and SIGTERM do not wait out a test's whole time limit.
+_running: set[subprocess.Popen[str]] = set()
+_running_lock = threading.Lock()
+_stopped = threading.Event()
+
+
+def stop_running_tests() -> None:
+    """Kill every evidence run in flight and start no more until `allow_tests`."""
+    _stopped.set()
+    with _running_lock:
+        for proc in list(_running):
+            with contextlib.suppress(OSError):
+                proc.kill()
+
+
+def allow_tests() -> None:
+    _stopped.clear()
+
+
+@dataclass(frozen=True)
+class RunReport:
+    """What one run of a cited test produced.
+
+    `detail` opens with a one-line statement of the outcome; any lines after it
+    are the runner's own account of why.
+    """
+
+    outcome: str
+    detail: str
+
+
+# pytest's documented exit statuses. Only consulted when a run leaves no
+# structured report behind.
+_EXIT_INTERRUPTED = 2
+_EXIT_INTERNAL_ERROR = 3
+_EXIT_USAGE = 4
+_EXIT_NO_TESTS = 5
+
+# An expected failure is reported by pytest as a kind of skip. It is carried
+# separately until the wording is settled, then reported as FAILED.
+_XFAILED = "xfailed"
+
+_DETAIL_LINES = 5
+_DETAIL_WIDTH = 240
+
+_SUMMARY_RE = re.compile(r"\b(\d+) (passed|failed|errors?|skipped|xfailed|xpassed|deselected)\b")
+
+
+def _excerpt(text: str) -> str:
+    """The few lines of runner output that say why.
+
+    pytest marks the lines that carry the actual error with a leading `E`; when
+    it has, those are the explanation and the surrounding traceback is not.
+    Otherwise keep the end of the text, which is where a failure is summarised.
+    """
+    lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+    marked = [f"E   {line[1:].strip()}" for line in lines if line.startswith("E ")]
+    kept = marked[:_DETAIL_LINES] if marked else lines[-_DETAIL_LINES:]
+    return "\n".join(line[:_DETAIL_WIDTH] for line in kept)
+
+
+def _lead(headline: str, text: str = "") -> str:
+    excerpt = _excerpt(text)
+    return f"{headline}\n{excerpt}" if excerpt else headline
+
+
+def _cause(detail: str) -> str:
+    """The single line of a report's excerpt that best names what went wrong."""
+    lines = detail.splitlines()[1:]
+    if not lines:
+        return ""
+    line = lines[0] if lines[0].startswith("E ") else lines[-1]
+    return re.sub(r"^E\s+", "", line.strip())
+
+
+def _read_report(path: Path) -> list[tuple[str, str, str]] | None:
+    """`(kind, test name, runner text)` for each test in a JUnit XML report.
+
+    None means there is no report to read: the command is not pytest, it ran
+    somewhere this path does not reach (a container), or it died before writing
+    one. An empty list is a different fact — the runner ran and selected nothing.
+    """
+    try:
+        root = ElementTree.parse(path).getroot()
+    except (OSError, ElementTree.ParseError):
+        return None
+
+    cases: list[tuple[str, str, str]] = []
+    for case in root.iter("testcase"):
+        name = case.get("name") or ""
+        failure, error, skipped = case.find("failure"), case.find("error"), case.find("skipped")
+        if failure is not None:
+            cases.append((FAILED, name, failure.text or failure.get("message") or ""))
+        elif error is not None:
+            # Setup, teardown, and collection failures. The test did not get as
+            # far as passing or failing.
+            cases.append((ERRORED, name, error.text or error.get("message") or ""))
+        elif skipped is not None:
+            kind = _XFAILED if "xfail" in (skipped.get("type") or "") else SKIPPED
+            cases.append((kind, name, skipped.get("message") or ""))
+        else:
+            cases.append((PASSED, name, ""))
+    return cases
+
+
+def _from_cases(cases: list[tuple[str, str, str]]) -> RunReport:
+    """One outcome for a citation that may cover several tests.
+
+    A class or a parametrized function is one citation and many cases. The
+    proof holds only if every case that ran held, so the worst case decides —
+    and a skipped case never counts toward a pass.
+    """
+    by_kind: dict[str, list[tuple[str, str]]] = {}
+    for kind, name, text in cases:
+        by_kind.setdefault(kind, []).append((name, text))
+
+    def which(name: str) -> str:
+        return f" ({name})" if len(cases) > 1 and name else ""
+
+    if FAILED in by_kind:
+        name, text = by_kind[FAILED][0]
+        return RunReport(FAILED, _lead(f"failed{which(name)}", text))
+    if _XFAILED in by_kind:
+        # The runner exits 0 for this. It is still a test whose assertion does
+        # not hold, which is exactly what a failing proof is.
+        name, text = by_kind[_XFAILED][0]
+        return RunReport(
+            FAILED,
+            _lead(
+                f"failed{which(name)}: marked as an expected failure (xfail), and it does fail",
+                text,
+            ),
+        )
+    if ERRORED in by_kind:
+        name, text = by_kind[ERRORED][0]
+        return RunReport(ERRORED, _lead(f"errored before it could pass or fail{which(name)}", text))
+    if PASSED in by_kind:
+        skipped = len(by_kind.get(SKIPPED, []))
+        note = f" ({skipped} of {len(cases)} cases skipped)" if skipped else ""
+        return RunReport(PASSED, f"passed{note}")
+
+    reason = by_kind[SKIPPED][0][1].strip().splitlines()[:1]
+    return RunReport(
+        SKIPPED,
+        "skipped, so it proves nothing" + (f": {reason[0][:_DETAIL_WIDTH]}" if reason else ""),
+    )
+
+
+def _nothing_ran(out: str) -> RunReport:
+    """The runner started and ran no test for this citation."""
+    if re.search(r"\b\d+ deselected\b", out):
+        return RunReport(
+            SKIPPED, "deselected by the project's own test configuration, so it did not run"
+        )
+    return RunReport(MISSING, "no such test")
+
+
+def _summary_counts(out: str) -> dict[str, int]:
+    """Counts from pytest's closing summary line, when it printed one."""
+    for line in reversed(out.splitlines()):
+        found = _SUMMARY_RE.findall(line)
+        if found and " in " in line:
+            return {("error" if name.startswith("error") else name): int(n) for n, name in found}
+    return {}
+
+
+def _from_exit_status(code: int, out: str) -> RunReport:
+    """Classify a run that left no structured report behind.
+
+    This is the weak path, taken only for a command that is not pytest or that
+    runs where the report cannot be read back. Output text is used here solely
+    to LOWER a result: a successful exit is overruled by a summary showing that
+    nothing passed, but a failing exit is never talked back up by anything the
+    output says, because a test can print whatever it likes.
+    """
+    if code == 0:
+        counts = _summary_counts(out)
+        if counts and not (counts.get("passed") or counts.get("xpassed")):
+            if counts.get("xfailed"):
+                return RunReport(
+                    FAILED, "failed: marked as an expected failure (xfail), and it does fail"
+                )
+            if counts.get("skipped") or counts.get("deselected"):
+                return RunReport(SKIPPED, "skipped, so it proves nothing")
+        return RunReport(PASSED, "passed")
+    if code == _EXIT_NO_TESTS:
+        return _nothing_ran(out)
+    if code == _EXIT_USAGE:
+        # pytest's own words for a node id that matches nothing. Any other
+        # usage error — an unreadable module, an option it does not know — is a
+        # run that broke, not a test that is absent.
+        if "not found:" in out or "no match in any of" in out:
+            return RunReport(MISSING, "no such test")
+        return RunReport(ERRORED, _lead("errored before it could pass or fail", out))
+    if code in (_EXIT_INTERRUPTED, _EXIT_INTERNAL_ERROR):
+        return RunReport(ERRORED, _lead("errored before it could pass or fail", out))
+    return RunReport(FAILED, _lead("failed", out))
+
+
+def run_test(
+    cmd: list[str],
+    node: str,
+    cwd: Path,
+    env: dict[str, str] | None = None,
+    timeout: float = TEST_TIMEOUT,
+) -> RunReport:
+    """Run one cited test and say what happened to it.
+
+    The runner is asked to write a JUnit XML report, and the outcome is read
+    from that. Exit status and terminal output are both unreliable narrators of
+    a single test: a skip and an expected failure exit 0, a coverage threshold
+    in the project's config exits non-zero for a test that passed, and a
+    doubled `-q` (the project's `addopts` plus ours) prints no summary at all.
+    """
+    cancelled = RunReport(ERRORED, "not run: the verification was interrupted")
+    if _stopped.is_set():
+        return cancelled
+    with tempfile.TemporaryDirectory(prefix="arbiter-report-") as scratch:
+        report = Path(scratch) / "report.xml"
+        try:
+            proc = subprocess.Popen(
+                [*cmd, node, "-q", "--no-header", f"--junitxml={report}"],
+                cwd=cwd,
+                # A test that waits on a terminal would wait forever; evidence
+                # checks are never interactive.
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                encoding="utf-8",
+                errors="replace",
+                env=env,
+            )
+        except OSError as e:
+            return RunReport(ERRORED, f"could not run the test command: {e}")
+        with _running_lock:
+            _running.add(proc)
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            return RunReport(ERRORED, f"timed out after {timeout:.0f}s")
+        except BaseException:
+            # Interrupted on this thread. Do not leave the test running.
+            proc.kill()
+            proc.wait()
+            raise
+        finally:
+            with _running_lock:
+                _running.discard(proc)
+        if _stopped.is_set():
+            return cancelled
+        cases = _read_report(report)
+
+    out = (stdout + stderr).strip()
+    if cases is None:
+        return _from_exit_status(proc.returncode, out)
+    if cases:
+        return _from_cases(cases)
+    if proc.returncode in (_EXIT_USAGE, _EXIT_NO_TESTS):
+        return _nothing_ran(out)
+    return RunReport(
+        ERRORED, _lead(f"the runner exited {proc.returncode} without running the test", out)
+    )
+
+
 def check_test_citation(
     citation: str,
     root: Path | None = None,
     test_command: list[str] | None = None,
     run: bool = True,
     scrub_env: bool = True,
+    timeout: float = TEST_TIMEOUT,
 ) -> EvidenceCheck:
     """Confirm a cited test exists and, when permitted, that it passes.
 
@@ -245,49 +563,28 @@ def check_test_citation(
     root = root or Path.cwd()
     m = _TEST_CITATION_RE.search(citation or "")
     if not m:
-        return EvidenceCheck("test", citation, None, "no test node id found")
+        return EvidenceCheck("test", citation, None, "no test node id found", NOT_RUN)
 
     node = m.group(0)
     path = _safe_path(m.group("path"), root)
     if path is None:
-        return EvidenceCheck("test", node, False, f"{m.group('path')} escapes the repository root")
+        return EvidenceCheck(
+            "test", node, False, f"{m.group('path')} escapes the repository root", MISSING
+        )
     if not path.is_file():
-        return EvidenceCheck("test", node, False, f"{m.group('path')} does not exist")
+        return EvidenceCheck("test", node, False, f"{m.group('path')} does not exist", MISSING)
 
     if not run:
-        return EvidenceCheck("test", node, None, "test file exists; not executed (--no-run-tests)")
+        return EvidenceCheck(
+            "test", node, None, "test file exists; not executed (--no-run-tests)", NOT_RUN
+        )
 
     cmd = test_command or detect_test_command(root)
     if not cmd:
-        return EvidenceCheck("test", node, None, "no test runner detected; not executed")
+        return EvidenceCheck("test", node, None, "no test runner detected; not executed", NOT_RUN)
 
-    try:
-        proc = subprocess.run(
-            [*cmd, node, "-q", "--no-header"],
-            cwd=root,
-            capture_output=True,
-            text=True,
-            timeout=TEST_TIMEOUT,
-            check=False,
-            env=scrubbed_env() if scrub_env else None,
-        )
-    except subprocess.TimeoutExpired:
-        return EvidenceCheck("test", node, None, f"timed out after {TEST_TIMEOUT:.0f}s")
-    except OSError as e:
-        return EvidenceCheck("test", node, None, f"could not run tests: {e}")
-
-    out = (proc.stdout + proc.stderr).strip()
-    if proc.returncode == 0:
-        return EvidenceCheck("test", node, True, "passed")
-    # pytest exits 4 for collection errors — the test does not exist under that id.
-    if proc.returncode == 4 or "no tests ran" in out.lower() or "not found" in out.lower():
-        return EvidenceCheck("test", node, False, "no such test")
-    return EvidenceCheck("test", node, False, f"failed\n{_tail(out)}")
-
-
-def _tail(text: str, lines: int = 6) -> str:
-    kept = [ln for ln in text.splitlines() if ln.strip()][-lines:]
-    return "\n".join(kept)
+    report = run_test(cmd, node, root, scrubbed_env() if scrub_env else None, timeout)
+    return EvidenceCheck("test", node, _VERIFIED[report.outcome], report.detail, report.outcome)
 
 
 # ── Baseline discrimination ──────────────────────────────────────────────────
@@ -402,6 +699,7 @@ def check_test_discriminates(
     test_command: list[str] | None = None,
     scrub_env: bool = True,
     base_dir: Path | None = None,
+    timeout: float = TEST_TIMEOUT,
 ) -> EvidenceCheck:
     """Does this test actually distinguish the change, or would it pass anyway?
 
@@ -445,36 +743,24 @@ def check_test_discriminates(
 
         try:
             env = _baseline_env(root, base, scrub_env)
-            proc = subprocess.run(
-                [*cmd, node, "-q", "--no-header"],
-                cwd=base,
-                capture_output=True,
-                text=True,
-                timeout=TEST_TIMEOUT,
-                check=False,
-                env=env,
-            )
-        except subprocess.TimeoutExpired:
-            return EvidenceCheck("baseline", node, None, "timed out against the base revision")
         except OSError as e:
             return EvidenceCheck("baseline", node, None, f"could not run against base: {e}")
+        report = run_test(cmd, node, base, env, timeout)
 
-    out = (proc.stdout + proc.stderr).strip()
-    if proc.returncode == 0:
+    if report.outcome == PASSED:
         return EvidenceCheck(
             "baseline",
             node,
             False,
             f"passes against {base_ref} too, so it does not distinguish this change",
         )
-    # Collection errors mean the test could not even load against the old code —
-    # usually it imports something this change introduced. That is not evidence
-    # either way.
-    collection_error = proc.returncode == 4 or (
-        "error" in out.lower()[:400] and "assert" not in out.lower()
+    if report.outcome == FAILED:
+        return EvidenceCheck("baseline", node, True, f"fails against {base_ref}, passes here")
+    # Anything else is not evidence either way. A test that cannot be collected
+    # against the old code usually imports something this change introduced; one
+    # that errors in setup, is skipped, or times out never ran its assertions.
+    headline, cause = report.detail.splitlines()[0], _cause(report.detail)
+    why = f"{headline} — {cause}" if cause else headline
+    return EvidenceCheck(
+        "baseline", node, None, f"could not run against {base_ref}: {why}"[:_DETAIL_WIDTH]
     )
-    if collection_error:
-        return EvidenceCheck(
-            "baseline", node, None, f"could not run against {base_ref} (likely new imports)"
-        )
-    return EvidenceCheck("baseline", node, True, f"fails against {base_ref}, passes here")

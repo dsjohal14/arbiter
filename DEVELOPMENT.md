@@ -29,8 +29,8 @@ empty, because a user's repo can be in exactly that state.
 
 | | Count | Time | What it covers |
 |---|---|---|---|
-| `tests/unit/` | 257 | ~5s | Pure functions: parsing, verdict logic, prompt construction, replay, scoring |
-| `tests/integration/` | 107 | ~60s | Real subprocesses, real git worktrees, the CLI through `main()` |
+| `tests/unit/` | 450 | ~45s | Parsing, verdict logic, prompts, replay, scoring, settings, the report, and real pytest runs for every test outcome |
+| `tests/integration/` | 205 | ~70s | Real subprocesses, real git worktrees, a real pseudo-terminal, real signals, the CLI through `main()` |
 
 Iterate with `make test-unit`. Run `make check` before you push.
 
@@ -38,8 +38,8 @@ Iterate with `make test-unit`. Run `make check` before you push.
 
 `tests/fake_cli.py` is a real executable placed on `PATH` by the `shim_path`
 fixture, impersonating `claude`, `codex`, and `gemini`. It replays a scripted
-JSONL stream and can hang, exit non-zero, emit garbage, or flood stderr on
-demand.
+JSONL stream and can hang, answer slowly, exit non-zero, fail its first N
+invocations and then recover, emit garbage, or flood stderr on demand.
 
 Mocking `asyncio.create_subprocess_exec` would have been less code and would
 have been wrong. The bugs this suite exists to catch live *below* that seam:
@@ -61,7 +61,12 @@ def test_something(shim_path):
     shim_path(hang=60)
     # a provider that dies with a message on stderr
     shim_path(claude_events("x"), exit_code=2, stderr="auth expired")
+    # a provider having a bad minute: fails once, then answers
+    shim_path(claude_events("x"), fail_first=1)
 ```
+
+Retries are real in the suite; the wait between them is not. An autouse fixture
+zeroes the backoff, so a test of a retried call takes milliseconds.
 
 `per_provider` matters because each CLI has a different event shape — feeding
 codex a claude stream produces no content, which is itself a useful way to
@@ -76,6 +81,30 @@ left clean and the temporary worktree removed — that check is the reason it is
 safe to point this at your own repo. Another plants the active branch's `src/`
 on `PYTHONPATH` and proves the base run still imports the checked-out package,
 guarding against editable installs that would compare HEAD with itself.
+
+### Tests that run the real program
+
+Some behaviour is not observable from inside `main()`, so a few tests start
+`python -m arbiter` as a process of its own:
+
+- `test_signals.py` signals it mid-call and mid-test, then checks the exit
+  status and that the provider and the cited test are actually gone. A handler
+  that is never installed still passes every in-process test.
+- `test_live_output.py` attaches it to a pseudo-terminal and to a pipe, because
+  which of the two it is talking to is the whole decision the display makes.
+- `test_github_action.py` runs `action/run.sh` the way a runner would. The
+  action's logic lives in that script, not inline in `action.yml`, precisely so
+  it can be driven here. CI's `action` job then runs the action itself, which
+  is the only place the YAML wiring can be exercised.
+
+### What a test outcome looks like, for real
+
+`tests/unit/test_evidence.py` writes a test file with one test per outcome —
+passing, failing, skipped, `xfail`, erroring in setup, unimportable,
+parametrized, hanging — and runs real pytest on each. Every one of those was a
+wrong verdict when the outcome was inferred from an exit status. If you change
+`run_test`, break it on purpose and watch them go red: forcing `_read_report`
+to return `None` should fail six of them.
 
 ### The suite never calls a real provider
 
@@ -115,12 +144,17 @@ make test-unit          # green again
 
 ```
 cli.py            argument parsing, subcommands, exit codes
+├── config.py        project settings, validated and fail-closed
+├── scaffold.py      `arbiter init`
 ├── plan_review.py   critique a plan into proposed contract edits
 ├── criteria.py      extract / pin / read acceptance criteria
 ├── verify.py        statuses, evidence checking, verdict derivation
 │   └── evidence.py    read cited lines, run cited tests, baseline discrimination
 ├── debate.py        rounds, judge parsing, follow-up loop
-├── streaming.py     one-block-at-a-time display coordinator (shared)
+├── streaming.py     running reviewers concurrently; the consolidation call
+├── progress.py      the live status board, and plain lines for a pipe
+├── report.py        the result as markdown, made inert
+├── usage.py         what a run took, added up without inventing a number
 ├── run_records.py   versioned, atomic audit/eval records
 ├── replay.py        re-derive a recorded run's result, calling nothing
 ├── evals.py         eval-case schema, loading, and scoring
@@ -131,7 +165,7 @@ cli.py            argument parsing, subcommands, exit codes
 └── doctor.py        install / auth / capability checks
 ```
 
-Three invariants worth keeping:
+Five invariants worth keeping:
 
 **`display.py` holds no logic.** It renders dicts. Anything that decides
 something belongs in `verify.py` or `plan_review.py`, where it can be tested
@@ -144,6 +178,19 @@ subprocesses, no filesystem, no clock. Everything that touches a working tree
 lives in `gather_evidence` and `evidence.py`. That split is what `replay.py`
 stands on: put a file read into the pure half and replaying a record silently
 starts depending on the repository it is replayed in.
+
+**A test's outcome comes from its report.** `evidence.run_test` asks the runner
+for JUnit XML and classifies from that into `passed` / `failed` / `errored` /
+`skipped` / `missing`. The downgrade rules key on that outcome, never on the
+prose in `detail`. Where a run leaves no report, output text may only ever
+*lower* a result — a test can print whatever it likes, so nothing it prints is
+allowed to turn a failing exit status into a pass.
+
+**Evidence runs off the event loop.** The checks block on the tests they run,
+so `verify.off_loop` puts them on a thread. A thread cannot be cancelled, only
+asked: `evidence.stop_running_tests` kills the test in flight and refuses to
+start another. Anything that adds blocking work to a verification belongs
+behind the same call, or Ctrl-C starts waiting for it.
 
 **`_build_cmd` is deterministic in its arguments.** Every provider flag decision
 is a pure function of `(Session, prompt, via_stdin, schema)`, which is what makes
@@ -214,6 +261,11 @@ make check
 
 That runs exactly what CI runs: `ruff check`, `ruff format --check`, and the full
 suite on ubuntu and macOS across Python 3.12 and 3.13.
+
+CI also builds the wheel and runs it from a clean environment (`package`), and
+runs the GitHub Action against the fake provider (`action`). Neither has a
+`make` target: the first needs a clean environment to mean anything, and the
+second needs a runner.
 
 `make typecheck` runs `mypy --strict`, which is **not** enforced in CI yet and
 will report findings. It is on the roadmap, not the gate.

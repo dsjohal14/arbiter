@@ -8,11 +8,23 @@ produce a pass on its own.
 from __future__ import annotations
 
 import sys
+import time
 
 import pytest
 
-from arbiter.evidence import check_file_citation, check_test_citation, detect_test_command
-from arbiter.verify import CriterionResult, apply_evidence_checks
+from arbiter import evidence
+from arbiter.evidence import (
+    EvidenceCheck,
+    check_file_citation,
+    check_test_citation,
+    detect_test_command,
+)
+from arbiter.verify import (
+    CriterionResult,
+    apply_downgrades,
+    apply_evidence_checks,
+    derive_verdict,
+)
 
 # pytest is importable here but not necessarily on PATH.
 PYTEST = [sys.executable, "-m", "pytest"]
@@ -150,6 +162,250 @@ def test_no_run_checks_existence_without_executing(repo):
     assert "not executed" in check.detail
 
 
+# ── What actually happened to the test ───────────────────────────────────────
+#
+# An exit status and a block of output are both unreliable narrators of one
+# test. pytest exits 0 for a skip and for an expected failure, exits non-zero
+# for a passing test when a coverage threshold trips, and a failing assertion
+# may print anything it likes. Every case here was a wrong verdict before the
+# outcome was read from the runner's own report: a clean pass for the first
+# five, a false failure for the coverage threshold.
+
+OUTCOME_TESTS = """\
+import time
+
+import pytest
+
+
+def test_passes():
+    assert True
+
+
+def test_fails_saying_not_found():
+    assert 1 == 2, "user not found in directory"
+
+
+@pytest.mark.skip(reason="flaky, will fix later")
+def test_skipped():
+    assert False
+
+
+@pytest.mark.xfail
+def test_expected_failure():
+    assert False
+
+
+@pytest.mark.xfail
+def test_unexpected_pass():
+    assert True
+
+
+def test_needs_a_missing_fixture(no_such_fixture):
+    assert True
+
+
+@pytest.mark.parametrize("n", [1, 2])
+def test_cases(n):
+    assert n == 1
+
+
+@pytest.mark.parametrize("n", [1, pytest.param(2, marks=pytest.mark.skip(reason="later"))])
+def test_partly_skipped(n):
+    assert n == 1
+
+
+@pytest.mark.slow
+def test_slow():
+    assert True
+
+
+def test_hangs():
+    time.sleep(60)
+"""
+
+
+@pytest.fixture
+def outcomes(tmp_path):
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_outcomes.py").write_text(OUTCOME_TESTS)
+    (tmp_path / "tests" / "test_unimportable.py").write_text(
+        "import a_module_that_does_not_exist\n\n\ndef test_x():\n    assert True\n"
+    )
+    (tmp_path / "pytest.ini").write_text("[pytest]\nmarkers =\n    slow: takes a while\n")
+    return tmp_path
+
+
+def _outcome(repo, name, command=None, **kwargs):
+    return check_test_citation(f"tests/test_outcomes.py::{name}", repo, command or PYTEST, **kwargs)
+
+
+def test_a_failure_whose_output_says_not_found_is_still_a_failure(outcomes):
+    """Matching "not found" anywhere in the output read this as a test that does
+    not exist — `untested`, which passes — when it had run and failed."""
+    check = _outcome(outcomes, "test_fails_saying_not_found")
+    assert check.outcome == evidence.FAILED
+    assert check.verified is False
+    assert check.detail.startswith("failed")
+    assert "user not found in directory" in check.detail
+
+
+def test_a_skipped_test_is_not_evidence_that_it_passes(outcomes):
+    """pytest exits 0 for a skip. Marking a red test `skip` must not turn it
+    into proof."""
+    check = _outcome(outcomes, "test_skipped")
+    assert check.outcome == evidence.SKIPPED
+    assert check.verified is None
+    assert "flaky, will fix later" in check.detail
+
+
+def test_an_expected_failure_is_a_failing_test(outcomes):
+    """pytest also exits 0 for xfail, and reports it as a kind of skip. It is
+    neither: the test ran, and what it asserts does not hold."""
+    check = _outcome(outcomes, "test_expected_failure")
+    assert check.outcome == evidence.FAILED
+    assert check.verified is False
+    assert check.detail.startswith("failed") and "xfail" in check.detail
+
+
+def test_a_test_marked_xfail_that_passes_did_pass(outcomes):
+    assert _outcome(outcomes, "test_unexpected_pass").outcome == evidence.PASSED
+
+
+def test_a_test_that_errors_in_setup_is_not_reported_as_missing(outcomes):
+    """Its output says "fixture 'no_such_fixture' not found", which used to make
+    a broken proof read as an absent one."""
+    check = _outcome(outcomes, "test_needs_a_missing_fixture")
+    assert check.outcome == evidence.ERRORED
+    assert check.verified is None
+    assert "no_such_fixture" in check.detail
+
+
+def test_a_test_module_that_cannot_be_imported_is_not_reported_as_missing(outcomes):
+    """pytest exits 4 for this, the same status as a node id that matches
+    nothing. They are different facts: this test exists and is broken."""
+    check = check_test_citation("tests/test_unimportable.py::test_x", outcomes, PYTEST)
+    assert check.outcome == evidence.ERRORED
+    assert "a_module_that_does_not_exist" in check.detail
+
+
+def test_a_test_that_really_is_absent_is_still_reported_as_missing(outcomes):
+    check = _outcome(outcomes, "test_imaginary")
+    assert check.outcome == evidence.MISSING
+    assert check.verified is False
+
+
+def test_one_failing_case_fails_a_parametrized_citation(outcomes):
+    check = _outcome(outcomes, "test_cases")
+    assert check.outcome == evidence.FAILED
+    assert "test_cases[2]" in check.detail
+
+
+def test_a_single_case_of_a_parametrized_test_can_be_cited(outcomes):
+    assert _outcome(outcomes, "test_cases[1]").outcome == evidence.PASSED
+
+
+def test_a_skipped_case_neither_fails_a_citation_nor_counts_toward_it(outcomes):
+    check = _outcome(outcomes, "test_partly_skipped")
+    assert check.outcome == evidence.PASSED
+    assert "1 of 2 cases skipped" in check.detail
+
+
+def test_a_coverage_threshold_does_not_fail_a_test_that_passed(tmp_path):
+    """One test never covers a project, so a `--cov-fail-under` in the project's
+    own config trips on every single-test run and pytest exits 1. Reading the
+    exit status reported every proof in such a project as failing."""
+    pytest.importorskip("pytest_cov")
+    (tmp_path / "conftest.py").write_text("")
+    (tmp_path / "lib.py").write_text(
+        "def used():\n    return 1\n\n\ndef unused(a):\n    if a:\n        return 2\n    return 3\n"
+    )
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_lib.py").write_text(
+        "from lib import used\n\n\ndef test_used():\n    assert used() == 1\n"
+    )
+    strict_coverage = [*PYTEST, "--cov=lib", "--cov-fail-under=100"]
+
+    check = check_test_citation("tests/test_lib.py::test_used", tmp_path, strict_coverage)
+
+    assert check.outcome == evidence.PASSED
+    assert check.verified is True
+
+
+def test_a_project_that_already_runs_quiet_does_not_hide_the_outcome(outcomes):
+    """A project's `addopts = -q` plus the `-q` passed here is `-qq`, at which
+    pytest prints no summary line at all — so the outcome cannot be read off
+    the terminal either."""
+    (outcomes / "pytest.ini").write_text("[pytest]\naddopts = -q\nmarkers =\n    slow: slow\n")
+    assert _outcome(outcomes, "test_skipped").outcome == evidence.SKIPPED
+    assert _outcome(outcomes, "test_passes").outcome == evidence.PASSED
+
+
+def test_a_test_the_project_deselects_did_not_run(outcomes):
+    (outcomes / "pytest.ini").write_text(
+        '[pytest]\naddopts = -m "not slow"\nmarkers =\n    slow: takes a while\n'
+    )
+    check = _outcome(outcomes, "test_slow")
+    assert check.outcome == evidence.SKIPPED
+    assert "deselected" in check.detail
+
+
+def test_a_test_that_hangs_is_cut_off_and_is_not_a_pass(outcomes):
+    started = time.monotonic()
+    check = _outcome(outcomes, "test_hangs", timeout=1.0)
+    assert time.monotonic() - started < 20
+    assert check.outcome == evidence.ERRORED
+    assert "timed out after 1s" in check.detail
+
+
+def test_a_runner_that_cannot_be_launched_is_an_error_not_a_pass(outcomes):
+    check = _outcome(outcomes, "test_passes", ["definitely-not-a-test-runner"])
+    assert check.outcome == evidence.ERRORED
+    assert "could not run the test command" in check.detail
+
+
+# A command that is not pytest, or that runs inside a container, leaves no
+# report to read. The exit status is then all there is, plus whatever the
+# output volunteers — which may only ever lower the result.
+
+REPORTLESS_RUNNER = "import sys\nsys.stdout.write(sys.argv[2])\nsys.exit(int(sys.argv[1]))\n"
+
+
+@pytest.mark.parametrize(
+    ("status", "output", "expected"),
+    [
+        (0, "1 passed in 0.01s", evidence.PASSED),
+        (0, "", evidence.PASSED),
+        (0, "1 skipped in 0.01s", evidence.SKIPPED),
+        (0, "1 xfailed in 0.01s", evidence.FAILED),
+        (0, "2 passed, 1 skipped in 0.01s", evidence.PASSED),
+        (1, "1 failed in 0.01s", evidence.FAILED),
+        # A failing status is never talked back up by text a test could print.
+        (1, "1 passed in 0.01s", evidence.FAILED),
+        (
+            4,
+            "ERROR: not found: /r/t.py::test_y\n(no match in any of [<Module t.py>])",
+            evidence.MISSING,
+        ),
+        (4, "pytest: error: unrecognized arguments: --no-header", evidence.ERRORED),
+        (5, "no tests ran in 0.00s", evidence.MISSING),
+        (5, "1 deselected in 0.00s", evidence.SKIPPED),
+        (2, "Interrupted: 1 error during collection", evidence.ERRORED),
+        (3, "INTERNALERROR> boom", evidence.ERRORED),
+        (101, "error: test failed, to rerun pass `--lib`", evidence.FAILED),
+    ],
+)
+def test_a_run_that_leaves_no_report_is_classified_by_its_exit_status(
+    tmp_path, status, output, expected
+):
+    runner = tmp_path / "runner.py"
+    runner.write_text(REPORTLESS_RUNNER)
+    command = [sys.executable, str(runner), str(status), output]
+
+    report = evidence.run_test(command, "tests/t.py::test_y", tmp_path)
+
+    assert report.outcome == expected
+
+
 # ── Downgrades ───────────────────────────────────────────────────────────────
 
 
@@ -221,6 +477,100 @@ def test_no_run_tests_still_downgrades_met_to_untested(repo):
     assert r.status == "untested"
 
 
+def test_a_skipped_proof_cannot_keep_a_criterion_met(outcomes):
+    """The cheapest way to turn a red proof green is to stop running it."""
+    r = apply_evidence_checks(
+        _result(test="tests/test_outcomes.py::test_skipped"), outcomes, PYTEST
+    )
+    assert r.status == "untested"
+    assert "skipped" in r.downgrade_reason
+    assert derive_verdict([r], require_tests=True) == "fail"
+
+
+def test_a_proof_marked_as_an_expected_failure_makes_the_criterion_unmet(outcomes):
+    r = apply_evidence_checks(
+        _result(test="tests/test_outcomes.py::test_expected_failure"), outcomes, PYTEST
+    )
+    assert r.status == "unmet"
+    assert derive_verdict([r]) == "fail"
+
+
+def test_a_proof_that_errors_is_unverifiable_rather_than_a_quiet_pass(outcomes):
+    """A broken proof is not the same as a test nobody wrote. `untested` passes
+    by default; a proof that was attempted and blew up must not."""
+    r = apply_evidence_checks(_result(test="tests/test_unimportable.py::test_x"), outcomes, PYTEST)
+    assert r.status == "unverifiable"
+    assert r.downgraded_from == "met"
+    assert "did not run to a result" in r.downgrade_reason
+    assert derive_verdict([r]) == "unclear"
+
+
+def test_a_proof_that_times_out_is_unverifiable(outcomes):
+    r = apply_evidence_checks(
+        _result(test="tests/test_outcomes.py::test_hangs"), outcomes, PYTEST, test_timeout=1.0
+    )
+    assert r.status == "unverifiable"
+
+
+def test_an_errored_proof_lowers_a_claim_the_reviewer_only_called_untested(outcomes):
+    """Facts about the evidence apply whatever the reviewer said, the same way a
+    failing test makes `untested` into `unmet`."""
+    r = apply_evidence_checks(
+        _result(status="untested", test="tests/test_unimportable.py::test_x"), outcomes, PYTEST
+    )
+    assert r.status == "unverifiable"
+
+
+@pytest.mark.parametrize(
+    ("detail", "verified", "expected", "reason"),
+    [
+        ("failed\nassert 1 == 2", False, "unmet", "cited test fails"),
+        ("no such test", False, "untested", "cited test does not exist"),
+        ("timed out after 120s", None, "untested", "test not confirmed"),
+    ],
+)
+def test_a_check_recorded_before_outcomes_existed_is_read_by_its_prose(
+    detail, verified, expected, reason
+):
+    """Older records never stored an outcome. They have to keep replaying to the
+    status they recorded, so their checks go through the rules they were written
+    under — and round-trip to exactly the dict they were read from."""
+    stored = {"kind": "test", "citation": "tests/t.py::t", "verified": verified, "detail": detail}
+    check = EvidenceCheck.from_dict(stored)
+    r = _result(test="tests/t.py::t")
+    r.test_check = check
+
+    apply_downgrades(r)
+
+    assert check.outcome is None
+    assert check.as_dict() == stored
+    assert r.status == expected
+    assert r.downgrade_reason.startswith(reason)
+
+
+def test_a_proof_shared_by_several_criteria_runs_once(tmp_path):
+    """Each run is a fresh interpreter plus the project's own import time, and
+    plans routinely rest several criteria on one test."""
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_counted.py").write_text(
+        "from pathlib import Path\n\n\n"
+        "def test_counted():\n"
+        "    with Path('runs.log').open('a') as log:\n"
+        "        log.write('ran\\n')\n"
+    )
+    citation = "tests/test_counted.py::test_counted"
+    cache: dict = {}
+
+    first = apply_evidence_checks(_result(test=citation), tmp_path, PYTEST, cache=cache)
+    second = apply_evidence_checks(
+        _result(test=f"proven by {citation}"), tmp_path, PYTEST, cache=cache
+    )
+
+    assert (tmp_path / "runs.log").read_text() == "ran\n"
+    assert first.status == second.status == "met"
+    assert first.test_check is not second.test_check, "criteria must not share one mutable check"
+
+
 # ── Untrusted test execution ─────────────────────────────────────────────────
 
 
@@ -258,3 +608,33 @@ def test_scrubbing_can_be_disabled_for_trusted_code(repo, monkeypatch):
         "tests/test_env.py::test_sees_env", repo, PYTEST, scrub_env=False
     )
     assert permissive.verified is True
+
+
+# ── Stopping a run in flight ─────────────────────────────────────────────────
+
+
+async def test_an_error_during_evidence_does_not_leave_tests_switched_off(repo):
+    """Stopping the tests in flight is how an interrupted run unwinds. The flag
+    has to be cleared once it has, or it outlives the run and every test after
+    it is reported as never having been run."""
+    from arbiter.verify import off_loop
+
+    def work():
+        raise RuntimeError("evidence blew up")
+
+    with pytest.raises(RuntimeError, match="evidence blew up"):
+        await off_loop(work)
+
+    check = check_test_citation("tests/test_app.py::test_passes", repo, PYTEST)
+    assert check.outcome == evidence.PASSED
+
+
+def test_a_stopped_run_starts_no_further_tests(repo):
+    evidence.stop_running_tests()
+    try:
+        check = check_test_citation("tests/test_app.py::test_passes", repo, PYTEST)
+    finally:
+        evidence.allow_tests()
+
+    assert check.outcome == evidence.ERRORED
+    assert "interrupted" in check.detail

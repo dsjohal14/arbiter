@@ -22,7 +22,7 @@ from pathlib import Path
 
 from . import criteria as crit
 from . import display, plan_review, verify
-from .evidence import EvidenceCheck
+from .evidence import TEST_OUTCOMES, EvidenceCheck
 from .prompts import Blinding
 from .run_records import SCHEMA_VERSION
 
@@ -30,7 +30,12 @@ REPLAYABLE_COMMANDS = ("verify", "plan review")
 
 # Every version this build can actually parse. v1/v2 keep observations inside
 # `result`, so they can be replayed but cannot certify an exact comparison.
-SUPPORTED_RECORD_VERSIONS = (1, 2, 3)
+# v3 predates stored test outcomes; its checks are read through the prose rules
+# they were written under, so it still replays to the verdict it recorded.
+SUPPORTED_RECORD_VERSIONS = (1, 2, 3, 4)
+
+# From here on a test check states its outcome instead of implying it.
+_OUTCOME_VERSION = 4
 
 
 class ReplayError(RuntimeError):
@@ -95,7 +100,20 @@ def _calls(record: dict, phase: str) -> list[dict]:
 
 
 def _reports(record: dict) -> list[tuple[str, str]]:
-    return [(str(call.get("role") or ""), call["content"]) for call in _calls(record, "reviewer")]
+    """Reviewer reports in the order the live run handled them.
+
+    Live, reports come back in panel order whatever order the reviewers
+    finished in. The record lists calls as they completed. Where no consolidated
+    verdict exists, the first reviewer on the panel to give the worst status
+    supplies the row — so replaying in completion order could quote a different
+    reviewer than the run did.
+    """
+    reports = [
+        (str(call.get("role") or ""), call["content"]) for call in _calls(record, "reviewer")
+    ]
+    panel = [str(key) for key in (record.get("configuration") or {}).get("models") or []]
+    position = {key: index for index, key in enumerate(panel)}
+    return sorted(reports, key=lambda report: position.get(report[0], len(panel)))
 
 
 def _consolidated(record: dict) -> str | None:
@@ -299,6 +317,16 @@ def _observations(record: dict, recorded: dict) -> dict:
         ids = [row["id"] for row in rows]
         if any(not isinstance(cid, str) or not cid for cid in ids) or len(ids) != len(set(ids)):
             raise ReplayError("The v3 verify record has malformed criterion evidence observations.")
+        if int(record["schema_version"]) >= _OUTCOME_VERSION:
+            # Without this a hand-edited check would quietly fall back to the
+            # legacy prose rules and replay to a status no v4 run could reach.
+            for row in rows:
+                check = row["test_check"]
+                if isinstance(check, dict) and check.get("outcome") not in TEST_OUTCOMES:
+                    raise ReplayError(
+                        f"The record's test evidence for {row['id']} does not state a known "
+                        "outcome, so the verdict rules have nothing to apply."
+                    )
     return observations
 
 

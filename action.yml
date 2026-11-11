@@ -1,0 +1,87 @@
+name: Arbiter verify
+description: >-
+  Gate a pull request against its approved plan: did the implementation keep
+  every promise the plan made?
+author: Daljit Singh
+branding:
+  icon: check-circle
+  color: purple
+
+# This action runs Arbiter. It does not install or authenticate a provider CLI
+# (claude, codex, ...): do that in an earlier step, with your own credentials.
+#
+# Checking test evidence EXECUTES tests from the branch under review, with
+# whatever the job can reach. For pull requests from forks, or any code you do
+# not trust, pass `args: --no-run-tests`. See "Trust boundary" in the README.
+
+inputs:
+  plan:
+    description: Path to the approved plan. Optional when the project settings name one.
+    required: false
+    default: ""
+  diff:
+    description: >-
+      What to verify: a revision range, a diff file, 'staged', or 'working'.
+      Defaults to the pull request's own changes, which needs the checkout to
+      have history (actions/checkout with fetch-depth: 0).
+    required: false
+    default: ""
+  args:
+    description: Extra arguments for `arbiter verify`, e.g. `--require-tests --models claude`.
+    required: false
+    default: ""
+  working-directory:
+    description: Directory to run in. Citations resolve against it, so it is the project root.
+    required: false
+    default: "."
+  fail-on-unclear:
+    description: Fail the job when the verdict is `unclear`. Set to "false" to only warn.
+    required: false
+    default: "true"
+  setup-python:
+    description: Install Python with actions/setup-python. Set to "false" if the job already has.
+    required: false
+    default: "true"
+  python-version:
+    description: Python version to install when setup-python is true.
+    required: false
+    default: "3.12"
+
+outputs:
+  verdict:
+    description: pass, fail, unclear, or error (the run itself went wrong).
+    value: ${{ steps.gate.outputs.verdict }}
+  exit-code:
+    description: "Arbiter's exit code: 0 pass, 1 fail, 2 usage, 3 unclear, 4 runtime error."
+    value: ${{ steps.gate.outputs.exit-code }}
+  json:
+    description: Path to the full result as JSON.
+    value: ${{ steps.gate.outputs.json }}
+  summary:
+    description: Path to the result as markdown. It is also added to the job summary.
+    value: ${{ steps.gate.outputs.summary }}
+
+runs:
+  using: composite
+  steps:
+    - if: inputs.setup-python == 'true'
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Install Arbiter
+      shell: bash
+      run: python -m pip install --quiet --disable-pip-version-check "$GITHUB_ACTION_PATH"
+
+    - name: Verify
+      id: gate
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        ARBITER_PLAN: ${{ inputs.plan }}
+        ARBITER_DIFF: ${{ inputs.diff }}
+        ARBITER_ARGS: ${{ inputs.args }}
+        ARBITER_FAIL_ON_UNCLEAR: ${{ inputs.fail-on-unclear }}
+        ARBITER_PR_BASE: ${{ github.event.pull_request.base.sha }}
+        ARBITER_PR_HEAD: ${{ github.event.pull_request.head.sha }}
+      run: bash "$GITHUB_ACTION_PATH/action/run.sh"

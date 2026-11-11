@@ -177,12 +177,11 @@ def test_plan_review_record_includes_extraction_and_final_result(
     assert code == 0
     assert record["command"] == "plan review"
     assert record["inputs"]["plan"]["content"] == RAW_PLAN
+    # What was printed is the recorded result, plus what the run took.
+    assert record["usage"] == output.pop("usage")
     assert record["result"] == output
-    assert [call["phase"] for call in record["provider_calls"]] == [
-        "extractor",
-        "reviewer",
-        "consolidator",
-    ]
+    # One reviewer, so nothing was sent to be merged with itself.
+    assert [call["phase"] for call in record["provider_calls"]] == ["extractor", "reviewer"]
     assert all(call["content"] == combined for call in record["provider_calls"])
 
 
@@ -204,9 +203,57 @@ def test_a_valid_empty_consolidation_can_clear_raw_findings(
             "claude": claude_events(_report()),
         }
     )
-    code = main(["plan", "review", "plan.md", "--models", "codex", "--judge", "claude"])
+    always = ["--consolidate", "always"]
+    code = main(["plan", "review", "plan.md", "--models", "codex", "--judge", "claude", *always])
     assert code == 0
     assert "ready to pin" in capsys.readouterr().out.lower()
+
+
+def test_one_reviewer_is_not_sent_to_be_merged_with_itself(tmp_path, shim_path, monkeypatch):
+    """With one critique there are no two phrasings to merge. The call was made
+    anyway, to the most expensive model on the panel, after the reviewer had
+    already finished. Skipping it never hides a finding: the reviewer's own are
+    kept as given."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "plan.md").write_text(PINNED)
+    argv_log = shim_path(
+        per_provider={
+            "codex": codex_events(_report(AMBIGUOUS)),
+            "claude": claude_events(_report()),
+        }
+    )
+
+    code = main(["plan", "review", "plan.md", "--models", "codex", "--judge", "claude"])
+
+    assert code == 1, "the reviewer's blocking finding stands"
+    assert len(argv_log.read_text().splitlines()) == 1
+
+
+def test_reviewers_with_nothing_to_say_are_not_consolidated(tmp_path, shim_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "plan.md").write_text(PINNED)
+    argv_log = shim_path(
+        per_provider={"codex": codex_events(_report()), "claude": claude_events(_report())}
+    )
+
+    assert main(["plan", "review", "plan.md", "--models", "claude,codex"]) == 0
+    assert len(argv_log.read_text().splitlines()) == 2
+
+
+def test_reviewers_who_each_found_something_are_still_merged(tmp_path, shim_path, monkeypatch):
+    """Two reviewers phrase one problem two ways; telling them apart is a judgement."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "plan.md").write_text(PINNED)
+    argv_log = shim_path(
+        per_provider={
+            "codex": codex_events(_report(AMBIGUOUS)),
+            "claude": claude_events(_report(MISSING)),
+        }
+    )
+
+    main(["plan", "review", "plan.md", "--models", "claude,codex", "--judge", "claude"])
+
+    assert len(argv_log.read_text().splitlines()) == 3
 
 
 def test_an_incomplete_reviewer_keeps_its_usable_findings(tmp_path, shim_path, monkeypatch, capsys):
@@ -293,7 +340,8 @@ def test_a_failed_reviewer_prevents_a_ready_verdict(tmp_path, shim_path, monkeyp
     assert payload["failed_reviewers"] == ["codex"]
     record = json.loads(record_path.read_text())
     failed = [call for call in record["provider_calls"] if call["status"] == "failed"]
-    assert len(failed) == 1
-    assert failed[0]["phase"] == "reviewer"
-    assert failed[0]["role"] == "codex"
-    assert failed[0]["error"]["type"] == "ModelCallError"
+    # Tried, then tried once more, and both attempts are on the record.
+    assert [call["attempt"] for call in failed] == [1, 2]
+    assert {call["phase"] for call in failed} == {"reviewer"}
+    assert {call["role"] for call in failed} == {"codex"}
+    assert failed[-1]["error"]["type"] == "ModelCallError"

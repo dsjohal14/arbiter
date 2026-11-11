@@ -22,14 +22,20 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
-from . import __version__
+from . import __version__, usage
 from .models import ModelResponse, Session
 
 # v2 added `workspace`. v3 makes that snapshot cover the whole Git-visible
 # tree (or the whole non-Git directory) and separates replay observations from
 # the result they are used to reproduce. Older records remain replayable, but
 # cannot support an exact replay check or be bound to a verify eval case.
-SCHEMA_VERSION = 3
+#
+# v4 states what running each cited test produced (`outcome`) on its evidence
+# check, and the downgrade rules key on that instead of on the check's prose.
+# The document shape is otherwise v3's. The bump exists for older readers: one
+# that applied prose rules to a v4 record would reach a different status for an
+# errored or skipped test, so it has to refuse the record rather than guess.
+SCHEMA_VERSION = 4
 
 MAX_WORKSPACE_FILES = 100_000
 MAX_WORKSPACE_FILE_BYTES = 512 * 1024 * 1024
@@ -289,6 +295,10 @@ class RunTrace:
     calls: list[dict] = field(default_factory=list)
 
     def success(self, phase: str, session: Session, response: ModelResponse) -> None:
+        # Attempts that failed before this one are calls too: they took time,
+        # and a provider may have billed for them.
+        for number, error in enumerate(response.failed_attempts, 1):
+            self._failed(phase, session, error, number)
         self.calls.append(
             {
                 "phase": phase,
@@ -296,6 +306,7 @@ class RunTrace:
                 "provider": session.provider.key,
                 "cli": session.cli,
                 "model": session.model,
+                "attempt": len(response.failed_attempts) + 1,
                 "status": "completed",
                 "duration_ms": round(response.duration * 1000),
                 "content": response.content,
@@ -307,6 +318,12 @@ class RunTrace:
         )
 
     def failure(self, phase: str, session: Session, error: Exception) -> None:
+        earlier = list(getattr(error, "earlier", None) or [])
+        for number, prior in enumerate(earlier, 1):
+            self._failed(phase, session, prior, number)
+        self._failed(phase, session, error, len(earlier) + 1)
+
+    def _failed(self, phase: str, session: Session, error: Exception, attempt: int) -> None:
         # A failed call still spent wall-clock, and a provider commonly reports
         # usage in the same event that reports the error. Recording null for
         # both would bias every later cost and latency summary downward by
@@ -321,6 +338,7 @@ class RunTrace:
                 "provider": session.provider.key,
                 "cli": session.cli,
                 "model": session.model,
+                "attempt": attempt,
                 "status": "failed",
                 "duration_ms": round(duration * 1000) if duration is not None else None,
                 "content": None,
@@ -376,6 +394,9 @@ class RunRecorder:
             # evidence citation/detail or blinding map even when status holds.
             "observations": _result_observations(result),
             "provider_calls": self.trace.calls,
+            # Derived from provider_calls, and stored so a record answers "what
+            # did this run cost" without the reader re-implementing the rules.
+            "usage": usage.summarize(self.trace.calls),
             "result": result,
             "exit_code": exit_code,
             "error": error_value,

@@ -688,3 +688,114 @@ def test_a_v1_record_still_replays():
     assert outcome.matches is False
     assert outcome.exact_comparison is False
     assert any("Legacy record" in note for note in outcome.notes)
+
+
+# ── Stored test outcomes (schema v4) ─────────────────────────────────────────
+#
+# From v4 a test check states what running it produced, and the downgrade rules
+# key on that. Older records implied it in prose and must keep replaying to the
+# verdict they recorded.
+
+ERRORED_CHECK = {
+    "kind": "test",
+    "citation": "tests/test_app.py::t",
+    "verified": None,
+    "detail": "errored before it could pass or fail\nE   ImportError: No module named 'app'",
+    "outcome": "errored",
+}
+
+
+def _errored_proof_record() -> dict:
+    record = verify_record(
+        result=recorded_result(
+            recorded_criterion(
+                "AC-1",
+                "unverifiable",
+                implementation_evidence="app.py:2",
+                test_evidence="tests/test_app.py::t",
+                test_check=ERRORED_CHECK,
+                downgraded_from="met",
+                downgrade_reason="cited test did not run to a result: tests/test_app.py::t",
+            ),
+            recorded_criterion("AC-2", "untested", **DOWNGRADED_NO_TEST),
+            status="unclear",
+        )
+    )
+    record["schema_version"] = 4
+    return record
+
+
+def test_a_v4_record_replays_an_errored_proof_as_unverifiable():
+    outcome = replay.replay(_errored_proof_record())
+
+    assert outcome.drift == []
+    assert outcome.matches is True
+    assert outcome.result.status == "unclear"
+    row = next(c for c in outcome.result.criteria if c.id == "AC-1")
+    assert row.test_check.outcome == "errored"
+
+
+@pytest.mark.parametrize("outcome", [None, "exploded", 7])
+def test_a_v4_test_check_must_state_a_known_outcome(outcome):
+    """Otherwise it would fall back to the prose rules and replay to a status no
+    v4 run could have reached."""
+    record = _errored_proof_record()
+    observed = record["observations"]["criteria_evidence"][0]["test_check"]
+    if outcome is None:
+        del observed["outcome"]
+    else:
+        observed["outcome"] = outcome
+
+    with pytest.raises(ReplayError, match="does not state a known outcome"):
+        replay.replay(record)
+
+
+def test_a_v3_record_is_read_through_the_rules_it_was_written_under():
+    """v3 recorded a timeout as "could not check", which left the criterion
+    `untested`. Re-reading it as an error would move the verdict of a run that
+    already happened."""
+    record = verify_record(
+        result=recorded_result(
+            recorded_criterion(
+                "AC-1",
+                "untested",
+                implementation_evidence="app.py:2",
+                test_evidence="tests/test_app.py::t",
+                test_check={
+                    "kind": "test",
+                    "citation": "tests/test_app.py::t",
+                    "verified": None,
+                    "detail": "timed out after 120s",
+                },
+                downgraded_from="met",
+                downgrade_reason="test not confirmed: timed out after 120s",
+            ),
+            recorded_criterion("AC-2", "untested", **DOWNGRADED_NO_TEST),
+        )
+    )
+    assert record["schema_version"] == 3
+
+    outcome = replay.replay(record)
+
+    assert outcome.drift == []
+    assert outcome.matches is True
+
+
+def test_reports_are_replayed_in_panel_order_not_the_order_they_finished():
+    """Live, reports come back in panel order whatever order the reviewers
+    finished in; the record lists calls as they completed. With no consolidated
+    verdict, the first reviewer on the panel to give the worst status supplies
+    the row — so replaying in completion order would quote a different reviewer
+    than the run did."""
+    from_claude = _review(_ac("AC-1", "met", "claude.py:1", "tests/a.py::t"), _ac("AC-2", "met"))
+    from_codex = _review(_ac("AC-1", "met", "codex.py:9", "tests/b.py::t"), _ac("AC-2", "met"))
+    record = verify_record(
+        configuration={"models": ["claude", "codex"]},
+        # codex finished first.
+        calls=[_call("reviewer", "codex", from_codex), _call("reviewer", "claude", from_claude)],
+    )
+
+    row = next(c for c in replay.replay(record).result.criteria if c.id == "AC-1")
+
+    assert row.implementation_evidence == "claude.py:1"
+    assert row.test_evidence == "tests/a.py::t"

@@ -46,6 +46,7 @@ def test_trace_keeps_provider_output_but_not_invocation_or_session_ids():
             "provider": "claude",
             "cli": "claude",
             "model": "sonnet",
+            "attempt": 1,
             "status": "completed",
             "duration_ms": 125,
             "content": '{"findings": []}',

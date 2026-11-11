@@ -13,11 +13,15 @@ Driven by environment variables so the shim scripts stay trivial:
     FAKE_CLI_STREAM_<N>  per-provider override (e.g. FAKE_CLI_STREAM_CODEX)
     FAKE_CLI_EXIT_CODE   exit with this code after replaying (default 0)
     FAKE_CLI_HANG        sleep this many seconds instead of exiting
+    FAKE_CLI_DELAY       sleep this many seconds, then reply normally (a slow provider)
     FAKE_CLI_GARBAGE     emit non-JSON noise between events
     FAKE_CLI_PROSE       write this to stdout before anything else, unterminated
                          (how a CLI needing a login asks, right before it blocks)
     FAKE_CLI_STDERR      write this to stderr
     FAKE_CLI_ARGV_OUT    append the received argv to this file, as JSON
+    FAKE_CLI_PID_OUT     write this process's pid to this file
+    FAKE_CLI_FAIL_FIRST  fail this many invocations (per provider) before behaving,
+                         counted in FAKE_CLI_FAIL_STATE — a provider having a bad minute
 """
 
 from __future__ import annotations
@@ -34,6 +38,24 @@ def main() -> int:
         with open(argv_out, "a", encoding="utf-8") as f:
             f.write(json.dumps(sys.argv) + "\n")
 
+    pid_out = os.environ.get("FAKE_CLI_PID_OUT")
+    if pid_out:
+        with open(pid_out, "w", encoding="utf-8") as f:
+            f.write(str(os.getpid()))
+
+    fail_first = int(os.environ.get("FAKE_CLI_FAIL_FIRST", "0"))
+    if fail_first:
+        state = f"{os.environ['FAKE_CLI_FAIL_STATE']}.{os.environ.get('FAKE_CLI_NAME', 'cli')}"
+        seen = 0
+        if os.path.exists(state):
+            with open(state, encoding="utf-8") as f:
+                seen = int(f.read())
+        with open(state, "w", encoding="utf-8") as f:
+            f.write(str(seen + 1))
+        if seen < fail_first:
+            sys.stderr.write("upstream overloaded, try again")
+            return 1
+
     stderr = os.environ.get("FAKE_CLI_STDERR")
     if stderr:
         sys.stderr.write(stderr)
@@ -45,6 +67,11 @@ def main() -> int:
         # a newline, which is exactly why a line-based reader never sees it.
         sys.stdout.write(prose)
         sys.stdout.flush()
+
+    delay = os.environ.get(f"FAKE_CLI_DELAY_{os.environ.get('FAKE_CLI_NAME', '').upper()}")
+    delay = delay or os.environ.get("FAKE_CLI_DELAY")
+    if delay:
+        time.sleep(float(delay))
 
     hang = os.environ.get("FAKE_CLI_HANG")
     if hang:

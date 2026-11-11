@@ -40,8 +40,25 @@ def out():
     return sys.stderr if _json_mode else sys.stdout
 
 
+_capture = None
+
+
+def capture(sink) -> None:
+    """Hand every printed line to `sink` instead of writing it, or stop doing so.
+
+    A live status board owns the terminal while it is up. Anything printed
+    through it would land in the middle of a frame, so the board takes the line
+    and places it above itself on the next redraw.
+    """
+    global _capture
+    _capture = sink
+
+
 def print(*args, **kwargs) -> None:
     """Like the builtin, but honours the JSON-mode redirect."""
+    if _capture is not None:
+        _capture(kwargs.get("sep", " ").join(str(arg) for arg in args))
+        return
     kwargs.setdefault("file", out())
     builtins.print(*args, **kwargs)
 
@@ -322,6 +339,21 @@ def print_error(msg: str) -> None:
 
 def print_note(msg: str) -> None:
     print(_c(f"  {msg}", DIM))
+
+
+def print_footer(text: str) -> None:
+    """The last line of a run: what it took."""
+    print(_c(f"  {text}", DIM))
+    print()
+
+
+def print_retry(name: str, attempt: int, error: object) -> None:
+    print(_c(f"  ↻  {name} failed (attempt {attempt}), retrying: {error}", YELLOW), file=sys.stderr)
+
+
+def retry_notice(name: str):
+    """A callback for `call_session(on_retry=...)` that says who is retrying."""
+    return lambda _key, attempt, error: print_retry(name, attempt, error)
 
 
 # ── Plan review ───────────────────────────────────────────────────────────────

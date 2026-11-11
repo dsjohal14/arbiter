@@ -12,7 +12,8 @@ from __future__ import annotations
 import asyncio
 
 from . import display
-from .models import Session, call_session
+from .models import ModelCallError, Session, call_session
+from .progress import Progress
 from .run_records import RunTrace
 
 
@@ -41,6 +42,9 @@ async def stream_parallel(
         if verbose:
             queue.put_nowait(("cmd", key, cmd))
 
+    def on_retry(key: str, attempt: int, error: Exception) -> None:
+        queue.put_nowait(("retry", key, (attempt, error)))
+
     async def run_one(sess: Session):
         try:
             resp = await call_session(
@@ -50,6 +54,7 @@ async def stream_parallel(
                 on_cmd=on_cmd,
                 timeout=timeout,
                 schema_path_writer=schema_path_writer,
+                on_retry=on_retry,
             )
             if trace is not None:
                 trace.success(phase, sess, resp)
@@ -149,6 +154,18 @@ async def _coordinator(
             if key == focus:
                 _end_focus()
             advance()
+        elif kind == "retry":
+            # Whatever that attempt streamed is not the answer. Close its block
+            # and forget it, so the next attempt opens one of its own.
+            if key == focus:
+                _end_focus()
+            buffers.pop(key, None)
+            displayed.discard(key)
+            if key in order:
+                order.remove(key)
+            attempt, error = payload
+            display.print_retry(names.get(key, key), attempt, error)
+            advance()
         elif kind == "fail":
             finished += 1
             displayed.add(key)
@@ -156,3 +173,114 @@ async def _coordinator(
             if key == focus:
                 focus = None
             advance()
+
+
+# ── Structured reviews: report progress, not output ──────────────────────────
+#
+# A debate streams prose a person reads. A verification's reviewers answer in
+# JSON meant for a parser, so what is worth showing is which step the run is on
+# and whether it is alive — which is what `Progress` renders.
+
+
+async def review_parallel(
+    sessions: list[Session],
+    prompts: dict[str, str],
+    names: dict[str, str],
+    timeout: float,
+    progress: Progress,
+    schema_path_writer=None,
+    trace: RunTrace | None = None,
+    phase: str = "reviewer",
+    activity: str = "reviewing",
+    finished: str = "reviewed",
+) -> list[tuple[str, str]]:
+    """Run every session concurrently. Returns [(key, content), ...] for those
+    that succeeded, in the order the sessions were given.
+
+    One model failing degrades to a reported error; it never aborts the group.
+    """
+    for sess in sessions:
+        progress.add(sess.key, names.get(sess.key, sess.key))
+
+    async def run_one(sess: Session):
+        progress.start(sess.key, activity)
+        received = 0
+
+        async def on_delta(key: str, text: str) -> None:
+            nonlocal received
+            received += len(text)
+            progress.update(key, f"{activity} · {received:,} characters back")
+
+        try:
+            resp = await call_session(
+                sess,
+                prompts[sess.key],
+                on_delta=on_delta,
+                timeout=timeout,
+                schema_path_writer=schema_path_writer,
+                on_retry=lambda key, attempt, error: progress.retry(key, attempt, str(error)),
+            )
+        except Exception as e:
+            if trace is not None:
+                trace.failure(phase, sess, e)
+            progress.fail(sess.key, str(e))
+            return None
+        if trace is not None:
+            trace.success(phase, sess, resp)
+        progress.done(sess.key, finished, resp.duration, resp.usage)
+        return resp
+
+    results = await asyncio.gather(*[run_one(s) for s in sessions])
+    return [(r.model, r.content) for r in results if r is not None]
+
+
+CONSOLIDATION = "consolidation"
+
+
+async def consolidate(
+    consolidator: Session,
+    name: str,
+    build_prompt,
+    skip: str | None,
+    progress: Progress,
+    timeout: float,
+    fallback: str,
+    schema_path_writer=None,
+    trace: RunTrace | None = None,
+    verbose: bool = False,
+):
+    """The consolidator's reply, or None when the call was skipped or failed.
+
+    Consolidation reconciles; it is not the source of truth. Losing it costs
+    precision and must not cost the whole run, so a failure here is reported
+    and the caller falls back to `fallback` — what the reviewers themselves said.
+
+    `build_prompt` is called only if the call is made: with nothing to
+    reconcile there is no reason to assemble a prompt nobody will read.
+    """
+    progress.add(CONSOLIDATION, CONSOLIDATION)
+    if skip:
+        progress.skip(CONSOLIDATION, skip)
+        return None
+
+    progress.start(CONSOLIDATION, f"{name} reconciling the reviews (blinded)")
+    try:
+        resp = await call_session(
+            consolidator,
+            build_prompt(),
+            on_cmd=(lambda _key, cmd: display.print_verbose_cmd(cmd)) if verbose else None,
+            timeout=timeout,
+            schema_path_writer=schema_path_writer,
+            on_retry=lambda _key, attempt, error: progress.retry(
+                CONSOLIDATION, attempt, str(error)
+            ),
+        )
+    except ModelCallError as e:
+        if trace is not None:
+            trace.failure("consolidator", consolidator, e)
+        progress.fail(CONSOLIDATION, f"{e} Falling back to {fallback}.")
+        return None
+    if trace is not None:
+        trace.success("consolidator", consolidator, resp)
+    progress.done(CONSOLIDATION, f"reconciled by {name}", resp.duration, resp.usage)
+    return resp
