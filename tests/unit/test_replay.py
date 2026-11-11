@@ -779,3 +779,23 @@ def test_a_v3_record_is_read_through_the_rules_it_was_written_under():
 
     assert outcome.drift == []
     assert outcome.matches is True
+
+
+def test_reports_are_replayed_in_panel_order_not_the_order_they_finished():
+    """Live, reports come back in panel order whatever order the reviewers
+    finished in; the record lists calls as they completed. With no consolidated
+    verdict, the first reviewer on the panel to give the worst status supplies
+    the row — so replaying in completion order would quote a different reviewer
+    than the run did."""
+    from_claude = _review(_ac("AC-1", "met", "claude.py:1", "tests/a.py::t"), _ac("AC-2", "met"))
+    from_codex = _review(_ac("AC-1", "met", "codex.py:9", "tests/b.py::t"), _ac("AC-2", "met"))
+    record = verify_record(
+        configuration={"models": ["claude", "codex"]},
+        # codex finished first.
+        calls=[_call("reviewer", "codex", from_codex), _call("reviewer", "claude", from_claude)],
+    )
+
+    row = next(c for c in replay.replay(record).result.criteria if c.id == "AC-1")
+
+    assert row.implementation_evidence == "claude.py:1"
+    assert row.test_evidence == "tests/a.py::t"

@@ -100,7 +100,20 @@ def _calls(record: dict, phase: str) -> list[dict]:
 
 
 def _reports(record: dict) -> list[tuple[str, str]]:
-    return [(str(call.get("role") or ""), call["content"]) for call in _calls(record, "reviewer")]
+    """Reviewer reports in the order the live run handled them.
+
+    Live, reports come back in panel order whatever order the reviewers
+    finished in. The record lists calls as they completed. Where no consolidated
+    verdict exists, the first reviewer on the panel to give the worst status
+    supplies the row — so replaying in completion order could quote a different
+    reviewer than the run did.
+    """
+    reports = [
+        (str(call.get("role") or ""), call["content"]) for call in _calls(record, "reviewer")
+    ]
+    panel = [str(key) for key in (record.get("configuration") or {}).get("models") or []]
+    position = {key: index for index, key in enumerate(panel)}
+    return sorted(reports, key=lambda report: position.get(report[0], len(panel)))
 
 
 def _consolidated(record: dict) -> str | None:

@@ -16,12 +16,14 @@ output. That degenerate case is ordinary code review.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import subprocess
 import sys
+import time
 from collections.abc import Callable
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
@@ -31,21 +33,26 @@ from .evidence import (
     ERRORED,
     FAILED,
     MISSING,
+    NOT_RUN,
     TEST_TIMEOUT,
     EvidenceCheck,
+    allow_tests,
     base_worktree,
     check_file_citation,
     check_test_citation,
     check_test_discriminates,
     node_id,
+    stop_running_tests,
     test_citation_path,
     test_node_changed,
 )
-from .models import IsolationMode, ModelCallError, Session, call_session, make_session
+from .models import IsolationMode, ModelCallError, Session, make_session
+from .progress import PlainProgress, Progress
 from .prompts import Blinding, blind, fenced, make_fence
 from .run_records import RunTrace
 from .schema_files import schema_writer
-from .streaming import stream_parallel
+from .streaming import CONSOLIDATION, review_parallel, stream_parallel
+from .streaming import consolidate as run_consolidation
 
 # Worst first: the order drives both sorting and the roll-up.
 STATUSES = ("unmet", "unverifiable", "untested", "met")
@@ -712,6 +719,58 @@ def derive_verdict(
 # ── Orchestration ─────────────────────────────────────────────────────────────
 
 
+def nothing_to_reconcile(criteria: list[Criterion], reports: list[tuple[str, str]]) -> str | None:
+    """Why a consolidation call would have no work to do, or None if it has some.
+
+    Consolidation reconciles reviewers that disagree. It is a serial call, made
+    after every reviewer has finished, usually to the most expensive model on
+    the panel — and with one reviewer, or with reviewers that already agree on
+    every criterion, it reconciles nothing. Its own instructions say to keep
+    what reviewers agree on, which is exactly what the merge below does for
+    free, and deterministically.
+
+    Skipping it is also the conservative direction: the merge takes the worst
+    status any reviewer gave, where a consolidator may overrule a reviewer.
+
+    A report that does not give a verdict for every criterion is never "nothing
+    to reconcile" — a provider without structured output answers in prose, and
+    reading that prose is work a consolidator can do.
+    """
+    assessed = [parse_review(text, criteria)[0] for _, text in reports]
+    for c in criteria:
+        if any(c.id not in verdicts for verdicts in assessed):
+            return None
+        if len({verdicts[c.id]["status"] for verdicts in assessed}) != 1:
+            return None
+    if len(reports) == 1:
+        return "one reviewer, so there is nothing to reconcile"
+    return f"all {len(reports)} reviewers agree on every criterion"
+
+
+def _reviewers_row(candidates: list[dict]) -> dict:
+    """One criterion's row when no consolidated verdict exists for it.
+
+    The worst status any reviewer gave stands, from the first reviewer on the
+    panel to give it. A reviewer that reached the same status may have named a
+    citation that one left out, so a missing citation is filled from those that
+    agree: otherwise "no test cited" would be reported about a criterion for
+    which a reviewer did cite one.
+    """
+    if not candidates:
+        return {
+            "status": "unverifiable",
+            "assessment": "No reviewer returned a verdict for this criterion.",
+            "implementation_evidence": None,
+            "test_evidence": None,
+        }
+    row = dict(min(candidates, key=lambda x: STATUSES.index(x["status"])))
+    agreeing = [x for x in candidates if x["status"] == row["status"]]
+    for citation in ("implementation_evidence", "test_evidence"):
+        if not row[citation]:
+            row[citation] = next((x[citation] for x in agreeing if x[citation]), None)
+    return row
+
+
 def _merge(
     criteria: list[Criterion],
     consolidated: dict[str, dict],
@@ -725,18 +784,7 @@ def _merge(
     for c in criteria:
         a = consolidated.get(c.id)
         if a is None:
-            # Fall back to the worst status any individual reviewer gave it.
-            candidates = [r[c.id] for r in per_reviewer if c.id in r]
-            a = (
-                min(candidates, key=lambda x: STATUSES.index(x["status"]))
-                if candidates
-                else {
-                    "status": "unverifiable",
-                    "assessment": "No reviewer returned a verdict for this criterion.",
-                    "implementation_evidence": None,
-                    "test_evidence": None,
-                }
-            )
+            a = _reviewers_row([r[c.id] for r in per_reviewer if c.id in r])
         # The approved plan's selection wins over the reviewer's choice, but it
         # remains a human assertion. If this diff changes that test, strict mode
         # must require renewed approval instead of calling the old selection proof.
@@ -877,24 +925,43 @@ async def run_verify(
     require_discriminating_tests: bool = False,
     trace: RunTrace | None = None,
     test_timeout: float = TEST_TIMEOUT,
+    consolidate: str = "auto",
+    progress: Progress | None = None,
 ) -> VerifyResult:
     manifest = manifest if manifest is not None else build_manifest(diff, root)
     diff_paths = changed_paths(diff)
     new_paths = added_paths(diff)
+    watch = progress if progress is not None else PlainProgress()
+    prompt = build_review_prompt(plan, diff, criteria, manifest)
+    for key in reviewers:
+        watch.add(key, names.get(key, key))
+    watch.add(CONSOLIDATION, CONSOLIDATION)
+    watch.add(EVIDENCE, EVIDENCE)
 
     with schema_writer() as write_schema:
-        display.print_section("independent review")
-        prompt = build_review_prompt(plan, diff, criteria, manifest)
-        reports = await stream_parallel(
-            list(reviewers.values()),
-            dict.fromkeys(reviewers, prompt),
-            verbose,
-            names,
-            timeout,
-            schema_path_writer=write_schema,
-            trace=trace,
-            phase="reviewer",
-        )
+        if verbose:
+            # The raw streams and the commands behind them, for debugging.
+            display.print_section("independent review")
+            reports = await stream_parallel(
+                list(reviewers.values()),
+                dict.fromkeys(reviewers, prompt),
+                verbose,
+                names,
+                timeout,
+                schema_path_writer=write_schema,
+                trace=trace,
+                phase="reviewer",
+            )
+        else:
+            reports = await review_parallel(
+                list(reviewers.values()),
+                dict.fromkeys(reviewers, prompt),
+                names,
+                timeout,
+                watch,
+                schema_path_writer=write_schema,
+                trace=trace,
+            )
         if not reports:
             raise ModelCallError("Every reviewer failed; cannot produce a verdict.")
 
@@ -910,71 +977,61 @@ async def run_verify(
         # debate judge is blinded: a model should not know it is grading itself.
         blinded, blinding = blind(reports, seed=seed)
 
-        display.print_section("consolidation")
-        display.print_note(f"{consolidator_name} is reconciling verdicts (blinded)...")
-
-        def on_cmd(key, cmd):
-            if verbose:
-                display.print_verbose_cmd(cmd)
-
-        consolidated_raw: str | None = None
-        try:
-            resp = await call_session(
-                consolidator,
-                build_consolidation_prompt(plan, diff, criteria, blinded),
-                on_cmd=on_cmd,
-                timeout=timeout,
-                schema_path_writer=write_schema,
-                on_retry=display.retry_notice(consolidator_name),
-            )
-            if trace is not None:
-                trace.success("consolidator", consolidator, resp)
-            if verbose:
-                display.print_timing(consolidator_name, resp.duration)
-            consolidated_raw = resp.content
-        except ModelCallError as e:
-            if trace is not None:
-                trace.failure("consolidator", consolidator, e)
-            # Consolidation reconciles; it is not the source of truth. Losing it
-            # costs precision and must not cost the whole run.
-            display.print_error(f"consolidation failed, using reviewer verdicts: {e}")
-
+        skip = {
+            "always": None,
+            "never": "switched off, so the most cautious reviewer decides each criterion",
+            "auto": nothing_to_reconcile(criteria, reports),
+        }[consolidate]
+        resp = await run_consolidation(
+            consolidator,
+            consolidator_name,
+            lambda: build_consolidation_prompt(plan, diff, criteria, blinded),
+            skip,
+            watch,
+            timeout,
+            fallback="the reviewers' own verdicts",
+            schema_path_writer=write_schema,
+            trace=trace,
+            verbose=verbose,
+        )
         results, findings = assemble_criteria_results(
-            criteria, reports, consolidated_raw, diff_paths, new_paths
+            criteria, reports, resp.content if resp else None, diff_paths, new_paths
         )
 
-    display.print_section("evidence check")
-    display.print_note(
-        "Reading cited lines" + (" and running cited tests..." if run_tests else " (tests not run)")
-    )
     want_baseline = bool(base_ref) and run_tests
-    if want_baseline:
-        display.print_note(f"Re-running cited tests against {base_ref} to see what they prove...")
+    watch.start(EVIDENCE, "reading cited lines" + (", running cited tests" if run_tests else ""))
+    started = time.monotonic()
 
-    with (
-        base_worktree(root or Path.cwd(), base_ref)
-        if want_baseline
-        else nullcontext(None) as base_dir
-    ):
-        if base_dir is not None:
-            # Must happen before check_test_discriminates copies current test
-            # files over their base versions in the shared worktree.
-            refresh_plan_selected_evidence(results, root or Path.cwd(), base_dir)
-        cache: EvidenceCache = {}
-        for r in results:
-            apply_evidence_checks(
-                r,
-                root,
-                test_command,
-                run_tests,
-                scrub_env,
-                require_pinned_evidence,
-                base_ref if want_baseline else None,
-                base_dir,
-                require_discriminating_tests,
-                test_timeout,
-                cache,
-            )
+    def check_all() -> None:
+        with (
+            base_worktree(root or Path.cwd(), base_ref)
+            if want_baseline
+            else nullcontext(None) as base_dir
+        ):
+            if base_dir is not None:
+                # Must happen before check_test_discriminates copies current test
+                # files over their base versions in the shared worktree.
+                refresh_plan_selected_evidence(results, root or Path.cwd(), base_dir)
+            cache: EvidenceCache = {}
+            for position, r in enumerate(results, 1):
+                what = r.test_evidence or r.implementation_evidence or "nothing cited"
+                watch.update(EVIDENCE, f"{r.id} ({position}/{len(results)}) · {what}")
+                apply_evidence_checks(
+                    r,
+                    root,
+                    test_command,
+                    run_tests,
+                    scrub_env,
+                    require_pinned_evidence,
+                    base_ref if want_baseline else None,
+                    base_dir,
+                    require_discriminating_tests,
+                    test_timeout,
+                    cache,
+                )
+
+    await off_loop(check_all)
+    watch.done(EVIDENCE, _evidence_summary(results, base_ref), time.monotonic() - started)
 
     return finalize_verify(
         results,
@@ -985,6 +1042,42 @@ async def run_verify(
         require_tests=require_tests,
         require_pinned_evidence=require_pinned_evidence or require_discriminating_tests,
     )
+
+
+EVIDENCE = "evidence"
+
+
+async def off_loop(work: Callable[[], None]) -> None:
+    """Run blocking evidence work on a thread, and stop it if this task is.
+
+    Evidence checks block on the tests they run. On the event loop that froze
+    everything else for as long as the tests took — including the display, and
+    the cancellation that Ctrl-C and SIGTERM depend on. A thread cannot be
+    cancelled, only asked, so an interrupted run kills the test in flight and
+    lets the thread unwind (it owns a temporary worktree) before going on.
+    """
+    allow_tests()
+    job = asyncio.ensure_future(asyncio.to_thread(work))
+    try:
+        await asyncio.shield(job)
+    except BaseException:
+        stop_running_tests()
+        with suppress(BaseException):
+            await job
+        raise
+
+
+def _evidence_summary(results: list[CriterionResult], base_ref: str | None) -> str:
+    lines = sum(1 for r in results if r.impl_check is not None)
+    ran = {
+        r.test_check.citation for r in results if r.test_check and r.test_check.outcome != NOT_RUN
+    }
+    based = {r.baseline_check.citation for r in results if r.baseline_check is not None}
+    parts = [f"{lines} cited line{'s' if lines != 1 else ''} read"]
+    parts.append(f"{len(ran)} test{'s' if len(ran) != 1 else ''} run")
+    if based:
+        parts.append(f"{len(based)} re-run against {base_ref}")
+    return "checked: " + ", ".join(parts)
 
 
 def render(result: VerifyResult) -> None:

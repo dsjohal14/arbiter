@@ -36,6 +36,10 @@ from pathlib import Path
 DEDICATED_FILE = ".arbiter.toml"
 PYPROJECT_FILE = "pyproject.toml"
 
+# When the consolidation call is made. `auto` skips it where it would have
+# nothing to reconcile; the other two are for wanting it always, or never.
+CONSOLIDATE_MODES = ("auto", "always", "never")
+
 
 class ConfigError(ValueError):
     """The project configuration is unreadable, malformed, or not allowed."""
@@ -67,6 +71,12 @@ def _count(key: str, value: object) -> int:
     return value
 
 
+def _mode(key: str, value: object) -> str:
+    if value not in CONSOLIDATE_MODES:
+        raise ConfigError(f"`{key}` must be one of {', '.join(CONSOLIDATE_MODES)}, not {value!r}.")
+    return str(value)
+
+
 def _names(key: str, value: object) -> list[str]:
     if isinstance(value, str):
         names = value.split(",")
@@ -96,6 +106,7 @@ SETTINGS: dict[str, Callable[[str, object], object]] = {
     "judge": _string,
     "timeout": _positive,
     "retries": _count,
+    "consolidate": _mode,
     "plan": _string,
     "base": _string,
     "require-tests": _flag,

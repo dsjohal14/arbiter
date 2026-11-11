@@ -28,6 +28,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -276,6 +277,28 @@ def detect_test_command(root: Path | None = None) -> list[str] | None:
     return None
 
 
+# Evidence checks block on the test they run, so the orchestration keeps them
+# off its event loop. A thread cannot be cancelled, only asked: these let a run
+# that is being interrupted kill the test in flight and refuse to start the
+# next, so Ctrl-C and SIGTERM do not wait out a test's whole time limit.
+_running: set[subprocess.Popen[str]] = set()
+_running_lock = threading.Lock()
+_stopped = threading.Event()
+
+
+def stop_running_tests() -> None:
+    """Kill every evidence run in flight and start no more until `allow_tests`."""
+    _stopped.set()
+    with _running_lock:
+        for proc in list(_running):
+            with contextlib.suppress(OSError):
+                proc.kill()
+
+
+def allow_tests() -> None:
+    _stopped.clear()
+
+
 @dataclass(frozen=True)
 class RunReport:
     """What one run of a cited test produced.
@@ -471,29 +494,47 @@ def run_test(
     in the project's config exits non-zero for a test that passed, and a
     doubled `-q` (the project's `addopts` plus ours) prints no summary at all.
     """
+    cancelled = RunReport(ERRORED, "not run: the verification was interrupted")
+    if _stopped.is_set():
+        return cancelled
     with tempfile.TemporaryDirectory(prefix="arbiter-report-") as scratch:
         report = Path(scratch) / "report.xml"
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 [*cmd, node, "-q", "--no-header", f"--junitxml={report}"],
                 cwd=cwd,
                 # A test that waits on a terminal would wait forever; evidence
                 # checks are never interactive.
                 stdin=subprocess.DEVNULL,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 encoding="utf-8",
                 errors="replace",
-                timeout=timeout,
-                check=False,
                 env=env,
             )
-        except subprocess.TimeoutExpired:
-            return RunReport(ERRORED, f"timed out after {timeout:.0f}s")
         except OSError as e:
             return RunReport(ERRORED, f"could not run the test command: {e}")
+        with _running_lock:
+            _running.add(proc)
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            return RunReport(ERRORED, f"timed out after {timeout:.0f}s")
+        except BaseException:
+            # Interrupted on this thread. Do not leave the test running.
+            proc.kill()
+            proc.wait()
+            raise
+        finally:
+            with _running_lock:
+                _running.discard(proc)
+        if _stopped.is_set():
+            return cancelled
         cases = _read_report(report)
 
-    out = (proc.stdout + proc.stderr).strip()
+    out = (stdout + stderr).strip()
     if cases is None:
         return _from_exit_status(proc.returncode, out)
     if cases:

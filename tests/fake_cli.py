@@ -13,6 +13,7 @@ Driven by environment variables so the shim scripts stay trivial:
     FAKE_CLI_STREAM_<N>  per-provider override (e.g. FAKE_CLI_STREAM_CODEX)
     FAKE_CLI_EXIT_CODE   exit with this code after replaying (default 0)
     FAKE_CLI_HANG        sleep this many seconds instead of exiting
+    FAKE_CLI_DELAY       sleep this many seconds, then reply normally (a slow provider)
     FAKE_CLI_GARBAGE     emit non-JSON noise between events
     FAKE_CLI_PROSE       write this to stdout before anything else, unterminated
                          (how a CLI needing a login asks, right before it blocks)
@@ -66,6 +67,11 @@ def main() -> int:
         # a newline, which is exactly why a line-based reader never sees it.
         sys.stdout.write(prose)
         sys.stdout.flush()
+
+    delay = os.environ.get(f"FAKE_CLI_DELAY_{os.environ.get('FAKE_CLI_NAME', '').upper()}")
+    delay = delay or os.environ.get("FAKE_CLI_DELAY")
+    if delay:
+        time.sleep(float(delay))
 
     hang = os.environ.get("FAKE_CLI_HANG")
     if hang:

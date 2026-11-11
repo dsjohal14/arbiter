@@ -4,7 +4,7 @@ import json
 
 from arbiter.criteria import number
 from arbiter.prompts import blind, build_judge_prompt, make_fence
-from arbiter.verify import CriterionResult, derive_verdict, parse_review
+from arbiter.verify import CriterionResult, derive_verdict, nothing_to_reconcile, parse_review
 
 ANSWERS = [("claude", "alpha"), ("codex", "beta"), ("gemini", "gamma")]
 CRITERIA = number(["total() sums every item", "empty list returns 0"])
@@ -214,3 +214,48 @@ def test_reviewer_reports_cannot_reuse_the_fence_they_were_shown(monkeypatch):
 
     assert "<<<2222222222222222-arbiter:REVIEWER-A\n" in prompt
     assert "<<<1111111111111111-arbiter" not in prompt
+
+
+# ── Whether a consolidation call would have any work to do ───────────────────
+
+
+def _reports(*statuses_per_reviewer):
+    return [
+        (
+            f"reviewer-{index}",
+            json.dumps(
+                {
+                    "criteria": [
+                        {"id": f"AC-{n}", "status": status, "assessment": "checked"}
+                        for n, status in enumerate(statuses, 1)
+                    ],
+                    "ungrounded_findings": [],
+                }
+            ),
+        )
+        for index, statuses in enumerate(statuses_per_reviewer)
+    ]
+
+
+def test_one_complete_report_leaves_nothing_to_reconcile():
+    assert "one reviewer" in nothing_to_reconcile(CRITERIA, _reports(("met", "unmet")))
+
+
+def test_reports_that_agree_leave_nothing_to_reconcile():
+    reason = nothing_to_reconcile(CRITERIA, _reports(("met", "unmet"), ("met", "unmet")))
+    assert reason == "all 2 reviewers agree on every criterion"
+
+
+def test_one_differing_status_is_something_to_reconcile():
+    assert nothing_to_reconcile(CRITERIA, _reports(("met", "met"), ("met", "unmet"))) is None
+
+
+def test_a_report_missing_a_criterion_is_something_to_reconcile():
+    assert nothing_to_reconcile(CRITERIA, _reports(("met", "met"), ("met",))) is None
+
+
+def test_a_report_in_prose_is_work_for_a_consolidator():
+    """A provider with no structured output answers in prose. Reading that is
+    exactly what a consolidator can do and a parser cannot."""
+    prose = [("gemini", "AC-1 looks fine to me, and AC-2 is covered by the new test.")]
+    assert nothing_to_reconcile(CRITERIA, prose) is None

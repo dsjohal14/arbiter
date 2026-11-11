@@ -29,7 +29,18 @@ import sys
 from pathlib import Path
 from typing import NoReturn
 
-from . import __version__, config, display, doctor, evals, plan_review, replay, run_records, verify
+from . import (
+    __version__,
+    config,
+    display,
+    doctor,
+    evals,
+    plan_review,
+    progress,
+    replay,
+    run_records,
+    verify,
+)
 from . import criteria as crit
 from .debate import run_debate, run_followup_loop
 from .evidence import TEST_TIMEOUT
@@ -74,6 +85,16 @@ def _add_output_flags(p: argparse.ArgumentParser) -> None:
         help="Emit a machine-readable JSON result on stdout",
     )
     p.add_argument("-v", "--verbose", action="store_true", help="Show more detail")
+
+
+def _add_consolidate(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--consolidate",
+        choices=config.CONSOLIDATE_MODES,
+        default=None,
+        help="When to make the consolidation call: auto (the default) skips it when "
+        "there is nothing to reconcile — one reviewer, or reviewers that agree",
+    )
 
 
 def _add_common(p: argparse.ArgumentParser) -> None:
@@ -220,6 +241,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="FILE",
         help="Write a sensitive, versioned JSON record of this run",
     )
+    _add_consolidate(v)
     _add_common(v)
 
     d = sub.add_parser("debate", help="Run a multi-model debate with a blinded judge")
@@ -254,6 +276,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="FILE",
         help="Write a sensitive, versioned JSON record of this run",
     )
+    _add_consolidate(rev)
     _add_common(rev)
 
     pin = plsub.add_parser("pin", help="Extract acceptance criteria and pin them into the plan")
@@ -405,6 +428,7 @@ _BUILT_IN: dict[str, object] = {
     "judge": None,
     "timeout": DEFAULT_TIMEOUT,
     "retries": 1,
+    "consolidate": "auto",
     "plan": None,
     "base": None,
     "require-tests": False,
@@ -449,6 +473,16 @@ def _apply_settings(args: argparse.Namespace) -> config.Config:
             f"Settings from {settings.source} (flags on the command line override it)."
         )
     return settings
+
+
+def _progress(args: argparse.Namespace) -> progress.Progress:
+    """How this run reports what it is doing.
+
+    `-v` keeps the raw provider streams and commands, which are for debugging
+    and would fight a board for the terminal; everything else gets a live board
+    where one can be drawn and one line per step where it cannot.
+    """
+    return progress.PlainProgress() if args.verbose else progress.for_terminal()
 
 
 def _set_retries(sessions: list[Session], retries: int) -> None:
@@ -567,6 +601,7 @@ async def cmd_plan_review(args: argparse.Namespace) -> int:
                 "judge": judge,
                 "timeout_seconds": args.timeout,
                 "retries": args.retries,
+                "consolidate": args.consolidate,
                 "seed": args.seed,
                 "isolation": isolation,
                 "apply": args.apply,
@@ -612,18 +647,21 @@ async def cmd_plan_review(args: argparse.Namespace) -> int:
                 f"reviewers: {', '.join(names.values())}"
             )
 
-        result = await plan_review.run_plan_review(
-            plan=text,
-            criteria=criteria,
-            reviewers=reviewers,
-            consolidator=consolidator,
-            consolidator_name=consolidator.label(),
-            names=names,
-            verbose=args.verbose,
-            timeout=args.timeout,
-            seed=args.seed,
-            trace=recorder.trace if recorder else None,
-        )
+        with _progress(args) as watch:
+            result = await plan_review.run_plan_review(
+                plan=text,
+                criteria=criteria,
+                reviewers=reviewers,
+                consolidator=consolidator,
+                consolidator_name=consolidator.label(),
+                names=names,
+                verbose=args.verbose,
+                timeout=args.timeout,
+                seed=args.seed,
+                trace=recorder.trace if recorder else None,
+                consolidate=args.consolidate,
+                progress=watch,
+            )
 
         if args.as_json:
             json.dump(result.as_dict(), sys.stdout, indent=2)
@@ -760,6 +798,7 @@ async def cmd_verify(args: argparse.Namespace) -> int:
                 "judge": judge,
                 "timeout_seconds": args.timeout,
                 "retries": args.retries,
+                "consolidate": args.consolidate,
                 "seed": args.seed,
                 "isolation": isolation,
                 "base_ref": base_ref,
@@ -788,28 +827,31 @@ async def cmd_verify(args: argparse.Namespace) -> int:
         )
 
     try:
-        result = await verify.run_verify(
-            plan=plan,
-            diff=diff,
-            criteria=criteria,
-            reviewers=reviewers,
-            consolidator=consolidator,
-            consolidator_name=consolidator.label(),
-            names=names,
-            verbose=args.verbose,
-            timeout=args.timeout,
-            seed=args.seed,
-            manifest=manifest,
-            test_command=test_command,
-            run_tests=args.run_tests,
-            require_tests=args.require_tests or args.require_pinned_evidence,
-            require_pinned_evidence=args.require_pinned_evidence,
-            scrub_env=not args.no_scrub_test_env,
-            base_ref=base_ref,
-            require_discriminating_tests=args.require_discriminating_tests,
-            trace=recorder.trace if recorder else None,
-            test_timeout=args.test_timeout,
-        )
+        with _progress(args) as watch:
+            result = await verify.run_verify(
+                plan=plan,
+                diff=diff,
+                criteria=criteria,
+                reviewers=reviewers,
+                consolidator=consolidator,
+                consolidator_name=consolidator.label(),
+                names=names,
+                verbose=args.verbose,
+                timeout=args.timeout,
+                seed=args.seed,
+                manifest=manifest,
+                test_command=test_command,
+                run_tests=args.run_tests,
+                require_tests=args.require_tests or args.require_pinned_evidence,
+                require_pinned_evidence=args.require_pinned_evidence,
+                scrub_env=not args.no_scrub_test_env,
+                base_ref=base_ref,
+                require_discriminating_tests=args.require_discriminating_tests,
+                trace=recorder.trace if recorder else None,
+                test_timeout=args.test_timeout,
+                consolidate=args.consolidate,
+                progress=watch,
+            )
     except Exception as e:
         _record_error(recorder, e)
         raise

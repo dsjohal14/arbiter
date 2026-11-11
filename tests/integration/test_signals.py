@@ -137,3 +137,43 @@ def test_sigterm_during_a_cited_test_stops_the_test(repo, shim_path):
     assert arbiter.returncode == 128 + signal.SIGTERM
     assert "Terminated." in err
     assert _gone(test), "the cited test was left running"
+
+
+def test_ctrl_c_during_a_cited_test_stops_the_test(repo, shim_path):
+    """Evidence checks run on a worker thread, and a thread cannot be cancelled,
+    only asked. Signalled alone — as a supervisor would, where a terminal would
+    also reach the test — the run still has to kill the test in flight rather
+    than wait out its time limit."""
+    (repo / "tests" / "test_slow.py").write_text(
+        "import os\nimport time\nfrom pathlib import Path\n\n\n"
+        "def test_hangs():\n"
+        "    Path('test.pid').write_text(str(os.getpid()))\n"
+        "    time.sleep(120)\n"
+    )
+    report = {
+        "criteria": [
+            {
+                "id": "AC-1",
+                "status": "met",
+                "assessment": "checked",
+                "implementation_evidence": "app.py:2",
+                "test_evidence": "tests/test_slow.py::test_hangs",
+            }
+        ],
+        "ungrounded_findings": [],
+    }
+    shim_path(claude_events(json.dumps(report)))
+    arbiter = _start()
+    started = time.monotonic()
+    try:
+        test = _wait_for(repo / "test.pid", "the cited test")
+
+        arbiter.send_signal(signal.SIGINT)
+        _, err = arbiter.communicate(timeout=20)
+    finally:
+        arbiter.kill()
+
+    assert arbiter.returncode == 130
+    assert "Interrupted." in err
+    assert _gone(test), "the cited test was left running"
+    assert time.monotonic() - started < 30
