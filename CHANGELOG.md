@@ -62,6 +62,10 @@ documented exit codes, where output text may only ever lower a result.
   call carries an `attempt` number and the record a `usage` roll-up. v1–v3
   records still replay, through the rules they were written under. An older
   Arbiter refuses a v4 record rather than misreading it.
+- Where no consolidated verdict exists for a criterion, a citation one reviewer
+  left out is filled from another that reached the same status. A v1–v3 record
+  of a multi-reviewer run whose consolidation *failed* can therefore replay
+  with drift in that citation.
 - `--plan` is required only when the project settings do not name a plan.
 
 ### Added

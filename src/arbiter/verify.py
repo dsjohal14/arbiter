@@ -1065,6 +1065,10 @@ async def off_loop(work: Callable[[], None]) -> None:
         with suppress(BaseException):
             await job
         raise
+    finally:
+        # Cleared once the thread has unwound. Left set, it would outlive this
+        # run and report every later test as never having been run.
+        allow_tests()
 
 
 def _evidence_summary(results: list[CriterionResult], base_ref: str | None) -> str:

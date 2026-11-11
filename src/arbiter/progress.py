@@ -291,8 +291,11 @@ class LiveProgress(_Rows):
             }.get(row.state, ("○", display.DIM))
             took = "" if row.seconds is None else took_for(row.seconds)
 
-        what = f"{row.activity} · {row.extra}" if row.extra else row.activity
-        text = f"{row.label[:_LABEL]:<{_LABEL}} {took:>{_TOOK}}  {what}"
+        # An error message can span lines. A row that does would be redrawn
+        # as if it were one, leaving the rest of it on screen for good.
+        activity, label = " ".join(row.activity.split()), " ".join(row.label.split())
+        what = f"{activity} · {row.extra}" if row.extra else activity
+        text = f"{label[:_LABEL]:<{_LABEL}} {took:>{_TOOK}}  {what}"
         room = max(0, width - 4)
         if len(text) > room:
             text = text[: max(0, room - 1)] + "…"

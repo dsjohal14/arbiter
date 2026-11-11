@@ -266,3 +266,21 @@ def test_usage_is_summarised_from_whatever_the_provider_reported():
     assert progress.brief(None) == ""
     assert progress.brief(Usage(input_tokens=15002, output_tokens=801)) == "15.0k in · 801 out"
     assert progress.brief(Usage(cost_usd=0.5)) == "$0.5000"
+
+
+def test_an_error_that_spans_lines_still_occupies_one_row(board):
+    """A provider's stderr is quoted in its failure. If a row took two lines the
+    next frame would move up one too few, and half of it would stay on screen."""
+    live, stream = board
+    live.add("codex", "codex")
+    live.fail("codex", "codex exited 1: Traceback (most recent call last):\n  File x\nBoom")
+    live.draw()
+    stream.seek(0)
+    stream.truncate()
+
+    live.draw()
+
+    frame = stream.getvalue()
+    assert frame.startswith("\033[1A\r\033[J"), "one row drawn, so one line up"
+    assert frame.count("\n") == 1
+    assert "Traceback (most recent call last): File x Boom" in _visible(frame)

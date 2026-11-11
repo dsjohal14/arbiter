@@ -608,3 +608,33 @@ def test_scrubbing_can_be_disabled_for_trusted_code(repo, monkeypatch):
         "tests/test_env.py::test_sees_env", repo, PYTEST, scrub_env=False
     )
     assert permissive.verified is True
+
+
+# ── Stopping a run in flight ─────────────────────────────────────────────────
+
+
+async def test_an_error_during_evidence_does_not_leave_tests_switched_off(repo):
+    """Stopping the tests in flight is how an interrupted run unwinds. The flag
+    has to be cleared once it has, or it outlives the run and every test after
+    it is reported as never having been run."""
+    from arbiter.verify import off_loop
+
+    def work():
+        raise RuntimeError("evidence blew up")
+
+    with pytest.raises(RuntimeError, match="evidence blew up"):
+        await off_loop(work)
+
+    check = check_test_citation("tests/test_app.py::test_passes", repo, PYTEST)
+    assert check.outcome == evidence.PASSED
+
+
+def test_a_stopped_run_starts_no_further_tests(repo):
+    evidence.stop_running_tests()
+    try:
+        check = check_test_citation("tests/test_app.py::test_passes", repo, PYTEST)
+    finally:
+        evidence.allow_tests()
+
+    assert check.outcome == evidence.ERRORED
+    assert "interrupted" in check.detail
