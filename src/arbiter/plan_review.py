@@ -538,6 +538,7 @@ async def run_plan_review(
                 on_cmd=on_cmd,
                 timeout=timeout,
                 schema_path_writer=write_schema,
+                on_retry=display.retry_notice(consolidator_name),
             )
             if trace is not None:
                 trace.success("consolidator", consolidator, resp)

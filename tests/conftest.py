@@ -15,6 +15,12 @@ FAKE_CLI = Path(__file__).parent / "fake_cli.py"
 PROVIDER_CLIS = ("claude", "codex", "gemini", "agy")
 
 
+@pytest.fixture(autouse=True)
+def _no_retry_backoff(monkeypatch):
+    """Retries are real in the suite; the wait between them is not."""
+    monkeypatch.setattr("arbiter.models._RETRY_BASE", 0.0)
+
+
 @pytest.fixture
 def shim_path(tmp_path, monkeypatch):
     """Put fake provider executables on PATH, and nothing else that answers to
@@ -58,6 +64,7 @@ def shim_path(tmp_path, monkeypatch):
         stderr=None,
         prose=None,
         installed=None,
+        fail_first=0,
     ):
         if installed is not None:
             # Model a machine that simply does not have the other CLIs, which is
@@ -85,6 +92,10 @@ def shim_path(tmp_path, monkeypatch):
             monkeypatch.setenv("FAKE_CLI_STDERR", stderr)
         if prose:
             monkeypatch.setenv("FAKE_CLI_PROSE", prose)
+        if fail_first:
+            monkeypatch.setenv("FAKE_CLI_FAIL_FIRST", str(fail_first))
+            monkeypatch.setenv("FAKE_CLI_FAIL_STATE", str(tmp_path / "fail-state"))
+        monkeypatch.setenv("FAKE_CLI_PID_OUT", str(tmp_path / "provider.pid"))
         argv_log = tmp_path / "argv.jsonl"
         monkeypatch.setenv("FAKE_CLI_ARGV_OUT", str(argv_log))
         return argv_log

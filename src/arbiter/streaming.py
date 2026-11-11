@@ -41,6 +41,9 @@ async def stream_parallel(
         if verbose:
             queue.put_nowait(("cmd", key, cmd))
 
+    def on_retry(key: str, attempt: int, error: Exception) -> None:
+        queue.put_nowait(("retry", key, (attempt, error)))
+
     async def run_one(sess: Session):
         try:
             resp = await call_session(
@@ -50,6 +53,7 @@ async def stream_parallel(
                 on_cmd=on_cmd,
                 timeout=timeout,
                 schema_path_writer=schema_path_writer,
+                on_retry=on_retry,
             )
             if trace is not None:
                 trace.success(phase, sess, resp)
@@ -148,6 +152,18 @@ async def _coordinator(
             finished += 1
             if key == focus:
                 _end_focus()
+            advance()
+        elif kind == "retry":
+            # Whatever that attempt streamed is not the answer. Close its block
+            # and forget it, so the next attempt opens one of its own.
+            if key == focus:
+                _end_focus()
+            buffers.pop(key, None)
+            displayed.discard(key)
+            if key in order:
+                order.remove(key)
+            attempt, error = payload
+            display.print_retry(names.get(key, key), attempt, error)
             advance()
         elif kind == "fail":
             finished += 1

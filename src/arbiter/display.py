@@ -324,6 +324,15 @@ def print_note(msg: str) -> None:
     print(_c(f"  {msg}", DIM))
 
 
+def print_retry(name: str, attempt: int, error: object) -> None:
+    print(_c(f"  ↻  {name} failed (attempt {attempt}), retrying: {error}", YELLOW), file=sys.stderr)
+
+
+def retry_notice(name: str):
+    """A callback for `call_session(on_retry=...)` that says who is retrying."""
+    return lambda _key, attempt, error: print_retry(name, attempt, error)
+
+
 # ── Plan review ───────────────────────────────────────────────────────────────
 
 _KIND_COLORS = {

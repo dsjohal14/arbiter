@@ -293,7 +293,8 @@ def test_a_failed_reviewer_prevents_a_ready_verdict(tmp_path, shim_path, monkeyp
     assert payload["failed_reviewers"] == ["codex"]
     record = json.loads(record_path.read_text())
     failed = [call for call in record["provider_calls"] if call["status"] == "failed"]
-    assert len(failed) == 1
-    assert failed[0]["phase"] == "reviewer"
-    assert failed[0]["role"] == "codex"
-    assert failed[0]["error"]["type"] == "ModelCallError"
+    # Tried, then tried once more, and both attempts are on the record.
+    assert [call["attempt"] for call in failed] == [1, 2]
+    assert {call["phase"] for call in failed} == {"reviewer"}
+    assert {call["role"] for call in failed} == {"codex"}
+    assert failed[-1]["error"]["type"] == "ModelCallError"

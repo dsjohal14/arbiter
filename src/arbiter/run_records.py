@@ -295,6 +295,10 @@ class RunTrace:
     calls: list[dict] = field(default_factory=list)
 
     def success(self, phase: str, session: Session, response: ModelResponse) -> None:
+        # Attempts that failed before this one are calls too: they took time,
+        # and a provider may have billed for them.
+        for number, error in enumerate(response.failed_attempts, 1):
+            self._failed(phase, session, error, number)
         self.calls.append(
             {
                 "phase": phase,
@@ -302,6 +306,7 @@ class RunTrace:
                 "provider": session.provider.key,
                 "cli": session.cli,
                 "model": session.model,
+                "attempt": len(response.failed_attempts) + 1,
                 "status": "completed",
                 "duration_ms": round(response.duration * 1000),
                 "content": response.content,
@@ -313,6 +318,12 @@ class RunTrace:
         )
 
     def failure(self, phase: str, session: Session, error: Exception) -> None:
+        earlier = list(getattr(error, "earlier", None) or [])
+        for number, prior in enumerate(earlier, 1):
+            self._failed(phase, session, prior, number)
+        self._failed(phase, session, error, len(earlier) + 1)
+
+    def _failed(self, phase: str, session: Session, error: Exception, attempt: int) -> None:
         # A failed call still spent wall-clock, and a provider commonly reports
         # usage in the same event that reports the error. Recording null for
         # both would bias every later cost and latency summary downward by
@@ -327,6 +338,7 @@ class RunTrace:
                 "provider": session.provider.key,
                 "cli": session.cli,
                 "model": session.model,
+                "attempt": attempt,
                 "status": "failed",
                 "duration_ms": round(duration * 1000) if duration is not None else None,
                 "content": None,

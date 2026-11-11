@@ -61,6 +61,12 @@ def _positive(key: str, value: object) -> float:
     return float(value)
 
 
+def _count(key: str, value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ConfigError(f"`{key}` must be a whole number, zero or more, not {value!r}.")
+    return value
+
+
 def _names(key: str, value: object) -> list[str]:
     if isinstance(value, str):
         names = value.split(",")
@@ -89,6 +95,7 @@ SETTINGS: dict[str, Callable[[str, object], object]] = {
     "models": _names,
     "judge": _string,
     "timeout": _positive,
+    "retries": _count,
     "plan": _string,
     "base": _string,
     "require-tests": _flag,

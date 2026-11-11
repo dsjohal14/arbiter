@@ -24,6 +24,7 @@ import json
 import os
 import shlex
 import shutil
+import signal
 import sys
 from pathlib import Path
 from typing import NoReturn
@@ -40,6 +41,7 @@ from .models import (
     VALID_MODELS,
     IsolationMode,
     ModelCallError,
+    Session,
     call_session,
     make_arbiter_session,
     make_debater_sessions,
@@ -97,6 +99,13 @@ def _add_common(p: argparse.ArgumentParser) -> None:
         default=None,
         metavar="SEC",
         help=f"Per-call timeout in seconds (default: {DEFAULT_TIMEOUT:.0f})",
+    )
+    p.add_argument(
+        "--retries",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Times a failed provider call is tried again (default: 1; a timeout is not retried)",
     )
     p.add_argument(
         "--seed",
@@ -395,6 +404,7 @@ _BUILT_IN: dict[str, object] = {
     "models": None,
     "judge": None,
     "timeout": DEFAULT_TIMEOUT,
+    "retries": 1,
     "plan": None,
     "base": None,
     "require-tests": False,
@@ -432,11 +442,18 @@ def _apply_settings(args: argparse.Namespace) -> config.Config:
 
     if args.timeout <= 0:
         _usage_error("--timeout must be greater than zero.")
+    if args.retries < 0:
+        _usage_error("--retries cannot be negative.")
     if settings.source is not None:
         display.print_note(
             f"Settings from {settings.source} (flags on the command line override it)."
         )
     return settings
+
+
+def _set_retries(sessions: list[Session], retries: int) -> None:
+    for session in sessions:
+        session.retries = retries
 
 
 def _read_prompt(arg: str | None) -> str:
@@ -470,6 +487,7 @@ async def _extract_acceptance_criteria(
     verbose: bool,
     timeout: float,
     trace: RunTrace | None = None,
+    retries: int = 0,
 ) -> list[crit.Criterion]:
     """Extract a complete in-memory contract without modifying the plan."""
     session = make_session(
@@ -479,6 +497,7 @@ async def _extract_acceptance_criteria(
         isolation=isolation,
         output_schema=crit.EXTRACTION_SCHEMA,
     )
+    session.retries = retries
     display.print_note(f"Extracting baseline acceptance criteria with {session.label()}...")
     try:
         with schema_writer() as write_schema:
@@ -488,6 +507,7 @@ async def _extract_acceptance_criteria(
                 on_cmd=(lambda _key, cmd: display.print_verbose_cmd(cmd)) if verbose else None,
                 timeout=timeout,
                 schema_path_writer=write_schema,
+                on_retry=display.retry_notice(session.label()),
             )
         if trace is not None:
             trace.success("extractor", session, resp)
@@ -546,6 +566,7 @@ async def cmd_plan_review(args: argparse.Namespace) -> int:
                 "models": keys,
                 "judge": judge,
                 "timeout_seconds": args.timeout,
+                "retries": args.retries,
                 "seed": args.seed,
                 "isolation": isolation,
                 "apply": args.apply,
@@ -569,6 +590,7 @@ async def cmd_plan_review(args: argparse.Namespace) -> int:
                 args.verbose,
                 args.timeout,
                 trace=recorder.trace if recorder else None,
+                retries=args.retries,
             )
             if not criteria:
                 message = "No acceptance criteria could be extracted from this plan."
@@ -580,6 +602,7 @@ async def cmd_plan_review(args: argparse.Namespace) -> int:
             recorder.configuration["criteria_source"] = criteria_source
 
         reviewers, consolidator = plan_review.make_review_sessions(keys, judge, isolation)
+        _set_retries([*reviewers.values(), consolidator], args.retries)
         names = {k: s.label() for k, s in reviewers.items()}
 
         if not args.as_json:
@@ -656,6 +679,7 @@ async def cmd_plan_pin(args: argparse.Namespace) -> int:
         "open" if args.allow_tools else "readonly",
         args.verbose,
         args.timeout,
+        retries=args.retries,
     )
     if not criteria:
         display.print_error("No acceptance criteria could be extracted from this plan.")
@@ -735,6 +759,7 @@ async def cmd_verify(args: argparse.Namespace) -> int:
                 "models": keys,
                 "judge": judge,
                 "timeout_seconds": args.timeout,
+                "retries": args.retries,
                 "seed": args.seed,
                 "isolation": isolation,
                 "base_ref": base_ref,
@@ -753,6 +778,7 @@ async def cmd_verify(args: argparse.Namespace) -> int:
     )
 
     reviewers, consolidator = make_verify_sessions(keys, judge, isolation)
+    _set_retries([*reviewers.values(), consolidator], args.retries)
     names = {k: s.label() for k, s in reviewers.items()}
 
     if not args.as_json:
@@ -1010,6 +1036,7 @@ async def cmd_debate(args: argparse.Namespace) -> int:
 
     debaters = make_debater_sessions(keys, isolation=isolation)
     arbiter = make_arbiter_session(judge, isolation=isolation, output_schema=JUDGE_SCHEMA)
+    _set_retries([*debaters.values(), arbiter], args.retries)
     names = {k: s.label() for k, s in debaters.items()}
     arbiter_name = arbiter.label()
     transcript: list[str] = []
@@ -1104,13 +1131,41 @@ async def _dispatch(args: argparse.Namespace) -> int:
     raise SystemExit(EXIT_USAGE)
 
 
+class _Terminated(KeyboardInterrupt):
+    """SIGTERM, delivered into the same cleanup path as Ctrl-C.
+
+    Python's default for SIGTERM is to die where it stands, running no
+    `finally`. A CI system cancels a job with exactly that signal, so every
+    superseded run would leave its provider CLIs running and its temporary
+    worktree registered. As a KeyboardInterrupt it unwinds instead: children
+    are reaped, the worktree is removed, and a cited test in flight is killed.
+    """
+
+
+EXIT_TERMINATED = 128 + signal.SIGTERM
+
+
+def _on_sigterm(_signum: int, _frame: object) -> None:
+    # One is enough. A second, arriving mid-cleanup, would abort the cleanup
+    # this handler exists to allow; whoever is impatient still has SIGKILL.
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    raise _Terminated
+
+
 def main(argv: list[str] | None = None) -> int:
     try:
         args = parse_args(argv)
     except SystemExit as e:  # argparse errors and --help
         return e.code if isinstance(e.code, int) else EXIT_USAGE
     try:
+        previous = signal.signal(signal.SIGTERM, _on_sigterm)
+    except ValueError:  # not the main thread: the embedding program owns signals
+        previous = None
+    try:
         return asyncio.run(_dispatch(args))
+    except _Terminated:
+        display.print_error("Terminated.")
+        return EXIT_TERMINATED
     except KeyboardInterrupt:
         print()
         display.print_error("Interrupted.")
@@ -1130,6 +1185,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.verbose:
             raise
         return EXIT_RUNTIME
+    finally:
+        if previous is not None:
+            signal.signal(signal.SIGTERM, previous)
 
 
 if __name__ == "__main__":
