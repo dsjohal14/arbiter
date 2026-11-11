@@ -3,6 +3,7 @@
 
 Drives locally installed CLI tools; no API keys needed.
 
+    arbiter init                                # set a project up
     arbiter plan review plan.md                 # is this plan good enough to build?
     arbiter plan pin plan.md                    # extract + pin acceptance criteria
     arbiter verify --plan plan.md --diff        # the gate
@@ -39,7 +40,9 @@ from . import (
     plan_review,
     progress,
     replay,
+    report,
     run_records,
+    scaffold,
     usage,
     verify,
 )
@@ -90,6 +93,11 @@ def _add_output_flags(p: argparse.ArgumentParser) -> None:
 
 
 def _add_consolidate(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--summary",
+        metavar="FILE",
+        help="Also write the result as markdown, for a pull request's job summary",
+    )
     p.add_argument(
         "--consolidate",
         choices=config.CONSOLIDATE_MODES,
@@ -314,6 +322,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     val.add_argument("cases", nargs="+", help="Evaluation case directories")
     _add_output_flags(val)
 
+    ini = sub.add_parser("init", help="Set this project up: settings, a plan, an ignore rule")
+    ini.add_argument(
+        "--plan",
+        default="PLAN.md",
+        metavar="FILE",
+        help="Where the plan lives (default: PLAN.md). Created if it does not exist.",
+    )
+
     doc = sub.add_parser("doctor", help="Check provider install, auth, and capabilities")
     doc.add_argument(
         "--no-probe", action="store_true", help="Check PATH only; skip the live authentication call"
@@ -485,6 +501,20 @@ def _progress(args: argparse.Namespace) -> progress.Progress:
     where one can be drawn and one line per step where it cannot.
     """
     return progress.PlainProgress() if args.verbose else progress.for_terminal()
+
+
+def _write_summary(path: str | None, markdown: str) -> None:
+    """Write the markdown report. A report that cannot be written is said so,
+    loudly, but does not change the exit code: the verdict is the contract, and
+    it was reached."""
+    if not path:
+        return
+    try:
+        Path(path).write_text(markdown, encoding="utf-8")
+    except OSError as e:
+        display.print_error(f"Could not write the summary to {path}: {e}")
+        return
+    display.print_note(f"Summary written to {path}")
 
 
 def _set_retries(sessions: list[Session], retries: int) -> None:
@@ -670,12 +700,14 @@ async def cmd_plan_review(args: argparse.Namespace) -> int:
             )
 
         spent = usage.summarize(trace.calls)
+        elapsed = time.monotonic() - started
         if args.as_json:
             json.dump({**result.as_dict(), "usage": spent}, sys.stdout, indent=2)
             sys.stdout.write("\n")
         else:
             plan_review.render(result, show_criteria=not args.apply)
-            display.print_footer(usage.headline(spent, time.monotonic() - started))
+            display.print_footer(usage.headline(spent, elapsed))
+        _write_summary(args.summary, report.plan_review_markdown(result.as_dict(), spent, elapsed))
 
         if args.apply:
             if not result.criteria:
@@ -869,12 +901,14 @@ async def cmd_verify(args: argparse.Namespace) -> int:
         raise
 
     spent = usage.summarize(trace.calls)
+    elapsed = time.monotonic() - started
     if args.as_json:
         json.dump({**result.as_dict(), "usage": spent}, sys.stdout, indent=2)
         sys.stdout.write("\n")
     else:
         verify.render(result)
-        display.print_footer(usage.headline(spent, time.monotonic() - started))
+        display.print_footer(usage.headline(spent, elapsed))
+    _write_summary(args.summary, report.verify_markdown(result.as_dict(), spent, elapsed))
     _finish_record(recorder, exit_code=result.exit_code, result=result.as_dict())
     return result.exit_code
 
@@ -1142,6 +1176,45 @@ async def cmd_debate(args: argparse.Namespace) -> int:
             _write_transcript(args.save, transcript)
 
 
+def cmd_init(args: argparse.Namespace) -> int:
+    """Set a project up, say what was done, and say what to run next."""
+    done = scaffold.init(Path.cwd(), args.plan)
+
+    display.print_section("arbiter init")
+    for item in done.created:
+        display.print(f"  {display._c('+', display.BOLD, display.GREEN)} created  {item}")
+    for item in done.kept:
+        display.print(f"  {display._c('·', display.DIM)} kept     {display._c(item, display.DIM)}")
+    for problem in done.problems:
+        display.print_error(problem)
+
+    display.print()
+    found = [key for key, present in done.providers.items() if present]
+    for key, present in done.providers.items():
+        mark = (
+            display._c("✓", display.BOLD, display.GREEN)
+            if present
+            else display._c("✗", display.DIM)
+        )
+        hint = (
+            "" if present else display._c(f"  — {doctor.INSTALL_HINTS.get(key, '')}", display.DIM)
+        )
+        display.print(f"  {mark} {PROVIDERS[key].cli}{hint}")
+    if not found:
+        display.print_error("No provider CLI is on PATH yet. Install at least one of the above.")
+
+    display.print()
+    display.print_note("Next:")
+    review, gate = f"arbiter plan review {args.plan} --apply", "arbiter verify --diff"
+    width = max(len(review), len(gate))
+    display.print(f"    1. Write the change into {args.plan}")
+    display.print(f"    2. {review:<{width}}   # turn it into a contract")
+    display.print(f"    3. {gate:<{width}}   # gate the staged change against it")
+    display.print_note("`arbiter doctor` checks each provider is logged in (it makes a real call).")
+    display.print()
+    return EXIT_RUNTIME if done.problems else EXIT_PASS
+
+
 async def cmd_doctor(args: argparse.Namespace) -> int:
     keys = sorted(PROVIDERS) if args.check_all else sorted(DEFAULT_PANEL)
     results = await doctor.run_doctor(keys, probe=not args.no_probe)
@@ -1182,6 +1255,8 @@ async def _dispatch(args: argparse.Namespace) -> int:
         )
     if args.command == "debate":
         return await cmd_debate(args)
+    if args.command == "init":
+        return cmd_init(args)
     if args.command == "doctor":
         return await cmd_doctor(args)
     raise SystemExit(EXIT_USAGE)

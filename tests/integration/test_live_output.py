@@ -156,3 +156,22 @@ def test_json_carries_the_usage_beside_the_result(repo, tmp_path):
     record = json.loads((tmp_path / "run.json").read_text())
     assert record["usage"] == payload["usage"]
     assert "usage" not in record["result"], "a verdict is replayable; what it cost is not"
+
+
+def test_a_summary_file_holds_the_verdict_as_markdown(repo, tmp_path):
+    result = _piped("--summary", "summary.md")
+
+    assert result.returncode == 0
+    summary = (tmp_path / "summary.md").read_text(encoding="utf-8")
+    assert summary.startswith("## ✓ Arbiter verdict: PASS")
+    assert "**AC-1** total() sums every item in the list" in summary
+    assert "1 provider call in " in summary
+
+
+def test_a_summary_that_cannot_be_written_does_not_change_the_verdict(repo):
+    """The verdict is the contract, and it was reached. The missing file is
+    said loudly instead."""
+    result = _piped("--summary", "no/such/directory/summary.md")
+
+    assert result.returncode == 0
+    assert "Could not write the summary" in result.stderr

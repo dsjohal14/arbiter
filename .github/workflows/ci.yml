@@ -55,3 +55,69 @@ jobs:
       # Makefile does it, see DEVELOPMENT.md.
       - name: Test
         run: .venv/bin/python -m pytest tests/ --cov=arbiter --cov-report=term-missing --cov-fail-under=80
+
+  package:
+    # The suite runs against an editable install, which cannot notice a module
+    # left out of the wheel. This builds what a user would install and runs it.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Build
+        run: uv build
+      - name: Install the wheel somewhere clean and run it
+        run: |
+          uv venv --python 3.12 "$RUNNER_TEMP/clean"
+          uv pip install --python "$RUNNER_TEMP/clean/bin/python" dist/*.whl
+          cd "$RUNNER_TEMP"
+          clean/bin/arbiter --version
+          clean/bin/python -m arbiter verify --help > /dev/null
+          clean/bin/python -c "import arbiter.config, arbiter.progress, arbiter.report, arbiter.scaffold, arbiter.usage"
+
+  action:
+    # The GitHub Action, run for real against the fake provider. Nothing is
+    # called and nothing is spent, but the install, the input wiring, the
+    # outputs, and the job summary are all exercised on an actual runner —
+    # which no local test can do.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Put a fake provider on PATH
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          printf '#!/bin/sh\nFAKE_CLI_NAME=claude exec python "%s/tests/fake_cli.py" "$@"\n' \
+            "$GITHUB_WORKSPACE" > "$RUNNER_TEMP/bin/claude"
+          chmod +x "$RUNNER_TEMP/bin/claude"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          echo "FAKE_CLI_STREAM=$GITHUB_WORKSPACE/tests/fixtures/action-selftest.jsonl" >> "$GITHUB_ENV"
+          python -m pip install --quiet pytest
+      # examples/totals ships a seeded defect, so the gate is supposed to fail.
+      - name: Verify the seeded defect
+        id: gate
+        uses: ./
+        continue-on-error: true
+        with:
+          plan: plan.md
+          diff: broken.diff
+          working-directory: examples/totals
+          setup-python: "false"
+          args: --models claude --test-command "python -m pytest"
+      - name: The gate must have failed, and said why
+        env:
+          VERDICT: ${{ steps.gate.outputs.verdict }}
+          EXIT_CODE: ${{ steps.gate.outputs.exit-code }}
+          OUTCOME: ${{ steps.gate.outcome }}
+          SUMMARY: ${{ steps.gate.outputs.summary }}
+        run: |
+          test "$VERDICT" = "fail"
+          test "$EXIT_CODE" = "1"
+          test "$OUTCOME" = "failure"
+          grep -q "Arbiter verdict: FAIL" "$SUMMARY"
+          grep -q "cited test fails" "$SUMMARY"

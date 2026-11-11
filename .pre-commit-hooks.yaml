@@ -1,0 +1,23 @@
+# Arbiter as a pre-commit hook.
+#
+#   repos:
+#     - repo: https://github.com/dsjohal14/arbiter
+#       rev: <tag>
+#       hooks:
+#         - id: arbiter-verify
+#           args: [--plan, PLAN.md, --require-tests]
+#
+# Leave `args` out when the project settings (.arbiter.toml, or [tool.arbiter]
+# in pyproject.toml) already name the plan. The hook makes real provider calls
+# on every commit; to run it on push instead, add `stages: [pre-push]` and
+# `args: [--diff, "origin/main...HEAD"]`.
+- id: arbiter-verify
+  name: arbiter verify
+  description: Gate the staged change against the approved plan. Makes real provider calls.
+  entry: arbiter verify --diff staged
+  language: python
+  pass_filenames: false
+  always_run: true
+  require_serial: true
+  # Show the verdict when the hook passes too, not only when it fails.
+  verbose: true
