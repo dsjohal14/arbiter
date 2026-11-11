@@ -177,6 +177,8 @@ def test_plan_review_record_includes_extraction_and_final_result(
     assert code == 0
     assert record["command"] == "plan review"
     assert record["inputs"]["plan"]["content"] == RAW_PLAN
+    # What was printed is the recorded result, plus what the run took.
+    assert record["usage"] == output.pop("usage")
     assert record["result"] == output
     # One reviewer, so nothing was sent to be merged with itself.
     assert [call["phase"] for call in record["provider_calls"]] == ["extractor", "reviewer"]

@@ -277,6 +277,8 @@ def test_verify_can_write_a_replayable_run_record(gate, repo, capsys):
     assert record["inputs"]["plan"]["content"] == PINNED_PLAN
     assert record["inputs"]["diff"]["content"] == DIFF
     assert record["configuration"]["custom_test_command"] is True
+    # What was printed is the recorded result, plus what the run took.
+    assert record["usage"] == output.pop("usage")
     assert record["result"] == output
     observed = {row["id"]: row for row in record["observations"]["criteria_evidence"]}
     assert observed["AC-2"]["test_check"]["verified"] is True

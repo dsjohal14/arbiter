@@ -26,6 +26,7 @@ import shlex
 import shutil
 import signal
 import sys
+import time
 from pathlib import Path
 from typing import NoReturn
 
@@ -39,6 +40,7 @@ from . import (
     progress,
     replay,
     run_records,
+    usage,
     verify,
 )
 from . import criteria as crit
@@ -591,8 +593,12 @@ async def cmd_plan_review(args: argparse.Namespace) -> int:
         _usage_error("The plan is empty.")
 
     isolation = "open" if args.allow_tools else "readonly"
+    started = time.monotonic()
+    # Kept whether or not a record is written: it is also what the run cost.
+    trace = RunTrace()
     recorder = (
         RunRecorder(
+            trace=trace,
             path=Path(args.record),
             command="plan review",
             inputs={"plan": recorded_input(text, args.file)},
@@ -624,7 +630,7 @@ async def cmd_plan_review(args: argparse.Namespace) -> int:
                 isolation,
                 args.verbose,
                 args.timeout,
-                trace=recorder.trace if recorder else None,
+                trace=trace,
                 retries=args.retries,
             )
             if not criteria:
@@ -658,16 +664,18 @@ async def cmd_plan_review(args: argparse.Namespace) -> int:
                 verbose=args.verbose,
                 timeout=args.timeout,
                 seed=args.seed,
-                trace=recorder.trace if recorder else None,
+                trace=trace,
                 consolidate=args.consolidate,
                 progress=watch,
             )
 
+        spent = usage.summarize(trace.calls)
         if args.as_json:
-            json.dump(result.as_dict(), sys.stdout, indent=2)
+            json.dump({**result.as_dict(), "usage": spent}, sys.stdout, indent=2)
             sys.stdout.write("\n")
         else:
             plan_review.render(result, show_criteria=not args.apply)
+            display.print_footer(usage.headline(spent, time.monotonic() - started))
 
         if args.apply:
             if not result.criteria:
@@ -781,8 +789,12 @@ async def cmd_verify(args: argparse.Namespace) -> int:
         except run_records.WorkspaceIdentityError as e:
             _usage_error(f"Could not safely record this workspace: {e}")
 
+    started = time.monotonic()
+    # Kept whether or not a record is written: it is also what the run cost.
+    trace = RunTrace()
     recorder = (
         RunRecorder(
+            trace=trace,
             path=Path(args.record),
             command="verify",
             inputs={
@@ -847,7 +859,7 @@ async def cmd_verify(args: argparse.Namespace) -> int:
                 scrub_env=not args.no_scrub_test_env,
                 base_ref=base_ref,
                 require_discriminating_tests=args.require_discriminating_tests,
-                trace=recorder.trace if recorder else None,
+                trace=trace,
                 test_timeout=args.test_timeout,
                 consolidate=args.consolidate,
                 progress=watch,
@@ -856,11 +868,13 @@ async def cmd_verify(args: argparse.Namespace) -> int:
         _record_error(recorder, e)
         raise
 
+    spent = usage.summarize(trace.calls)
     if args.as_json:
-        json.dump(result.as_dict(), sys.stdout, indent=2)
+        json.dump({**result.as_dict(), "usage": spent}, sys.stdout, indent=2)
         sys.stdout.write("\n")
     else:
         verify.render(result)
+        display.print_footer(usage.headline(spent, time.monotonic() - started))
     _finish_record(recorder, exit_code=result.exit_code, result=result.as_dict())
     return result.exit_code
 

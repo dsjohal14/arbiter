@@ -341,6 +341,12 @@ def print_note(msg: str) -> None:
     print(_c(f"  {msg}", DIM))
 
 
+def print_footer(text: str) -> None:
+    """The last line of a run: what it took."""
+    print(_c(f"  {text}", DIM))
+    print()
+
+
 def print_retry(name: str, attempt: int, error: object) -> None:
     print(_c(f"  ↻  {name} failed (attempt {attempt}), retrying: {error}", YELLOW), file=sys.stderr)
 

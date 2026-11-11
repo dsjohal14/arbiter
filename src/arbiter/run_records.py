@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
-from . import __version__
+from . import __version__, usage
 from .models import ModelResponse, Session
 
 # v2 added `workspace`. v3 makes that snapshot cover the whole Git-visible
@@ -394,6 +394,9 @@ class RunRecorder:
             # evidence citation/detail or blinding map even when status holds.
             "observations": _result_observations(result),
             "provider_calls": self.trace.calls,
+            # Derived from provider_calls, and stored so a record answers "what
+            # did this run cost" without the reader re-implementing the rules.
+            "usage": usage.summarize(self.trace.calls),
             "result": result,
             "exit_code": exit_code,
             "error": error_value,

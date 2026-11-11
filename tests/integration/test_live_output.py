@@ -140,3 +140,19 @@ def test_json_mode_keeps_stdout_for_the_result_alone(repo):
     payload = json.loads(result.stdout)
     assert payload["status"] == "pass"
     assert "reviewed in" in result.stderr, "progress moves to stderr, it does not vanish"
+
+
+def test_a_run_ends_by_saying_what_it_took(repo):
+    result = _piped()
+    assert "1 provider call in " in result.stdout.splitlines()[-2]
+
+
+def test_json_carries_the_usage_beside_the_result(repo, tmp_path):
+    result = _piped("--json", "--record", "run.json")
+
+    payload = json.loads(result.stdout)
+    assert payload["usage"]["calls"] == 1
+    assert payload["usage"]["providers"][0]["label"] == "claude (sonnet)"
+    record = json.loads((tmp_path / "run.json").read_text())
+    assert record["usage"] == payload["usage"]
+    assert "usage" not in record["result"], "a verdict is replayable; what it cost is not"
